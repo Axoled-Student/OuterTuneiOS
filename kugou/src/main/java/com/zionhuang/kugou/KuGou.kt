@@ -16,7 +16,6 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.util.decodeBase64String
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
-import java.lang.Integer.min
 import kotlin.math.abs
 
 @OptIn(ExperimentalSerializationApi::class)
@@ -157,7 +156,7 @@ object KuGou {
             .let { lines ->
                 // Remove useless information such as singer, writer, composer, guitar, etc.
                 var headCutLine = 0
-                for (i in min(HEAD_CUT_LIMIT, lines.lastIndex) downTo 0) {
+                for (i in minOf(HEAD_CUT_LIMIT, lines.lastIndex) downTo 0) {
                     if (lines[i].matches(BANNED_REGEX)) {
                         headCutLine = i + 1
                         break
@@ -166,7 +165,7 @@ object KuGou {
                 val filteredLines = lines.drop(headCutLine)
 
                 var tailCutLine = 0
-                for (i in min(lines.size - HEAD_CUT_LIMIT, lines.lastIndex) downTo 0) {
+                for (i in minOf(lines.size - HEAD_CUT_LIMIT, lines.lastIndex) downTo 0) {
                     if (lines[lines.lastIndex - i].matches(BANNED_REGEX)) {
                         tailCutLine = i + 1
                         break

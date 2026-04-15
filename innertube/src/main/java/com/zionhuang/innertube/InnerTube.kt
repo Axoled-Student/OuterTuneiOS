@@ -7,18 +7,9 @@ import com.zionhuang.innertube.models.body.*
 import com.zionhuang.innertube.utils.parseCookieString
 import com.zionhuang.innertube.utils.sha1
 import io.ktor.client.*
-import io.ktor.client.engine.okhttp.*
-import io.ktor.client.plugins.*
-import io.ktor.client.plugins.compression.*
-import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
 import io.ktor.util.encodeBase64
-import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.serialization.json.Json
-import java.net.Proxy
-import java.util.*
 
 /**
  * Provide access to InnerTube endpoints.
@@ -28,8 +19,8 @@ class InnerTube {
     private var httpClient = createClient()
 
     var locale = YouTubeLocale(
-        gl = Locale.getDefault().country,
-        hl = Locale.getDefault().toLanguageTag()
+        gl = defaultCountryCode(),
+        hl = defaultLanguageTag()
     )
     var visitorData: String? = null
     var dataSyncId: String? = null
@@ -40,7 +31,7 @@ class InnerTube {
         }
     private var cookieMap = emptyMap<String, String>()
 
-    var proxy: Proxy? = null
+    var proxy: PlatformProxy? = null
         set(value) {
             field = value
             httpClient.close()
@@ -49,33 +40,7 @@ class InnerTube {
 
     var useLoginForBrowse: Boolean = false
 
-    @OptIn(ExperimentalSerializationApi::class)
-    private fun createClient() = HttpClient(OkHttp) {
-        expectSuccess = true
-
-        install(ContentNegotiation) {
-            json(Json {
-                ignoreUnknownKeys = true
-                explicitNulls = false
-                encodeDefaults = true
-            })
-        }
-
-        install(ContentEncoding) {
-            gzip(0.9F)
-            deflate(0.8F)
-        }
-
-        if (proxy != null) {
-            engine {
-                proxy = this@InnerTube.proxy
-            }
-        }
-
-        defaultRequest {
-            url(YouTubeClient.API_URL_YOUTUBE_MUSIC)
-        }
-    }
+    private fun createClient() = createInnerTubeHttpClient(proxy)
 
     private fun HttpRequestBuilder.ytClient(client: YouTubeClient, setLogin: Boolean = false) {
         contentType(ContentType.Application.Json)
@@ -89,7 +54,7 @@ class InnerTube {
                 cookie?.let { cookie ->
                     append("cookie", cookie)
                     if ("SAPISID" !in cookieMap) return@let
-                    val currentTime = System.currentTimeMillis() / 1000
+                    val currentTime = currentTimeMillis() / 1000
                     val sapisidHash = sha1("$currentTime ${cookieMap["SAPISID"]} ${YouTubeClient.ORIGIN_YOUTUBE_MUSIC}")
                     append("Authorization", "SAPISIDHASH ${currentTime}_${sapisidHash} SAPISID1PHASH ${currentTime}_${sapisidHash} SAPISID3PHASH ${currentTime}_${sapisidHash}")
                 }

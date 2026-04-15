@@ -59,7 +59,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
-import java.net.Proxy
+import kotlin.jvm.JvmInline
 import kotlin.random.Random
 
 /**
@@ -89,7 +89,7 @@ object YouTube {
         set(value) {
             innerTube.cookie = value
         }
-    var proxy: Proxy?
+    var proxy: PlatformProxy?
         get() = innerTube.proxy
         set(value) {
             innerTube.proxy = value
@@ -768,7 +768,7 @@ object YouTube {
 
     suspend fun queue(videoIds: List<String>? = null, playlistId: String? = null): Result<List<SongItem>> = runCatching {
         if (videoIds != null) {
-            assert(videoIds.size <= MAX_GET_QUEUE_SIZE) // Max video limit
+            require(videoIds.size <= MAX_GET_QUEUE_SIZE) // Max video limit
         }
         innerTube.getQueue(WEB_REMIX, videoIds, playlistId).body<GetQueueResponse>().queueDatas
             .mapNotNull {
@@ -785,7 +785,7 @@ object YouTube {
             val text = group.transcriptCueGroupRenderer.cues[0].transcriptCueRenderer.cue.simpleText
                 .trim('♪')
                 .trim(' ')
-            "[%02d:%02d.%03d]$text".format(time / 60000, (time / 1000) % 60, time % 1000)
+            "${formatLrcTimestamp(time)}$text"
         }!!
     }
 
@@ -833,4 +833,11 @@ object YouTube {
     const val MAX_GET_QUEUE_SIZE = 1000
 
     private val VISITOR_DATA_REGEX = Regex("^Cg[t|s]")
+
+    private fun formatLrcTimestamp(timeMs: Long): String {
+        val minutes = (timeMs / 60000).toString().padStart(2, '0')
+        val seconds = ((timeMs / 1000) % 60).toString().padStart(2, '0')
+        val milliseconds = (timeMs % 1000).toString().padStart(3, '0')
+        return "[$minutes:$seconds.$milliseconds]"
+    }
 }

@@ -1,0 +1,29 @@
+name: OuterTuneiOS
+options:
+  minimumXcodeGenVersion: 2.45.0
+  deploymentTarget:
+    iOS: 15.0
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+targets:
+  OuterTuneiOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: OuterTuneiOS/Sources
+    info:
+      path: OuterTuneiOS/Info.plist
+      properties:
+        CFBundleDisplayName: OuterTune iOS
+        UILaunchScreen: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dd3boh.outertune.ios
+        DEVELOPMENT_TEAM: N22YNA5XUL
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        IPHONEOS_DEPLOYMENT_TARGET: 15.0
+    scheme:
+      gatherCoverageData: false
