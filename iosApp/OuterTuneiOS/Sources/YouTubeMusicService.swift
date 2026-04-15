@@ -71,7 +71,7 @@ final class YouTubeMusicService {
             }
 
             let subtitleParts = extractSubtitleParts(from: renderer)
-            let artist = subtitleParts.first ?? "Unknown Artist"
+            let artist = extractArtistName(from: renderer, subtitleParts: subtitleParts)
             let duration = subtitleParts.reversed().first(where: { isDurationToken($0) })
             let thumbnail = extractThumbnailURL(from: renderer)
 
@@ -253,6 +253,75 @@ final class YouTubeMusicService {
             .split(separator: "•")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    private func extractArtistName(from renderer: [String: Any], subtitleParts: [String]) -> String {
+        if let fromRuns = extractArtistNameFromRuns(from: renderer) {
+            return fromRuns
+        }
+
+        if let fromParts = subtitleParts.first(where: { !isMetadataArtistToken($0) }) {
+            return fromParts
+        }
+
+        return subtitleParts.first ?? "Unknown Artist"
+    }
+
+    private func extractArtistNameFromRuns(from renderer: [String: Any]) -> String? {
+        guard
+            let columns = renderer["flexColumns"] as? [[String: Any]],
+            columns.count > 1,
+            let secondRenderer = columns[1]["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any],
+            let text = secondRenderer["text"] as? [String: Any],
+            let runs = text["runs"] as? [[String: Any]]
+        else {
+            return nil
+        }
+
+        var firstCandidate: String?
+
+        for run in runs {
+            guard let value = run["text"] as? String else { continue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed == "•" || isMetadataArtistToken(trimmed) {
+                continue
+            }
+
+            if firstCandidate == nil {
+                firstCandidate = trimmed
+            }
+
+            if run["navigationEndpoint"] != nil {
+                return trimmed
+            }
+        }
+
+        return firstCandidate
+    }
+
+    private func isMetadataArtistToken(_ value: String) -> Bool {
+        let normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if normalized.isEmpty {
+            return true
+        }
+
+        if isDurationToken(value) {
+            return true
+        }
+
+        if normalized.hasSuffix(" views") || normalized.hasSuffix(" view") {
+            return true
+        }
+
+        let metadataTokens: Set<String> = [
+            "song", "songs", "video", "videos", "album", "single", "ep", "playlist", "mix",
+            "歌曲", "曲目", "影片", "專輯", "單曲", "播放清單", "混音"
+        ]
+
+        return metadataTokens.contains(normalized)
     }
 
     private func extractThumbnailURL(from renderer: [String: Any]) -> String? {

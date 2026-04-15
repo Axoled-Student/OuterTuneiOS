@@ -12,6 +12,7 @@ targets:
     platform: iOS
     sources:
       - path: OuterTuneiOS/Sources
+      - path: OuterTuneiOS/Assets.xcassets
     info:
       path: OuterTuneiOS/Info.plist
       properties:
@@ -25,5 +26,6 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MACCATALYST: NO
         IPHONEOS_DEPLOYMENT_TARGET: 15.0
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     scheme:
       gatherCoverageData: false
