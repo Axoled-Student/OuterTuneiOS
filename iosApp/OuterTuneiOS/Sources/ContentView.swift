@@ -3,10 +3,13 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var player = AudioPlayerViewModel()
+    @State private var isNowPlayingPresented: Bool = false
 
     var body: some View {
         TabView {
-            HomeTabView()
+            HomeTabView {
+                isNowPlayingPresented = true
+            }
                 .tabItem {
                     Label("首頁", systemImage: "house")
                 }
@@ -21,22 +24,32 @@ struct ContentView: View {
                     Label("資料庫", systemImage: "books.vertical")
                 }
 
-            PlayerTabView()
-                .tabItem {
-                    Label("播放中", systemImage: "play.circle")
-                }
-
             SettingsTabView()
                 .tabItem {
                     Label("設定", systemImage: "gearshape")
                 }
         }
         .environmentObject(player)
+        .overlay(alignment: .bottom) {
+            if player.nowPlayingTrack != nil {
+                MiniPlayerBarView {
+                    isNowPlayingPresented = true
+                }
+                .environmentObject(player)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 54)
+            }
+        }
+        .sheet(isPresented: $isNowPlayingPresented) {
+            NowPlayingSheetView()
+                .environmentObject(player)
+        }
     }
 }
 
 private struct HomeTabView: View {
     @EnvironmentObject private var player: AudioPlayerViewModel
+    let openNowPlaying: () -> Void
 
     var body: some View {
         NavigationView {
@@ -62,6 +75,9 @@ private struct HomeTabView: View {
                 Section("快速操作") {
                     Button(player.isPlaying ? "暫停" : "播放") {
                         player.togglePlayback()
+                    }
+                    Button("打開播放器") {
+                        openNowPlaying()
                     }
                     Button("下一首") {
                         player.playNext()
@@ -274,26 +290,31 @@ private struct LibraryTabView: View {
     }
 }
 
-private struct PlayerTabView: View {
+private struct NowPlayingSheetView: View {
     @EnvironmentObject private var player: AudioPlayerViewModel
+    @Environment(\.dismiss) private var dismiss
     @State private var isImportPickerPresented: Bool = false
 
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("目前播放")
-                            .font(.headline)
+                    if let track = player.nowPlayingTrack {
+                        VStack(spacing: 14) {
+                            TrackArtworkView(
+                                urlString: track.thumbnailURL,
+                                dimension: 280,
+                                cornerRadius: 20
+                            )
 
-                        if let track = player.nowPlayingTrack {
-                            HStack(alignment: .top) {
+                            HStack(alignment: .top, spacing: 12) {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(track.title)
                                         .font(.title3)
+                                        .fontWeight(.semibold)
                                         .lineLimit(2)
                                     Text(track.artist)
-                                        .font(.subheadline)
+                                        .font(.title3)
                                         .foregroundColor(.secondary)
                                 }
                                 Spacer()
@@ -302,7 +323,16 @@ private struct PlayerTabView: View {
                                 }
                                 .buttonStyle(.bordered)
                             }
-                        } else {
+
+                            Text(player.statusMessage)
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("目前播放")
+                                .font(.headline)
                             Text("尚未開始播放")
                                 .foregroundColor(.secondary)
                         }
@@ -437,7 +467,15 @@ private struct PlayerTabView: View {
                 }
                 .padding()
             }
-            .navigationTitle("播放中")
+            .navigationTitle("正在播放")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("關閉") {
+                        dismiss()
+                    }
+                }
+            }
             .fileImporter(
                 isPresented: $isImportPickerPresented,
                 allowedContentTypes: [.audio],
@@ -450,6 +488,123 @@ private struct PlayerTabView: View {
                     player.statusMessage = "匯入失敗：\(error.localizedDescription)"
                 }
             }
+        }
+    }
+}
+
+private struct MiniPlayerBarView: View {
+    @EnvironmentObject private var player: AudioPlayerViewModel
+    let onExpand: () -> Void
+
+    var body: some View {
+        if let track = player.nowPlayingTrack {
+            VStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    Button(action: onExpand) {
+                        HStack(spacing: 10) {
+                            TrackArtworkView(
+                                urlString: track.thumbnailURL,
+                                dimension: 42,
+                                cornerRadius: 8
+                            )
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(track.title)
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                    .lineLimit(1)
+                                Text(track.artist)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer(minLength: 8)
+
+                    Button(action: player.playPrevious) {
+                        Image(systemName: "backward.fill")
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: player.togglePlayback) {
+                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 17, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: player.playNext) {
+                        Image(systemName: "forward.fill")
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.2))
+                        Capsule()
+                            .fill(Color.accentColor)
+                            .frame(width: proxy.size.width * progress)
+                    }
+                }
+                .frame(height: 4)
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(.ultraThinMaterial)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 2)
+        }
+    }
+
+    private var progress: CGFloat {
+        guard player.duration > 0 else { return 0 }
+        let ratio = player.sliderPosition / player.duration
+        let clamped = min(max(ratio, 0), 1)
+        return CGFloat(clamped)
+    }
+}
+
+private struct TrackArtworkView: View {
+    let urlString: String?
+    let dimension: CGFloat
+    let cornerRadius: CGFloat
+
+    var body: some View {
+        Group {
+            if let urlString,
+               let url = URL(string: urlString),
+               !urlString.isEmpty {
+                AsyncImage(url: url) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    artworkPlaceholder
+                }
+            } else {
+                artworkPlaceholder
+            }
+        }
+        .frame(width: dimension, height: dimension)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+
+    private var artworkPlaceholder: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color.secondary.opacity(0.18))
+            Image(systemName: "music.note")
+                .font(.system(size: max(dimension * 0.28, 14), weight: .semibold))
+                .foregroundColor(.secondary)
         }
     }
 }
