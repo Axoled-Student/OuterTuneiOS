@@ -92,14 +92,21 @@ final class YouTubeMusicService {
 
     func resolveAudioStreamURL(videoId: String) async throws -> URL {
         for profile in playerClientProfiles {
-            if let url = try await fetchPlayableURL(videoId: videoId, profile: profile) {
+            if let url = try await fetchPlayableURL(videoId: videoId, profile: profile, allowWebM: false) {
+                return url
+            }
+        }
+
+        // As a fallback, try WebM if every profile lacks iOS-friendly formats.
+        for profile in playerClientProfiles {
+            if let url = try await fetchPlayableURL(videoId: videoId, profile: profile, allowWebM: true) {
                 return url
             }
         }
         throw YouTubeMusicServiceError.noPlayableStream
     }
 
-    private func fetchPlayableURL(videoId: String, profile: PlayerClientProfile) async throws -> URL? {
+    private func fetchPlayableURL(videoId: String, profile: PlayerClientProfile, allowWebM: Bool) async throws -> URL? {
         let payload: [String: Any] = [
             "context": [
                 "client": [
@@ -137,7 +144,9 @@ final class YouTubeMusicService {
         let formats = (streamingData["formats"] as? [[String: Any]]) ?? []
         let candidates = adaptive + formats
         let sortedAudioFormats = candidates
-            .filter { isLikelyAudioFormat($0) }
+            .filter { format in
+                isLikelyAudioFormat(format) && (allowWebM || !isWebMFormat(format))
+            }
             .sorted { playbackPriority(for: $0) > playbackPriority(for: $1) }
 
         for format in sortedAudioFormats {
@@ -298,6 +307,13 @@ final class YouTubeMusicService {
             return false
         }
         return mimeType.contains("audio/")
+    }
+
+    private func isWebMFormat(_ format: [String: Any]) -> Bool {
+        guard let mimeType = (format["mimeType"] as? String)?.lowercased() else {
+            return false
+        }
+        return mimeType.contains("webm") || mimeType.contains("opus")
     }
 
     private func playbackPriority(for format: [String: Any]) -> Int {

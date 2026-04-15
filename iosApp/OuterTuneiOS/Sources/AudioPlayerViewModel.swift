@@ -31,6 +31,7 @@ final class AudioPlayerViewModel: ObservableObject {
     private var player: AVPlayer?
     private var periodicObserverToken: Any?
     private var playbackEndObserverToken: NSObjectProtocol?
+    private var audioInterruptionObserverToken: NSObjectProtocol?
     private var playerItemStatusObservationToken: NSKeyValueObservation?
     private var playerItemKeepUpObservationToken: NSKeyValueObservation?
 
@@ -51,6 +52,8 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     init() {
+        AudioSessionConfigurator.configureForPlayback()
+        observeAudioSessionInterruptions()
         restoreQueueState()
         restoreDownloadsState()
         restoreFavoritesState()
@@ -63,6 +66,9 @@ final class AudioPlayerViewModel: ObservableObject {
         }
         if let playbackToken = playbackEndObserverToken {
             NotificationCenter.default.removeObserver(playbackToken)
+        }
+        if let interruptionToken = audioInterruptionObserverToken {
+            NotificationCenter.default.removeObserver(interruptionToken)
         }
         playerItemStatusObservationToken?.invalidate()
         playerItemKeepUpObservationToken?.invalidate()
@@ -277,6 +283,7 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     func play() {
+        _ = AudioSessionConfigurator.configureForPlayback()
         guard player != nil else {
             if let currentQueueIndex {
                 playQueueItem(at: currentQueueIndex)
@@ -285,6 +292,8 @@ final class AudioPlayerViewModel: ObservableObject {
             }
             return
         }
+        player?.isMuted = false
+        player?.volume = 1.0
         player?.play()
         isPlaying = true
         statusMessage = "播放中"
@@ -341,6 +350,7 @@ final class AudioPlayerViewModel: ObservableObject {
 
         statusMessage = "解析串流中..."
         do {
+            _ = AudioSessionConfigurator.configureForPlayback()
             let resolvedURL = try await resolvePlayableURL(for: track)
             streamURL = resolvedURL.absoluteString
             let item = AVPlayerItem(url: resolvedURL)
@@ -358,6 +368,8 @@ final class AudioPlayerViewModel: ObservableObject {
 
             observePlayerItemState(item: item, trackTitle: track.title)
             observePlaybackEnd(item: item)
+            player?.isMuted = false
+            player?.volume = 1.0
             player?.play()
             isPlaying = true
             trackDidStartPlaying(track)
@@ -499,6 +511,48 @@ final class AudioPlayerViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func observeAudioSessionInterruptions() {
+#if os(iOS)
+        audioInterruptionObserverToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor in
+                guard let self else { return }
+
+                guard
+                    let info = notification.userInfo,
+                    let rawType = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+                    let type = AVAudioSession.InterruptionType(rawValue: rawType)
+                else {
+                    return
+                }
+
+                switch type {
+                case .began:
+                    self.isPlaying = false
+                    self.statusMessage = "音訊被中斷"
+                case .ended:
+                    let optionsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                    let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+                    _ = AudioSessionConfigurator.configureForPlayback()
+
+                    if options.contains(.shouldResume) {
+                        self.player?.isMuted = false
+                        self.player?.volume = 1.0
+                        self.player?.play()
+                        self.isPlaying = true
+                        self.statusMessage = "播放中"
+                    }
+                @unknown default:
+                    break
+                }
+            }
+        }
+#endif
     }
 
     private func downloadTrack(_ track: AppTrack) async {
@@ -791,15 +845,24 @@ final class AudioPlayerViewModel: ObservableObject {
 }
 
 enum AudioSessionConfigurator {
-    static func configureForPlayback() {
+    @discardableResult
+    static func configureForPlayback() -> Bool {
 #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.allowAirPlay, .allowBluetooth])
+            try session.setCategory(
+                .playback,
+                mode: .default,
+                options: [.allowAirPlay, .allowBluetooth, .allowBluetoothA2DP]
+            )
             try session.setActive(true)
+            return true
         } catch {
             print("Failed to configure audio session: \(error)")
+            return false
         }
+#else
+        return false
 #endif
     }
 }
