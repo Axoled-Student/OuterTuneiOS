@@ -90,6 +90,66 @@ final class YouTubeMusicService {
         return songs
     }
 
+    func autocompleteSuggestions(query: String) async throws -> [String] {
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else {
+            return []
+        }
+
+        var components = URLComponents(string: "https://suggestqueries.google.com/complete/search")
+        components?.queryItems = [
+            URLQueryItem(name: "client", value: "firefox"),
+            URLQueryItem(name: "ds", value: "yt"),
+            URLQueryItem(name: "hl", value: "zh-TW"),
+            URLQueryItem(name: "q", value: normalizedQuery)
+        ]
+
+        guard let url = components?.url else {
+            throw YouTubeMusicServiceError.invalidResponse
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
+            throw YouTubeMusicServiceError.invalidResponse
+        }
+
+        guard
+            let payload = try JSONSerialization.jsonObject(with: data) as? [Any],
+            payload.count > 1,
+            let rawSuggestions = payload[1] as? [Any]
+        else {
+            return []
+        }
+
+        var suggestions: [String] = []
+        for entry in rawSuggestions {
+            if let suggestion = entry as? String {
+                let normalized = suggestion.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !normalized.isEmpty,
+                   normalized.caseInsensitiveCompare(normalizedQuery) != .orderedSame,
+                   !suggestions.contains(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) {
+                    suggestions.append(normalized)
+                }
+                continue
+            }
+
+            if let nested = entry as? [Any],
+               let first = nested.first as? String {
+                let normalized = first.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !normalized.isEmpty,
+                   normalized.caseInsensitiveCompare(normalizedQuery) != .orderedSame,
+                   !suggestions.contains(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) {
+                    suggestions.append(normalized)
+                }
+            }
+        }
+
+        return Array(suggestions.prefix(10))
+    }
+
     func resolveAudioStreamURL(videoId: String) async throws -> URL {
         guard let firstURL = try await resolveAudioStreamURLs(videoId: videoId).first else {
             throw YouTubeMusicServiceError.noPlayableStream

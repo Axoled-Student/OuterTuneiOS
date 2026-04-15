@@ -109,6 +109,14 @@ private struct SearchTabView: View {
                     TextField("搜尋 YouTube Music", text: $player.searchQuery)
                         .textFieldStyle(.roundedBorder)
                         .noAutoInputAdjustments()
+                        .onSubmit {
+                            Task {
+                                await player.searchYouTube()
+                            }
+                        }
+                        .onChange(of: player.searchQuery) { _ in
+                            player.scheduleAutocomplete()
+                        }
 
                     Button("搜尋") {
                         Task {
@@ -120,8 +128,39 @@ private struct SearchTabView: View {
                 .padding(.horizontal)
                 .padding(.top, 8)
 
+                if !player.autocompleteSuggestions.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(player.autocompleteSuggestions, id: \.self) { suggestion in
+                                Button {
+                                    player.applyAutocompleteSuggestion(suggestion)
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "magnifyingglass")
+                                            .font(.caption)
+                                        Text(suggestion)
+                                            .font(.subheadline)
+                                            .lineLimit(1)
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(
+                                        Capsule()
+                                            .fill(Color.secondary.opacity(0.13))
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
+                }
+
                 if player.isSearching {
                     ProgressView("搜尋中...")
+                        .padding(.bottom, 8)
+                } else if player.isLoadingAutocomplete {
+                    ProgressView("建議搜尋中...")
                         .padding(.bottom, 8)
                 }
 
@@ -294,185 +333,199 @@ private struct NowPlayingSheetView: View {
     @EnvironmentObject private var player: AudioPlayerViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var isImportPickerPresented: Bool = false
+    @State private var showAdvancedSource: Bool = false
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    if let track = player.nowPlayingTrack {
-                        VStack(spacing: 14) {
+            ZStack {
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.92, green: 0.52, blue: 0.56).opacity(0.28),
+                        Color(red: 0.26, green: 0.43, blue: 0.72).opacity(0.18),
+                        Color(.systemBackground)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+
+                ScrollView {
+                    VStack(spacing: 22) {
+                        if let track = player.nowPlayingTrack {
                             TrackArtworkView(
                                 urlString: track.thumbnailURL,
-                                dimension: 280,
-                                cornerRadius: 20
+                                dimension: 300,
+                                cornerRadius: 24
                             )
 
-                            HStack(alignment: .top, spacing: 12) {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(track.title)
-                                        .font(.title3)
-                                        .fontWeight(.semibold)
-                                        .lineLimit(2)
-                                    Text(track.artist)
-                                        .font(.title3)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                Button(player.isFavorite(track) ? "已收藏" : "收藏") {
-                                    player.toggleFavorite(track)
-                                }
-                                .buttonStyle(.bordered)
+                            VStack(spacing: 6) {
+                                Text(track.title)
+                                    .font(.title2)
+                                    .fontWeight(.bold)
+                                    .multilineTextAlignment(.center)
+                                    .lineLimit(2)
+                                Text(track.artist)
+                                    .font(.title3)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
                             }
 
                             Text(player.statusMessage)
                                 .font(.footnote)
                                 .foregroundColor(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    } else {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("目前播放")
-                                .font(.headline)
-                            Text("尚未開始播放")
-                                .foregroundColor(.secondary)
-                        }
-                    }
 
-                    Text("目前來源")
-                        .font(.headline)
-                    TextField("https://example.com/audio.mp3", text: $player.streamURL)
-                        .urlKeyboardIfAvailable()
-                        .noAutoInputAdjustments()
-                        .textFieldStyle(.roundedBorder)
+                            VStack(spacing: 8) {
+                                Slider(
+                                    value: Binding(
+                                        get: { player.sliderPosition },
+                                        set: { player.updateScrubbing(position: $0) }
+                                    ),
+                                    in: 0...max(player.duration, 1),
+                                    onEditingChanged: { editing in
+                                        if editing {
+                                            player.beginScrubbing()
+                                        } else {
+                                            player.endScrubbing()
+                                        }
+                                    }
+                                )
 
-                    HStack {
-                        Button("以網址播放") {
-                            player.loadAndPlay()
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button("匯入本機音訊") {
-                            isImportPickerPresented = true
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Slider(
-                            value: Binding(
-                                get: { player.sliderPosition },
-                                set: { player.updateScrubbing(position: $0) }
-                            ),
-                            in: 0...max(player.duration, 1),
-                            onEditingChanged: { editing in
-                                if editing {
-                                    player.beginScrubbing()
-                                } else {
-                                    player.endScrubbing()
+                                HStack {
+                                    Text(player.formattedTime(player.sliderPosition))
+                                    Spacer()
+                                    Text(player.formattedTime(player.duration))
                                 }
-                            }
-                        )
-
-                        HStack {
-                            Text(player.formattedTime(player.sliderPosition))
-                            Spacer()
-                            Text(player.formattedTime(player.duration))
-                        }
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    }
-
-                    HStack(spacing: 12) {
-                        Button(action: player.seekBackward15) {
-                            Label("-15", systemImage: "gobackward.15")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button(action: player.togglePlayback) {
-                            Label(player.isPlaying ? "暫停" : "播放", systemImage: player.isPlaying ? "pause.fill" : "play.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-
-                        Button(action: player.seekForward15) {
-                            Label("+15", systemImage: "goforward.15")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    HStack(spacing: 12) {
-                        Button("上一首") { player.playPrevious() }
-                            .buttonStyle(.bordered)
-                        Button("下一首") { player.playNext() }
-                            .buttonStyle(.bordered)
-                    }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("歌詞")
-                                .font(.headline)
-                            Spacer()
-                            Button("載入") {
-                                player.loadLyricsForCurrentTrack()
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        if player.isLoadingLyrics {
-                            ProgressView("載入歌詞中...")
-                        } else if player.lyricsText.isEmpty {
-                            Text("尚未載入")
+                                .font(.caption)
                                 .foregroundColor(.secondary)
-                        } else {
-                            Text(player.lyricsText)
-                                .font(.footnote)
-                        }
-                    }
+                            }
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("播放佇列")
-                                .font(.headline)
-                        }
+                            HStack(spacing: 42) {
+                                Button(action: player.playPrevious) {
+                                    Image(systemName: "backward.fill")
+                                        .font(.system(size: 30, weight: .semibold))
+                                }
+                                .buttonStyle(.plain)
 
-                        ForEach(Array(player.queue.enumerated()), id: \.element.id) { index, track in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(track.title)
-                                        .lineLimit(1)
-                                    Text(track.artist)
-                                        .font(.caption)
+                                Button(action: player.togglePlayback) {
+                                    Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                                        .font(.system(size: 34, weight: .bold))
+                                        .frame(width: 86, height: 86)
+                                        .foregroundColor(.white)
+                                        .background(Circle().fill(Color.accentColor))
+                                }
+                                .buttonStyle(.plain)
+
+                                Button(action: player.playNext) {
+                                    Image(systemName: "forward.fill")
+                                        .font(.system(size: 30, weight: .semibold))
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            HStack(spacing: 26) {
+                                Button(action: player.seekBackward15) {
+                                    Image(systemName: "gobackward.15")
+                                }
+                                .buttonStyle(.plain)
+
+                                Button(action: player.seekForward15) {
+                                    Image(systemName: "goforward.15")
+                                }
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    player.toggleFavorite(track)
+                                } label: {
+                                    Image(systemName: player.isFavorite(track) ? "heart.fill" : "heart")
+                                }
+                                .buttonStyle(.plain)
+
+                                Button(action: player.loadLyricsForCurrentTrack) {
+                                    Image(systemName: "text.quote")
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .font(.system(size: 22, weight: .medium))
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack {
+                                    Text("歌詞")
+                                        .font(.headline)
+                                    Spacer()
+                                    if player.isLoadingLyrics {
+                                        ProgressView()
+                                    }
+                                }
+
+                                if player.lyricsText.isEmpty {
+                                    Text("尚未載入")
                                         .foregroundColor(.secondary)
+                                } else {
+                                    Text(player.lyricsText)
+                                        .font(.footnote)
+                                        .lineLimit(8)
                                 }
-                                Spacer()
-                                if player.currentQueueIndex == index {
-                                    Image(systemName: "speaker.wave.2.fill")
-                                        .foregroundColor(.accentColor)
-                                }
-                                Button("播放") {
-                                    player.playQueueItem(at: index)
-                                }
-                                .buttonStyle(.bordered)
-
-                                Button("刪除") {
-                                    player.removeQueueItem(at: IndexSet(integer: index))
-                                }
-                                .buttonStyle(.bordered)
                             }
-                            .padding(.vertical, 4)
+                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .fill(.ultraThinMaterial)
+                            )
+                        } else {
+                            VStack(spacing: 8) {
+                                Image(systemName: "music.note.list")
+                                    .font(.system(size: 44))
+                                    .foregroundColor(.secondary)
+                                Text("尚未開始播放")
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.top, 60)
                         }
+
+                        DisclosureGroup(isExpanded: $showAdvancedSource) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                TextField("https://example.com/audio.mp3", text: $player.streamURL)
+                                    .urlKeyboardIfAvailable()
+                                    .noAutoInputAdjustments()
+                                    .textFieldStyle(.roundedBorder)
+
+                                HStack {
+                                    Button("以網址播放") {
+                                        player.loadAndPlay()
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    Button("匯入本機音訊") {
+                                        isImportPickerPresented = true
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+                            .padding(.top, 8)
+                        } label: {
+                            Text("進階來源")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                        }
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(.ultraThinMaterial)
+                        )
                     }
+                    .padding(20)
                 }
-                .padding()
             }
             .navigationTitle("正在播放")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("關閉") {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
                         dismiss()
+                    } label: {
+                        Image(systemName: "chevron.down")
                     }
                 }
             }

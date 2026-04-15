@@ -1,12 +1,19 @@
 import AVFoundation
 import Foundation
+import MediaPlayer
 import SwiftUI
+
+#if os(iOS)
+import UIKit
+#endif
 
 @MainActor
 final class AudioPlayerViewModel: ObservableObject {
     @Published var streamURL: String = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
     @Published var searchQuery: String = ""
     @Published var searchResults: [YouTubeSearchSong] = []
+    @Published var autocompleteSuggestions: [String] = []
+    @Published var isLoadingAutocomplete: Bool = false
     @Published var isSearching: Bool = false
     @Published var activeDownloadTrackIds: Set<String> = []
 
@@ -38,6 +45,11 @@ final class AudioPlayerViewModel: ObservableObject {
     private var playbackCandidateURLs: [URL] = []
     private var playbackCandidateIndex: Int = 0
     private var activePlaybackTrackStableId: String?
+    private var autocompleteTask: Task<Void, Never>?
+
+    private var hasConfiguredRemoteCommands: Bool = false
+    private var nowPlayingArtworkSourceURL: String?
+    private var nowPlayingArtworkTask: Task<Void, Never>?
 
     private let youtubeService = YouTubeMusicService.shared
     private let lyricsService = LyricsService.shared
@@ -47,6 +59,9 @@ final class AudioPlayerViewModel: ObservableObject {
     private let downloadsStorageKey = "ios.downloads.v1"
     private let favoritesStorageKey = "ios.favorites.v1"
     private let historyStorageKey = "ios.history.v1"
+    private let searchHistoryStorageKey = "ios.searchHistory.v1"
+
+    private var searchHistory: [String] = []
 
     var nowPlayingTrack: AppTrack? {
         guard let currentQueueIndex, currentQueueIndex >= 0, currentQueueIndex < queue.count else {
@@ -58,10 +73,13 @@ final class AudioPlayerViewModel: ObservableObject {
     init() {
         AudioSessionConfigurator.configureForPlayback()
         observeAudioSessionInterruptions()
+        configureRemoteCommandCenterIfNeeded()
         restoreQueueState()
         restoreDownloadsState()
         restoreFavoritesState()
         restoreHistoryState()
+        restoreSearchHistoryState()
+        autocompleteSuggestions = Array(searchHistory.prefix(6))
     }
 
     deinit {
@@ -76,6 +94,8 @@ final class AudioPlayerViewModel: ObservableObject {
         }
         playerItemStatusObservationToken?.invalidate()
         playerItemKeepUpObservationToken?.invalidate()
+        autocompleteTask?.cancel()
+        nowPlayingArtworkTask?.cancel()
     }
 
     func loadAndPlay() {
@@ -108,6 +128,9 @@ final class AudioPlayerViewModel: ObservableObject {
             return
         }
 
+        saveSearchHistoryQuery(query)
+        autocompleteSuggestions = []
+
         isSearching = true
         defer { isSearching = false }
 
@@ -118,6 +141,31 @@ final class AudioPlayerViewModel: ObservableObject {
             searchResults = []
             statusMessage = "搜尋失敗：\(error.localizedDescription)"
         }
+    }
+
+    func scheduleAutocomplete() {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        autocompleteTask?.cancel()
+
+        if query.isEmpty {
+            autocompleteSuggestions = Array(searchHistory.prefix(6))
+            isLoadingAutocomplete = false
+            return
+        }
+
+        let local = localAutocompleteSuggestions(for: query)
+        autocompleteSuggestions = local
+
+        autocompleteTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.fetchRemoteAutocomplete(for: query, localSeed: local)
+        }
+    }
+
+    func applyAutocompleteSuggestion(_ suggestion: String) {
+        searchQuery = suggestion
+        autocompleteSuggestions = []
     }
 
     func playSearchResult(_ song: YouTubeSearchSong) {
@@ -224,6 +272,7 @@ final class AudioPlayerViewModel: ObservableObject {
                 self.currentQueueIndex = nil
                 player?.pause()
                 isPlaying = false
+                clearNowPlayingInfo()
             } else if currentQueueIndex >= queue.count {
                 self.currentQueueIndex = queue.count - 1
             }
@@ -301,12 +350,14 @@ final class AudioPlayerViewModel: ObservableObject {
         player?.play()
         isPlaying = true
         statusMessage = "播放中"
+        updateNowPlayingPlaybackState()
     }
 
     func pause() {
         player?.pause()
         isPlaying = false
         statusMessage = "已暫停"
+        updateNowPlayingPlaybackState()
     }
 
     func seekBackward15() {
@@ -393,6 +444,7 @@ final class AudioPlayerViewModel: ObservableObject {
         guard playbackCandidateURLs.indices.contains(playbackCandidateIndex) else {
             isPlaying = false
             statusMessage = "播放失敗：找不到可播放串流"
+            updateNowPlayingPlaybackState()
             return
         }
 
@@ -418,6 +470,7 @@ final class AudioPlayerViewModel: ObservableObject {
         player?.volume = 1.0
         player?.play()
         isPlaying = true
+        updateNowPlayingInfo(for: track)
 
         if playbackCandidateIndex == 0 {
             statusMessage = "緩衝中：\(track.title)"
@@ -437,6 +490,7 @@ final class AudioPlayerViewModel: ObservableObject {
         }
 
         playbackCandidateIndex = nextIndex
+        player?.pause()
         _ = AudioSessionConfigurator.configureForPlayback()
         startPlaybackAttempt(track: track)
         return true
@@ -448,6 +502,7 @@ final class AudioPlayerViewModel: ObservableObject {
         player.seek(to: target)
         currentTime = seconds
         sliderPosition = seconds
+        updateNowPlayingPlaybackState()
     }
 
     private func installPeriodicTimeObserver() {
@@ -481,6 +536,8 @@ final class AudioPlayerViewModel: ObservableObject {
                 } else if assetDuration.isFinite && assetDuration > 0 {
                     self.duration = assetDuration
                 }
+
+                self.updateNowPlayingPlaybackState()
             }
         }
     }
@@ -507,8 +564,10 @@ final class AudioPlayerViewModel: ObservableObject {
                         } else {
                             self.statusMessage = "播放中（備援）：\(trackTitle)"
                         }
+                        self.updateNowPlayingPlaybackState()
                     } else {
                         self.statusMessage = "已就緒：\(trackTitle)"
+                        self.updateNowPlayingInfo(for: track)
                     }
                 case .failed:
                     if self.tryFallbackPlaybackIfNeeded(for: track) {
@@ -518,6 +577,7 @@ final class AudioPlayerViewModel: ObservableObject {
                     self.isPlaying = false
                     let message = self.describePlaybackFailure(from: observedItem)
                     self.statusMessage = "播放失敗：\(message)"
+                    self.updateNowPlayingPlaybackState()
                 case .unknown:
                     break
                 @unknown default:
@@ -557,6 +617,7 @@ final class AudioPlayerViewModel: ObservableObject {
                 self.currentTime = 0
                 self.sliderPosition = 0
                 self.player?.seek(to: .zero)
+                self.updateNowPlayingPlaybackState()
 
                 if self.shouldAutoPlayNext {
                     self.playNext()
@@ -592,6 +653,168 @@ final class AudioPlayerViewModel: ObservableObject {
         return "unknown error"
     }
 
+    private func fetchRemoteAutocomplete(for query: String, localSeed: [String]) async {
+        isLoadingAutocomplete = true
+        defer { isLoadingAutocomplete = false }
+
+        do {
+            let remote = try await youtubeService.autocompleteSuggestions(query: query)
+            var merged = localSeed
+            for item in remote where !merged.contains(where: { $0.caseInsensitiveCompare(item) == .orderedSame }) {
+                merged.append(item)
+            }
+            autocompleteSuggestions = Array(merged.prefix(10))
+        } catch {
+            autocompleteSuggestions = localSeed
+        }
+    }
+
+    private func localAutocompleteSuggestions(for query: String) -> [String] {
+        let normalized = query.lowercased()
+        let prefixMatches = searchHistory.filter {
+            $0.lowercased().hasPrefix(normalized)
+        }
+        let containsMatches = searchHistory.filter {
+            !$0.lowercased().hasPrefix(normalized) && $0.lowercased().contains(normalized)
+        }
+        return Array((prefixMatches + containsMatches).prefix(8))
+    }
+
+    private func saveSearchHistoryQuery(_ query: String) {
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+
+        searchHistory.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        searchHistory.insert(normalized, at: 0)
+        if searchHistory.count > 30 {
+            searchHistory.removeLast(searchHistory.count - 30)
+        }
+
+        if let data = try? JSONEncoder().encode(searchHistory) {
+            UserDefaults.standard.set(data, forKey: searchHistoryStorageKey)
+        }
+    }
+
+    private func restoreSearchHistoryState() {
+        guard
+            let data = UserDefaults.standard.data(forKey: searchHistoryStorageKey),
+            let restored = try? JSONDecoder().decode([String].self, from: data)
+        else {
+            return
+        }
+
+        searchHistory = restored
+    }
+
+    private func configureRemoteCommandCenterIfNeeded() {
+#if os(iOS)
+        guard !hasConfiguredRemoteCommands else { return }
+        let commandCenter = MPRemoteCommandCenter.shared()
+
+        commandCenter.playCommand.isEnabled = true
+        commandCenter.pauseCommand.isEnabled = true
+        commandCenter.nextTrackCommand.isEnabled = true
+        commandCenter.previousTrackCommand.isEnabled = true
+        commandCenter.changePlaybackPositionCommand.isEnabled = true
+
+        commandCenter.playCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.play() }
+            return .success
+        }
+        commandCenter.pauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.pause() }
+            return .success
+        }
+        commandCenter.nextTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.playNext() }
+            return .success
+        }
+        commandCenter.previousTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.playPrevious() }
+            return .success
+        }
+        commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let changeEvent = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            Task { @MainActor in
+                self?.seek(to: changeEvent.positionTime)
+            }
+            return .success
+        }
+
+        hasConfiguredRemoteCommands = true
+#endif
+    }
+
+    private func updateNowPlayingInfo(for track: AppTrack) {
+#if os(iOS)
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPMediaItemPropertyTitle] = track.title
+        info[MPMediaItemPropertyArtist] = track.artist
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(currentTime, 0)
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        if duration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = duration
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+
+        updateNowPlayingArtworkIfNeeded(for: track)
+#endif
+    }
+
+    private func updateNowPlayingPlaybackState() {
+#if os(iOS)
+        guard nowPlayingTrack != nil else {
+            return
+        }
+
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(currentTime, 0)
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        if duration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = duration
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+#endif
+    }
+
+    private func clearNowPlayingInfo() {
+#if os(iOS)
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+#endif
+    }
+
+    private func updateNowPlayingArtworkIfNeeded(for track: AppTrack) {
+#if os(iOS)
+        guard let rawURL = track.thumbnailURL, !rawURL.isEmpty else {
+            return
+        }
+
+        guard nowPlayingArtworkSourceURL != rawURL else {
+            return
+        }
+
+        nowPlayingArtworkSourceURL = rawURL
+        nowPlayingArtworkTask?.cancel()
+
+        nowPlayingArtworkTask = Task {
+            guard let url = URL(string: rawURL) else { return }
+            guard let (data, _) = try? await URLSession.shared.data(from: url) else { return }
+            guard !Task.isCancelled else { return }
+            guard let image = UIImage(data: data) else { return }
+
+            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+            info[MPMediaItemPropertyArtwork] = artwork
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        }
+#endif
+    }
+
     private func observeAudioSessionInterruptions() {
 #if os(iOS)
         audioInterruptionObserverToken = NotificationCenter.default.addObserver(
@@ -625,6 +848,7 @@ final class AudioPlayerViewModel: ObservableObject {
                         self.player?.play()
                         self.isPlaying = true
                         self.statusMessage = "播放中"
+                        self.updateNowPlayingPlaybackState()
                     }
                 @unknown default:
                     break
