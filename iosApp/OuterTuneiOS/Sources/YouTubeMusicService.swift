@@ -91,22 +91,29 @@ final class YouTubeMusicService {
     }
 
     func resolveAudioStreamURL(videoId: String) async throws -> URL {
-        for profile in playerClientProfiles {
-            if let url = try await fetchPlayableURL(videoId: videoId, profile: profile, allowWebM: false) {
-                return url
-            }
+        guard let firstURL = try await resolveAudioStreamURLs(videoId: videoId).first else {
+            throw YouTubeMusicServiceError.noPlayableStream
         }
-
-        // As a fallback, try WebM if every profile lacks iOS-friendly formats.
-        for profile in playerClientProfiles {
-            if let url = try await fetchPlayableURL(videoId: videoId, profile: profile, allowWebM: true) {
-                return url
-            }
-        }
-        throw YouTubeMusicServiceError.noPlayableStream
+        return firstURL
     }
 
-    private func fetchPlayableURL(videoId: String, profile: PlayerClientProfile, allowWebM: Bool) async throws -> URL? {
+    func resolveAudioStreamURLs(videoId: String, limit: Int = 12) async throws -> [URL] {
+        var orderedURLs: [URL] = []
+
+        for profile in playerClientProfiles {
+            let urls = try await fetchPlayableURLs(videoId: videoId, profile: profile, allowWebM: false)
+            orderedURLs.append(contentsOf: urls)
+        }
+
+        let deduplicated = deduplicate(urls: orderedURLs)
+        if deduplicated.isEmpty {
+            throw YouTubeMusicServiceError.noPlayableStream
+        }
+
+        return Array(deduplicated.prefix(max(limit, 1)))
+    }
+
+    private func fetchPlayableURLs(videoId: String, profile: PlayerClientProfile, allowWebM: Bool) async throws -> [URL] {
         let payload: [String: Any] = [
             "context": [
                 "client": [
@@ -131,13 +138,21 @@ final class YouTubeMusicService {
         )
 
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+            return []
         }
 
         guard
             let streamingData = object["streamingData"] as? [String: Any]
         else {
-            return nil
+            return []
+        }
+
+        var resolved: [URL] = []
+
+        // HLS manifests are usually the most compatible option on iOS AVPlayer.
+        if let hlsManifest = streamingData["hlsManifestUrl"] as? String,
+           let hlsURL = URL(string: hlsManifest) {
+            resolved.append(hlsURL)
         }
 
         let adaptive = (streamingData["adaptiveFormats"] as? [[String: Any]]) ?? []
@@ -149,13 +164,9 @@ final class YouTubeMusicService {
             }
             .sorted { playbackPriority(for: $0) > playbackPriority(for: $1) }
 
-        for format in sortedAudioFormats {
-            if let url = extractPlayableURL(from: format) {
-                return url
-            }
-        }
+        resolved.append(contentsOf: sortedAudioFormats.compactMap { extractPlayableURL(from: $0) })
 
-        return nil
+        return deduplicate(urls: resolved)
     }
 
     private func requestJSON(
@@ -306,7 +317,18 @@ final class YouTubeMusicService {
         guard let mimeType = (format["mimeType"] as? String)?.lowercased() else {
             return false
         }
-        return mimeType.contains("audio/")
+
+        guard mimeType.contains("audio/") else {
+            return false
+        }
+
+        // Restrict to codecs/container families that are known to decode reliably in iOS AVPlayer.
+        return mimeType.contains("audio/mp4") ||
+            mimeType.contains("mp4a") ||
+            mimeType.contains("audio/mpeg") ||
+            mimeType.contains("audio/mp3") ||
+            mimeType.contains("audio/aac") ||
+            mimeType.contains("audio/x-m4a")
     }
 
     private func isWebMFormat(_ format: [String: Any]) -> Bool {
@@ -347,6 +369,20 @@ final class YouTubeMusicService {
         let regex = try? NSRegularExpression(pattern: "^\\d{1,2}:\\d{2}(:\\d{2})?$")
         let range = NSRange(location: 0, length: value.utf16.count)
         return regex?.firstMatch(in: value, range: range) != nil
+    }
+
+    private func deduplicate(urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        var result: [URL] = []
+
+        for url in urls {
+            let key = url.absoluteString
+            if seen.insert(key).inserted {
+                result.append(url)
+            }
+        }
+
+        return result
     }
 }
 

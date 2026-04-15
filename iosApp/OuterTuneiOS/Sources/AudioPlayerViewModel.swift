@@ -35,6 +35,10 @@ final class AudioPlayerViewModel: ObservableObject {
     private var playerItemStatusObservationToken: NSKeyValueObservation?
     private var playerItemKeepUpObservationToken: NSKeyValueObservation?
 
+    private var playbackCandidateURLs: [URL] = []
+    private var playbackCandidateIndex: Int = 0
+    private var activePlaybackTrackStableId: String?
+
     private let youtubeService = YouTubeMusicService.shared
     private let lyricsService = LyricsService.shared
 
@@ -351,51 +355,91 @@ final class AudioPlayerViewModel: ObservableObject {
         statusMessage = "解析串流中..."
         do {
             _ = AudioSessionConfigurator.configureForPlayback()
-            let resolvedURL = try await resolvePlayableURL(for: track)
-            streamURL = resolvedURL.absoluteString
-            let item = AVPlayerItem(url: resolvedURL)
-            if player == nil {
-                player = AVPlayer(playerItem: item)
-                installPeriodicTimeObserver()
-            } else {
-                player?.replaceCurrentItem(with: item)
+            playbackCandidateURLs = try await resolvePlayableURLs(for: track)
+            playbackCandidateIndex = 0
+            activePlaybackTrackStableId = track.stableId
+
+            guard !playbackCandidateURLs.isEmpty else {
+                throw YouTubeMusicServiceError.noPlayableStream
             }
 
-            currentTime = 0
-            sliderPosition = 0
-            duration = inferredFallbackDuration(for: track, streamURL: resolvedURL) ?? 0
-            lyricsText = ""
-
-            observePlayerItemState(item: item, trackTitle: track.title)
-            observePlaybackEnd(item: item)
-            player?.isMuted = false
-            player?.volume = 1.0
-            player?.play()
-            isPlaying = true
+            startPlaybackAttempt(track: track)
             trackDidStartPlaying(track)
-            statusMessage = "緩衝中：\(track.title)"
         } catch {
             isPlaying = false
             statusMessage = "播放失敗：\(error.localizedDescription)"
         }
     }
 
-    private func resolvePlayableURL(for track: AppTrack) async throws -> URL {
+    private func resolvePlayableURLs(for track: AppTrack) async throws -> [URL] {
         switch track.source {
         case .directURL(let urlString):
             guard let url = URL(string: urlString) else {
                 throw YouTubeMusicServiceError.invalidResponse
             }
-            return url
+            return [url]
         case .youtube(let videoId):
-            return try await youtubeService.resolveAudioStreamURL(videoId: videoId)
+            return try await youtubeService.resolveAudioStreamURLs(videoId: videoId)
         case .localFile(let relativePath):
             let localURL = localFileURL(relativePath: relativePath)
             if FileManager.default.fileExists(atPath: localURL.path) {
-                return localURL
+                return [localURL]
             }
             throw YouTubeMusicServiceError.invalidResponse
         }
+    }
+
+    private func startPlaybackAttempt(track: AppTrack) {
+        guard playbackCandidateURLs.indices.contains(playbackCandidateIndex) else {
+            isPlaying = false
+            statusMessage = "播放失敗：找不到可播放串流"
+            return
+        }
+
+        let resolvedURL = playbackCandidateURLs[playbackCandidateIndex]
+        streamURL = resolvedURL.absoluteString
+
+        let item = AVPlayerItem(url: resolvedURL)
+        if player == nil {
+            player = AVPlayer(playerItem: item)
+            installPeriodicTimeObserver()
+        } else {
+            player?.replaceCurrentItem(with: item)
+        }
+
+        currentTime = 0
+        sliderPosition = 0
+        duration = inferredFallbackDuration(for: track, streamURL: resolvedURL) ?? 0
+        lyricsText = ""
+
+        observePlayerItemState(item: item, track: track)
+        observePlaybackEnd(item: item)
+        player?.isMuted = false
+        player?.volume = 1.0
+        player?.play()
+        isPlaying = true
+
+        if playbackCandidateIndex == 0 {
+            statusMessage = "緩衝中：\(track.title)"
+        } else {
+            statusMessage = "切換備援串流 \(playbackCandidateIndex + 1)/\(playbackCandidateURLs.count)..."
+        }
+    }
+
+    private func tryFallbackPlaybackIfNeeded(for track: AppTrack) -> Bool {
+        guard activePlaybackTrackStableId == track.stableId else {
+            return false
+        }
+
+        let nextIndex = playbackCandidateIndex + 1
+        guard playbackCandidateURLs.indices.contains(nextIndex) else {
+            return false
+        }
+
+        playbackCandidateIndex = nextIndex
+        _ = AudioSessionConfigurator.configureForPlayback()
+        startPlaybackAttempt(track: track)
+        return true
     }
 
     private func seek(to seconds: Double) {
@@ -441,9 +485,11 @@ final class AudioPlayerViewModel: ObservableObject {
         }
     }
 
-    private func observePlayerItemState(item: AVPlayerItem, trackTitle: String) {
+    private func observePlayerItemState(item: AVPlayerItem, track: AppTrack) {
         playerItemStatusObservationToken?.invalidate()
         playerItemKeepUpObservationToken?.invalidate()
+
+        let trackTitle = track.title
 
         playerItemStatusObservationToken = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
             Task { @MainActor in
@@ -456,13 +502,21 @@ final class AudioPlayerViewModel: ObservableObject {
                         self.duration = resolvedDuration
                     }
                     if self.isPlaying {
-                        self.statusMessage = "播放中：\(trackTitle)"
+                        if self.playbackCandidateIndex == 0 {
+                            self.statusMessage = "播放中：\(trackTitle)"
+                        } else {
+                            self.statusMessage = "播放中（備援）：\(trackTitle)"
+                        }
                     } else {
                         self.statusMessage = "已就緒：\(trackTitle)"
                     }
                 case .failed:
+                    if self.tryFallbackPlaybackIfNeeded(for: track) {
+                        return
+                    }
+
                     self.isPlaying = false
-                    let message = observedItem.error?.localizedDescription ?? "音訊格式不支援或串流已失效"
+                    let message = self.describePlaybackFailure(from: observedItem)
                     self.statusMessage = "播放失敗：\(message)"
                 case .unknown:
                     break
@@ -511,6 +565,31 @@ final class AudioPlayerViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func describePlaybackFailure(from item: AVPlayerItem) -> String {
+        if let error = item.error as NSError? {
+            if error.domain == "CoreMediaErrorDomain", error.code == -12660 {
+                return "串流格式不相容（CoreMedia -12660）"
+            }
+
+            if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+                if underlying.domain == "CoreMediaErrorDomain", underlying.code == -12660 {
+                    return "串流格式不相容（CoreMedia -12660）"
+                }
+                return "\(error.localizedDescription) [\(underlying.domain):\(underlying.code)]"
+            }
+            return "\(error.localizedDescription) [\(error.domain):\(error.code)]"
+        }
+
+        if let event = item.errorLog()?.events.last {
+            if event.errorStatusCode != 0 {
+                return "串流錯誤碼 \(event.errorStatusCode)"
+            }
+            return "串流暫時不可用"
+        }
+
+        return "unknown error"
     }
 
     private func observeAudioSessionInterruptions() {
@@ -566,7 +645,9 @@ final class AudioPlayerViewModel: ObservableObject {
 
         do {
             statusMessage = "下載中：\(track.title)"
-            let streamURL = try await resolvePlayableURL(for: track)
+            guard let streamURL = try await resolvePlayableURLs(for: track).first else {
+                throw YouTubeMusicServiceError.noPlayableStream
+            }
             let downloadedTrack = try await downloadAudioFile(from: streamURL, originalTrack: track)
 
             downloadedTracks.removeAll { $0.stableId == downloadedTrack.stableId }
