@@ -34,15 +34,20 @@ final class AudioPlayerViewModel: ObservableObject {
     @Published var downloadedTracks: [AppTrack] = []
     @Published var favoriteTracks: [AppTrack] = []
     @Published var playbackHistory: [AppTrack] = []
+    @Published var audioQualityPreference: AudioQualityPreference = .auto
+    @Published private(set) var availableStreamOptions: [AudioStreamOption] = []
+    @Published private(set) var nowPlayingStreamInfo: AudioStreamOption?
 
     private var player: AVPlayer?
     private var periodicObserverToken: Any?
     private var playbackEndObserverToken: NSObjectProtocol?
     private var audioInterruptionObserverToken: NSObjectProtocol?
+    private var audioRouteChangeObserverToken: NSObjectProtocol?
+    private var mediaServicesResetObserverToken: NSObjectProtocol?
     private var playerItemStatusObservationToken: NSKeyValueObservation?
     private var playerItemKeepUpObservationToken: NSKeyValueObservation?
 
-    private var playbackCandidateURLs: [URL] = []
+    private var playbackCandidates: [AudioStreamOption] = []
     private var playbackCandidateIndex: Int = 0
     private var activePlaybackTrackStableId: String?
     private var autocompleteTask: Task<Void, Never>?
@@ -60,6 +65,7 @@ final class AudioPlayerViewModel: ObservableObject {
     private let favoritesStorageKey = "ios.favorites.v1"
     private let historyStorageKey = "ios.history.v1"
     private let searchHistoryStorageKey = "ios.searchHistory.v1"
+    private let audioQualityStorageKey = "ios.audioQualityPreference.v1"
 
     private var searchHistory: [String] = []
 
@@ -78,6 +84,7 @@ final class AudioPlayerViewModel: ObservableObject {
         restoreDownloadsState()
         restoreFavoritesState()
         restoreHistoryState()
+        restoreAudioQualityPreferenceState()
         restoreSearchHistoryState()
         autocompleteSuggestions = Array(searchHistory.prefix(6))
     }
@@ -91,6 +98,12 @@ final class AudioPlayerViewModel: ObservableObject {
         }
         if let interruptionToken = audioInterruptionObserverToken {
             NotificationCenter.default.removeObserver(interruptionToken)
+        }
+        if let routeChangeToken = audioRouteChangeObserverToken {
+            NotificationCenter.default.removeObserver(routeChangeToken)
+        }
+        if let mediaResetToken = mediaServicesResetObserverToken {
+            NotificationCenter.default.removeObserver(mediaResetToken)
         }
         playerItemStatusObservationToken?.invalidate()
         playerItemKeepUpObservationToken?.invalidate()
@@ -272,6 +285,9 @@ final class AudioPlayerViewModel: ObservableObject {
                 self.currentQueueIndex = nil
                 player?.pause()
                 isPlaying = false
+                playbackCandidates = []
+                availableStreamOptions = []
+                nowPlayingStreamInfo = nil
                 clearNowPlayingInfo()
             } else if currentQueueIndex >= queue.count {
                 self.currentQueueIndex = queue.count - 1
@@ -297,6 +313,68 @@ final class AudioPlayerViewModel: ObservableObject {
             return
         }
         playQueueItem(at: currentQueueIndex - 1)
+    }
+
+    func setAudioQualityPreference(_ preference: AudioQualityPreference) {
+        guard audioQualityPreference != preference else {
+            return
+        }
+
+        audioQualityPreference = preference
+        persistAudioQualityPreferenceState()
+
+        guard let track = nowPlayingTrack else {
+            return
+        }
+
+        playbackCandidates = prioritizePlaybackCandidates(playbackCandidates)
+        availableStreamOptions = playbackCandidates
+
+        guard !playbackCandidates.isEmpty else {
+            return
+        }
+
+        let resumeTime = currentTime
+        playbackCandidateIndex = 0
+        statusMessage = "音質：\(preference.displayName)"
+        player?.pause()
+        _ = AudioSessionConfigurator.configureForPlayback()
+        startPlaybackAttempt(track: track)
+
+        if resumeTime > 1 {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                self?.seekAfterSwitch(resumeTime: resumeTime)
+            }
+        }
+    }
+
+    func selectAudioStream(_ stream: AudioStreamOption) {
+        guard let track = nowPlayingTrack else {
+            return
+        }
+
+        guard let index = playbackCandidates.firstIndex(where: { $0.id == stream.id }) else {
+            return
+        }
+
+        guard index != playbackCandidateIndex else {
+            return
+        }
+
+        let resumeTime = currentTime
+        playbackCandidateIndex = index
+        statusMessage = "切換來源：\(stream.displayTitle)"
+        player?.pause()
+        _ = AudioSessionConfigurator.configureForPlayback()
+        startPlaybackAttempt(track: track)
+
+        if resumeTime > 1 {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                self?.seekAfterSwitch(resumeTime: resumeTime)
+            }
+        }
     }
 
     func loadLyricsForCurrentTrack() {
@@ -406,11 +484,13 @@ final class AudioPlayerViewModel: ObservableObject {
         statusMessage = "解析串流中..."
         do {
             _ = AudioSessionConfigurator.configureForPlayback()
-            playbackCandidateURLs = try await resolvePlayableURLs(for: track)
+            playbackCandidates = try await resolvePlayableStreams(for: track)
+            availableStreamOptions = playbackCandidates
             playbackCandidateIndex = 0
             activePlaybackTrackStableId = track.stableId
+            nowPlayingStreamInfo = playbackCandidates.first
 
-            guard !playbackCandidateURLs.isEmpty else {
+            guard !playbackCandidates.isEmpty else {
                 throw YouTubeMusicServiceError.noPlayableStream
             }
 
@@ -418,37 +498,77 @@ final class AudioPlayerViewModel: ObservableObject {
             trackDidStartPlaying(track)
         } catch {
             isPlaying = false
+            playbackCandidates = []
+            availableStreamOptions = []
+            nowPlayingStreamInfo = nil
             statusMessage = "播放失敗：\(error.localizedDescription)"
         }
     }
 
-    private func resolvePlayableURLs(for track: AppTrack) async throws -> [URL] {
+    private func resolvePlayableStreams(for track: AppTrack) async throws -> [AudioStreamOption] {
         switch track.source {
         case .directURL(let urlString):
             guard let url = URL(string: urlString) else {
                 throw YouTubeMusicServiceError.invalidResponse
             }
-            return [url]
+            return [
+                AudioStreamOption(
+                    id: "direct:\(url.absoluteString)",
+                    url: url,
+                    sourceClientName: "DIRECT",
+                    sourceClientVersion: "-",
+                    mimeType: nil,
+                    codec: nil,
+                    container: "URL",
+                    bitrate: nil,
+                    averageBitrate: nil,
+                    audioQuality: nil,
+                    contentLength: nil,
+                    itag: nil,
+                    isHLSManifest: false
+                )
+            ]
         case .youtube(let videoId):
-            return try await youtubeService.resolveAudioStreamURLs(videoId: videoId)
+            let resolved = try await youtubeService.resolveAudioStreams(videoId: videoId)
+            return prioritizePlaybackCandidates(resolved)
         case .localFile(let relativePath):
             let localURL = localFileURL(relativePath: relativePath)
             if FileManager.default.fileExists(atPath: localURL.path) {
-                return [localURL]
+                let ext = localURL.pathExtension.uppercased()
+                return [
+                    AudioStreamOption(
+                        id: "local:\(localURL.absoluteString)",
+                        url: localURL,
+                        sourceClientName: "LOCAL",
+                        sourceClientVersion: "-",
+                        mimeType: nil,
+                        codec: nil,
+                        container: ext.isEmpty ? "LOCAL" : ext,
+                        bitrate: nil,
+                        averageBitrate: nil,
+                        audioQuality: nil,
+                        contentLength: nil,
+                        itag: nil,
+                        isHLSManifest: false
+                    )
+                ]
             }
             throw YouTubeMusicServiceError.invalidResponse
         }
     }
 
     private func startPlaybackAttempt(track: AppTrack) {
-        guard playbackCandidateURLs.indices.contains(playbackCandidateIndex) else {
+        guard playbackCandidates.indices.contains(playbackCandidateIndex) else {
             isPlaying = false
+            nowPlayingStreamInfo = nil
             statusMessage = "播放失敗：找不到可播放串流"
             updateNowPlayingPlaybackState()
             return
         }
 
-        let resolvedURL = playbackCandidateURLs[playbackCandidateIndex]
+        let selectedStream = playbackCandidates[playbackCandidateIndex]
+        let resolvedURL = selectedStream.url
+        nowPlayingStreamInfo = selectedStream
         streamURL = resolvedURL.absoluteString
 
         let item = AVPlayerItem(url: resolvedURL)
@@ -475,7 +595,7 @@ final class AudioPlayerViewModel: ObservableObject {
         if playbackCandidateIndex == 0 {
             statusMessage = "緩衝中：\(track.title)"
         } else {
-            statusMessage = "切換備援串流 \(playbackCandidateIndex + 1)/\(playbackCandidateURLs.count)..."
+            statusMessage = "切換備援串流 \(playbackCandidateIndex + 1)/\(playbackCandidates.count)..."
         }
     }
 
@@ -485,7 +605,7 @@ final class AudioPlayerViewModel: ObservableObject {
         }
 
         let nextIndex = playbackCandidateIndex + 1
-        guard playbackCandidateURLs.indices.contains(nextIndex) else {
+        guard playbackCandidates.indices.contains(nextIndex) else {
             return false
         }
 
@@ -817,9 +937,11 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func observeAudioSessionInterruptions() {
 #if os(iOS)
+        let audioSession = AVAudioSession.sharedInstance()
+
         audioInterruptionObserverToken = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
-            object: AVAudioSession.sharedInstance(),
+            object: audioSession,
             queue: .main
         ) { [weak self] notification in
             Task { @MainActor in
@@ -843,18 +965,73 @@ final class AudioPlayerViewModel: ObservableObject {
                     _ = AudioSessionConfigurator.configureForPlayback()
 
                     if options.contains(.shouldResume) {
-                        self.player?.isMuted = false
-                        self.player?.volume = 1.0
-                        self.player?.play()
                         self.isPlaying = true
-                        self.statusMessage = "播放中"
-                        self.updateNowPlayingPlaybackState()
+                        self.refreshAudioOutput(shouldForcePlay: true, status: "播放中")
                     }
                 @unknown default:
                     break
                 }
             }
         }
+
+        audioRouteChangeObserverToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor in
+                guard let self else { return }
+
+                let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+                guard let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason) else {
+                    return
+                }
+
+                switch reason {
+                case .newDeviceAvailable, .oldDeviceUnavailable, .categoryChange, .override, .routeConfigurationChange:
+                    self.refreshAudioOutput(shouldForcePlay: self.isPlaying)
+                default:
+                    break
+                }
+            }
+        }
+
+        mediaServicesResetObserverToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+
+                _ = AudioSessionConfigurator.configureForPlayback()
+                guard self.isPlaying, let queueIndex = self.currentQueueIndex else {
+                    self.refreshAudioOutput(shouldForcePlay: false)
+                    return
+                }
+
+                self.statusMessage = "音訊服務重置，重新載入中..."
+                Task {
+                    await self.playTrack(at: queueIndex)
+                }
+            }
+        }
+#endif
+    }
+
+    private func refreshAudioOutput(shouldForcePlay: Bool, status: String? = nil) {
+#if os(iOS)
+        _ = AudioSessionConfigurator.configureForPlayback()
+        player?.isMuted = false
+        player?.volume = 1.0
+        if shouldForcePlay {
+            player?.play()
+            isPlaying = true
+        }
+        if let status {
+            statusMessage = status
+        }
+        updateNowPlayingPlaybackState()
 #endif
     }
 
@@ -869,7 +1046,7 @@ final class AudioPlayerViewModel: ObservableObject {
 
         do {
             statusMessage = "下載中：\(track.title)"
-            guard let streamURL = try await resolvePlayableURLs(for: track).first else {
+            guard let streamURL = try await resolvePlayableStreams(for: track).first?.url else {
                 throw YouTubeMusicServiceError.noPlayableStream
             }
             let downloadedTrack = try await downloadAudioFile(from: streamURL, originalTrack: track)
@@ -882,6 +1059,84 @@ final class AudioPlayerViewModel: ObservableObject {
         } catch {
             statusMessage = "下載失敗：\(error.localizedDescription)"
         }
+    }
+
+    private func prioritizePlaybackCandidates(_ candidates: [AudioStreamOption]) -> [AudioStreamOption] {
+        guard audioQualityPreference != .auto else {
+            return candidates
+        }
+
+        let knownBitrate = candidates.enumerated().filter { (_, stream) in
+            guard let bitrate = stream.effectiveBitrate else {
+                return false
+            }
+            return bitrate > 0
+        }
+
+        let unknownBitrate = candidates.enumerated().filter { (_, stream) in
+            stream.effectiveBitrate == nil || stream.effectiveBitrate == 0
+        }
+
+        let sortedKnown = knownBitrate.sorted { lhs, rhs in
+            let leftBitrate = lhs.element.effectiveBitrate ?? 0
+            let rightBitrate = rhs.element.effectiveBitrate ?? 0
+
+            switch audioQualityPreference {
+            case .high:
+                if leftBitrate == rightBitrate {
+                    return lhs.offset < rhs.offset
+                }
+                return leftBitrate > rightBitrate
+            case .medium:
+                let target = 128_000
+                let leftDistance = abs(leftBitrate - target)
+                let rightDistance = abs(rightBitrate - target)
+                if leftDistance == rightDistance {
+                    if leftBitrate == rightBitrate {
+                        return lhs.offset < rhs.offset
+                    }
+                    return leftBitrate > rightBitrate
+                }
+                return leftDistance < rightDistance
+            case .low:
+                if leftBitrate == rightBitrate {
+                    return lhs.offset < rhs.offset
+                }
+                return leftBitrate < rightBitrate
+            case .auto:
+                return lhs.offset < rhs.offset
+            }
+        }
+
+        return sortedKnown.map(\.element) + unknownBitrate.map(\.element)
+    }
+
+    private func seekAfterSwitch(resumeTime: Double) {
+        let target: Double
+        if duration > 0 {
+            target = min(resumeTime, max(duration - 1, 0))
+        } else {
+            target = resumeTime
+        }
+
+        if target > 0 {
+            seek(to: target)
+        }
+    }
+
+    private func persistAudioQualityPreferenceState() {
+        UserDefaults.standard.set(audioQualityPreference.rawValue, forKey: audioQualityStorageKey)
+    }
+
+    private func restoreAudioQualityPreferenceState() {
+        guard
+            let rawValue = UserDefaults.standard.string(forKey: audioQualityStorageKey),
+            let restored = AudioQualityPreference(rawValue: rawValue)
+        else {
+            return
+        }
+
+        audioQualityPreference = restored
     }
 
     private func downloadAudioFile(from remoteURL: URL, originalTrack: AppTrack) async throws -> AppTrack {

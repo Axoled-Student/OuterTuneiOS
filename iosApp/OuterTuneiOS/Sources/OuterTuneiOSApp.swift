@@ -13,8 +13,11 @@ struct OuterTuneiOSApp: App {
             ContentView()
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .active {
+            switch phase {
+            case .active, .inactive, .background:
                 AudioSessionConfigurator.configureForPlayback()
+            @unknown default:
+                break
             }
         }
     }

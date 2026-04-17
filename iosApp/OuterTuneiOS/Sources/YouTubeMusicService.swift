@@ -1,5 +1,47 @@
 import Foundation
 
+struct AudioStreamOption: Identifiable, Equatable {
+    let id: String
+    let url: URL
+    let sourceClientName: String
+    let sourceClientVersion: String
+    let mimeType: String?
+    let codec: String?
+    let container: String
+    let bitrate: Int?
+    let averageBitrate: Int?
+    let audioQuality: String?
+    let contentLength: Int64?
+    let itag: Int?
+    let isHLSManifest: Bool
+
+    var effectiveBitrate: Int? {
+        averageBitrate ?? bitrate
+    }
+
+    var bitrateText: String {
+        guard let effectiveBitrate, effectiveBitrate > 0 else {
+            return "未知"
+        }
+        return "\(max(effectiveBitrate / 1000, 1)) kbps"
+    }
+
+    var displayTitle: String {
+        if isHLSManifest {
+            return "HLS 自適應"
+        }
+        return "\(container) • \(bitrateText)"
+    }
+
+    var shortDescription: String {
+        var parts: [String] = [container, bitrateText]
+        if let codec, !codec.isEmpty {
+            parts.append(codec)
+        }
+        return parts.joined(separator: " • ")
+    }
+}
+
 enum YouTubeMusicServiceError: LocalizedError {
     case invalidResponse
     case parsingFailed
@@ -151,26 +193,101 @@ final class YouTubeMusicService {
     }
 
     func resolveAudioStreamURL(videoId: String) async throws -> URL {
-        guard let firstURL = try await resolveAudioStreamURLs(videoId: videoId).first else {
+        guard let firstURL = try await resolveAudioStreams(videoId: videoId).first?.url else {
             throw YouTubeMusicServiceError.noPlayableStream
         }
         return firstURL
     }
 
     func resolveAudioStreamURLs(videoId: String, limit: Int = 12) async throws -> [URL] {
-        var orderedURLs: [URL] = []
+        let streams = try await resolveAudioStreams(videoId: videoId, limit: limit)
+        return streams.map(\.url)
+    }
+
+    func resolveAudioStreams(videoId: String, limit: Int = 12) async throws -> [AudioStreamOption] {
+        var orderedStreams: [AudioStreamOption] = []
 
         for profile in playerClientProfiles {
-            let urls = try await fetchPlayableURLs(videoId: videoId, profile: profile, allowWebM: false)
-            orderedURLs.append(contentsOf: urls)
+            let streams = try await fetchPlayableStreams(videoId: videoId, profile: profile, allowWebM: false)
+            orderedStreams.append(contentsOf: streams)
         }
 
-        let deduplicated = deduplicate(urls: orderedURLs)
+        let deduplicated = deduplicate(streams: orderedStreams)
         if deduplicated.isEmpty {
             throw YouTubeMusicServiceError.noPlayableStream
         }
 
         return Array(deduplicated.prefix(max(limit, 1)))
+    }
+
+    private func fetchPlayableStreams(videoId: String, profile: PlayerClientProfile, allowWebM: Bool) async throws -> [AudioStreamOption] {
+        let payload: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": profile.clientName,
+                    "clientVersion": profile.clientVersion,
+                    "hl": "en",
+                    "gl": "US",
+                    "osVersion": profile.osVersion
+                ]
+            ],
+            "videoId": videoId,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+
+        let data = try await requestJSON(
+            endpoint: "https://music.youtube.com/youtubei/v1/player",
+            payload: payload,
+            clientName: profile.clientId,
+            clientVersion: profile.clientVersion,
+            userAgent: profile.userAgent
+        )
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        guard
+            let streamingData = object["streamingData"] as? [String: Any]
+        else {
+            return []
+        }
+
+        var resolved: [AudioStreamOption] = []
+
+        if let hlsManifest = streamingData["hlsManifestUrl"] as? String,
+           let hlsURL = URL(string: hlsManifest) {
+            resolved.append(
+                AudioStreamOption(
+                    id: "hls:\(profile.clientName):\(hlsURL.absoluteString)",
+                    url: hlsURL,
+                    sourceClientName: profile.clientName,
+                    sourceClientVersion: profile.clientVersion,
+                    mimeType: "application/x-mpegURL",
+                    codec: nil,
+                    container: "HLS",
+                    bitrate: nil,
+                    averageBitrate: nil,
+                    audioQuality: "AUTO",
+                    contentLength: nil,
+                    itag: nil,
+                    isHLSManifest: true
+                )
+            )
+        }
+
+        let adaptive = (streamingData["adaptiveFormats"] as? [[String: Any]]) ?? []
+        let formats = (streamingData["formats"] as? [[String: Any]]) ?? []
+        let candidates = adaptive + formats
+        let sortedAudioFormats = candidates
+            .filter { format in
+                isLikelyAudioFormat(format) && (allowWebM || !isWebMFormat(format))
+            }
+            .sorted { playbackPriority(for: $0) > playbackPriority(for: $1) }
+
+        resolved.append(contentsOf: sortedAudioFormats.compactMap { extractPlayableStream(from: $0, profile: profile) })
+        return deduplicate(streams: resolved)
     }
 
     private func fetchPlayableURLs(videoId: String, profile: PlayerClientProfile, allowWebM: Bool) async throws -> [URL] {
@@ -442,6 +559,94 @@ final class YouTubeMusicService {
         return finalComponents.url
     }
 
+    private func extractPlayableStream(from format: [String: Any], profile: PlayerClientProfile) -> AudioStreamOption? {
+        guard let url = extractPlayableURL(from: format) else {
+            return nil
+        }
+
+        let mimeType = format["mimeType"] as? String
+        let codec = parseCodec(from: mimeType)
+        let container = containerLabel(from: mimeType)
+        let bitrate = format["bitrate"] as? Int
+        let averageBitrate = format["averageBitrate"] as? Int
+        let audioQuality = format["audioQuality"] as? String
+        let itag = format["itag"] as? Int
+
+        var contentLength: Int64?
+        if let rawContentLength = format["contentLength"] as? String {
+            contentLength = Int64(rawContentLength)
+        } else if let int64Length = format["contentLength"] as? Int64 {
+            contentLength = int64Length
+        } else if let intLength = format["contentLength"] as? Int {
+            contentLength = Int64(intLength)
+        }
+
+        return AudioStreamOption(
+            id: "fmt:\(profile.clientName):\(itag ?? -1):\(url.absoluteString)",
+            url: url,
+            sourceClientName: profile.clientName,
+            sourceClientVersion: profile.clientVersion,
+            mimeType: mimeType,
+            codec: codec,
+            container: container,
+            bitrate: bitrate,
+            averageBitrate: averageBitrate,
+            audioQuality: audioQuality,
+            contentLength: contentLength,
+            itag: itag,
+            isHLSManifest: false
+        )
+    }
+
+    private func parseCodec(from mimeType: String?) -> String? {
+        guard let mimeType else {
+            return nil
+        }
+
+        let parts = mimeType.split(separator: ";")
+        guard parts.count > 1 else {
+            return nil
+        }
+
+        for part in parts {
+            let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.lowercased().hasPrefix("codecs=") else {
+                continue
+            }
+
+            let rawValue = trimmed.dropFirst("codecs=".count)
+            return String(rawValue).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        }
+
+        return nil
+    }
+
+    private func containerLabel(from mimeType: String?) -> String {
+        guard let lowered = mimeType?.lowercased() else {
+            return "Audio"
+        }
+
+        if lowered.contains("mpegurl") || lowered.contains("x-mpegurl") {
+            return "HLS"
+        }
+        if lowered.contains("audio/mp4") || lowered.contains("audio/x-m4a") || lowered.contains("mp4a") {
+            return "M4A"
+        }
+        if lowered.contains("audio/mpeg") || lowered.contains("audio/mp3") {
+            return "MP3"
+        }
+        if lowered.contains("audio/aac") {
+            return "AAC"
+        }
+        if lowered.contains("audio/webm") {
+            return "WEBM"
+        }
+        if lowered.contains("audio/ogg") {
+            return "OGG"
+        }
+        return "Audio"
+    }
+
     private func isLikelyAudioFormat(_ format: [String: Any]) -> Bool {
         guard let mimeType = (format["mimeType"] as? String)?.lowercased() else {
             return false
@@ -508,6 +713,20 @@ final class YouTubeMusicService {
             let key = url.absoluteString
             if seen.insert(key).inserted {
                 result.append(url)
+            }
+        }
+
+        return result
+    }
+
+    private func deduplicate(streams: [AudioStreamOption]) -> [AudioStreamOption] {
+        var seen = Set<String>()
+        var result: [AudioStreamOption] = []
+
+        for stream in streams {
+            let key = stream.url.absoluteString
+            if seen.insert(key).inserted {
+                result.append(stream)
             }
         }
 

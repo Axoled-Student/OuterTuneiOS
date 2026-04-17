@@ -18,6 +18,8 @@ targets:
       properties:
         CFBundleDisplayName: OuterTune iOS
         UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dd3boh.outertune.ios

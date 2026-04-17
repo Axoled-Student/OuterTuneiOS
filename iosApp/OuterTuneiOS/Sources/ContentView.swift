@@ -334,6 +334,7 @@ private struct NowPlayingSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var isImportPickerPresented: Bool = false
     @State private var showAdvancedSource: Bool = false
+    @State private var isAudioInfoPresented: Bool = false
 
     var body: some View {
         NavigationView {
@@ -444,6 +445,13 @@ private struct NowPlayingSheetView: View {
                                     Image(systemName: "text.quote")
                                 }
                                 .buttonStyle(.plain)
+
+                                Button {
+                                    isAudioInfoPresented = true
+                                } label: {
+                                    Image(systemName: "info.circle")
+                                }
+                                .buttonStyle(.plain)
                             }
                             .font(.system(size: 22, weight: .medium))
 
@@ -541,7 +549,136 @@ private struct NowPlayingSheetView: View {
                     player.statusMessage = "匯入失敗：\(error.localizedDescription)"
                 }
             }
+            .sheet(isPresented: $isAudioInfoPresented) {
+                AudioSourceInfoSheetView()
+                    .environmentObject(player)
+            }
         }
+    }
+}
+
+private struct AudioSourceInfoSheetView: View {
+    @EnvironmentObject private var player: AudioPlayerViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    private var selectedStreamId: String? {
+        player.nowPlayingStreamInfo?.id
+    }
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section("音質偏好") {
+                    Picker(
+                        "音質",
+                        selection: Binding(
+                            get: { player.audioQualityPreference },
+                            set: { player.setAudioQualityPreference($0) }
+                        )
+                    ) {
+                        ForEach(AudioQualityPreference.allCases) { option in
+                            Text(option.displayName)
+                                .tag(option)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text(player.audioQualityPreference.description)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("目前播放來源") {
+                    if let stream = player.nowPlayingStreamInfo {
+                        AudioInfoRow(label: "格式", value: stream.container)
+                        AudioInfoRow(label: "位元率", value: stream.bitrateText)
+
+                        if let codec = stream.codec, !codec.isEmpty {
+                            AudioInfoRow(label: "編碼", value: codec)
+                        }
+
+                        if let audioQuality = stream.audioQuality, !audioQuality.isEmpty {
+                            AudioInfoRow(label: "品質標籤", value: audioQuality)
+                        }
+
+                        if let itag = stream.itag {
+                            AudioInfoRow(label: "itag", value: String(itag))
+                        }
+
+                        if let contentLength = stream.contentLength, contentLength > 0 {
+                            AudioInfoRow(label: "大小", value: ByteCountFormatter.string(fromByteCount: contentLength, countStyle: .file))
+                        }
+
+                        AudioInfoRow(label: "來源客戶端", value: "\(stream.sourceClientName) \(stream.sourceClientVersion)")
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("URL")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text(stream.url.absoluteString)
+                                .font(.caption2)
+                                .textSelection(.enabled)
+                        }
+                    } else {
+                        Text("目前沒有可顯示的音訊來源資訊")
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                if !player.availableStreamOptions.isEmpty {
+                    Section("可切換來源") {
+                        ForEach(player.availableStreamOptions) { stream in
+                            Button {
+                                player.selectAudioStream(stream)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(stream.displayTitle)
+                                            .font(.subheadline)
+                                            .foregroundColor(.primary)
+                                        Text(stream.shortDescription)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    if selectedStreamId == stream.id {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundColor(.accentColor)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("音訊資訊")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("關閉") {
+                        dismiss()
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+        }
+    }
+}
+
+private struct AudioInfoRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .foregroundColor(.secondary)
+            Spacer(minLength: 16)
+            Text(value)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.subheadline)
     }
 }
 
