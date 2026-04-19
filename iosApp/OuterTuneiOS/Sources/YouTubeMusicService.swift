@@ -46,6 +46,7 @@ enum YouTubeMusicServiceError: LocalizedError {
     case invalidResponse
     case parsingFailed
     case noPlayableStream
+    case notLoggedIn
 
     var errorDescription: String? {
         switch self {
@@ -55,8 +56,18 @@ enum YouTubeMusicServiceError: LocalizedError {
             return "YouTube 資料解析失敗"
         case .noPlayableStream:
             return "找不到可播放音訊串流"
+        case .notLoggedIn:
+            return "尚未登入 YouTube Music"
         }
     }
+}
+
+/// 登入後注入到每次 API 請求的認證內容。
+struct YouTubeAuthContext {
+    let cookie: String
+    let visitorData: String
+    let dataSyncId: String
+    let sapisid: String?
 }
 
 final class YouTubeMusicService {
@@ -64,10 +75,17 @@ final class YouTubeMusicService {
 
     private let session: URLSession
 
+    /// 提供帳號登入後的 cookie / visitorData / dataSyncId；可為 nil（未登入）。
+    /// 這個 closure 會在每次建立 request 前讀取，因此 AccountStore 更新後會自動生效。
+    var authProvider: (() -> YouTubeAuthContext?)?
+
     private init() {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 20
         configuration.timeoutIntervalForResource = 30
+        // 停用 URLSession 的自動 cookie 儲存，避免 WebView 的 cookie 意外附到 API 請求
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
         self.session = URLSession(configuration: configuration)
     }
 
@@ -351,28 +369,128 @@ final class YouTubeMusicService {
         payload: [String: Any],
         clientName: String,
         clientVersion: String,
-        userAgent: String
+        userAgent: String,
+        useLogin: Bool = false,
+        loginSupported: Bool = true
     ) async throws -> Data {
         guard let url = URL(string: endpoint) else {
             throw YouTubeMusicServiceError.invalidResponse
         }
 
+        var finalPayload = payload
+        let auth = useLogin ? authProvider?() : nil
+        if let auth {
+            if var context = finalPayload["context"] as? [String: Any],
+               var client = context["client"] as? [String: Any] {
+                if !auth.visitorData.isEmpty {
+                    client["visitorData"] = auth.visitorData
+                }
+                context["client"] = client
+                if loginSupported, !auth.dataSyncId.isEmpty {
+                    context["user"] = ["onBehalfOfUser": auth.dataSyncId]
+                }
+                finalPayload["context"] = context
+            }
+        }
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        request.httpBody = try JSONSerialization.data(withJSONObject: finalPayload)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(clientName, forHTTPHeaderField: "X-YouTube-Client-Name")
         request.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
         request.setValue("1", forHTTPHeaderField: "X-Goog-Api-Format-Version")
         request.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://music.youtube.com", forHTTPHeaderField: "X-Origin")
         request.setValue("https://music.youtube.com/", forHTTPHeaderField: "Referer")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+        if let auth, useLogin, loginSupported, !auth.cookie.isEmpty {
+            request.setValue(auth.cookie, forHTTPHeaderField: "Cookie")
+            if let sapisid = auth.sapisid {
+                let timestamp = Int(Date().timeIntervalSince1970)
+                let hash = sha1("\(timestamp) \(sapisid) https://music.youtube.com")
+                let authHeader = "SAPISIDHASH \(timestamp)_\(hash) SAPISID1PHASH \(timestamp)_\(hash) SAPISID3PHASH \(timestamp)_\(hash)"
+                request.setValue(authHeader, forHTTPHeaderField: "Authorization")
+            }
+        }
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
             throw YouTubeMusicServiceError.invalidResponse
         }
         return data
+    }
+
+    private func sha1(_ input: String) -> String {
+        // 純 Swift SHA-1，避免引入 CommonCrypto
+        let bytes: [UInt8] = Array(input.utf8)
+        var h0: UInt32 = 0x67452301
+        var h1: UInt32 = 0xEFCDAB89
+        var h2: UInt32 = 0x98BADCFE
+        var h3: UInt32 = 0x10325476
+        var h4: UInt32 = 0xC3D2E1F0
+
+        var padded = bytes
+        let messageLengthBits = UInt64(bytes.count) * 8
+        padded.append(0x80)
+        while padded.count % 64 != 56 {
+            padded.append(0)
+        }
+        for i in stride(from: 7, through: 0, by: -1) {
+            padded.append(UInt8((messageLengthBits >> UInt64(i * 8)) & 0xFF))
+        }
+
+        for chunkStart in stride(from: 0, to: padded.count, by: 64) {
+            var w = [UInt32](repeating: 0, count: 80)
+            for i in 0 ..< 16 {
+                let base = chunkStart + i * 4
+                w[i] = (UInt32(padded[base]) << 24) |
+                       (UInt32(padded[base + 1]) << 16) |
+                       (UInt32(padded[base + 2]) << 8) |
+                       UInt32(padded[base + 3])
+            }
+            for i in 16 ..< 80 {
+                let value = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]
+                w[i] = (value << 1) | (value >> 31)
+            }
+
+            var a = h0, b = h1, c = h2, d = h3, e = h4
+
+            for i in 0 ..< 80 {
+                let f: UInt32
+                let k: UInt32
+                switch i {
+                case 0 ..< 20:
+                    f = (b & c) | ((~b) & d)
+                    k = 0x5A827999
+                case 20 ..< 40:
+                    f = b ^ c ^ d
+                    k = 0x6ED9EBA1
+                case 40 ..< 60:
+                    f = (b & c) | (b & d) | (c & d)
+                    k = 0x8F1BBCDC
+                default:
+                    f = b ^ c ^ d
+                    k = 0xCA62C1D6
+                }
+
+                let temp = ((a << 5) | (a >> 27)) &+ f &+ e &+ k &+ w[i]
+                e = d
+                d = c
+                c = (b << 30) | (b >> 2)
+                b = a
+                a = temp
+            }
+
+            h0 = h0 &+ a
+            h1 = h1 &+ b
+            h2 = h2 &+ c
+            h3 = h3 &+ d
+            h4 = h4 &+ e
+        }
+
+        return String(format: "%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4)
     }
 
     private func extractVideoId(from renderer: [String: Any]) -> String? {
@@ -765,3 +883,222 @@ private let playerClientProfiles: [PlayerClientProfile] = [
         osVersion: "10.0"
     )
 ]
+// MARK: - Account / Home / Library APIs
+
+extension YouTubeMusicService {
+    private var webRemixClientName: String { "WEB_REMIX" }
+    private var webRemixClientVersion: String { "1.20250310.01.00" }
+    private var webRemixClientId: String { "67" }
+    private var webRemixUserAgent: String { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36" }
+
+    private func baseContext() -> [String: Any] {
+        [
+            "context": [
+                "client": [
+                    "clientName": webRemixClientName,
+                    "clientVersion": webRemixClientVersion,
+                    "hl": "zh-TW",
+                    "gl": "TW"
+                ]
+            ]
+        ]
+    }
+
+    /// 對應 Android 版 `YouTube.accountInfo()`，需要登入 cookie。
+    func fetchAccountInfo() async throws -> YouTubeAccountInfo {
+        let data = try await requestJSON(
+            endpoint: "https://music.youtube.com/youtubei/v1/account/account_menu",
+            payload: baseContext(),
+            clientName: webRemixClientId,
+            clientVersion: webRemixClientVersion,
+            userAgent: webRemixUserAgent,
+            useLogin: true
+        )
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw YouTubeMusicServiceError.parsingFailed
+        }
+
+        // 在 response 中尋找 activeAccountHeaderRenderer
+        let renderers = collectDictionaries(forKey: "activeAccountHeaderRenderer", in: object)
+        guard let renderer = renderers.first else {
+            throw YouTubeMusicServiceError.notLoggedIn
+        }
+
+        let name = firstRunText(in: renderer["accountName"]) ?? ""
+        let email = firstRunText(in: renderer["accountByline"])
+        let channelHandle = firstRunText(in: renderer["channelHandle"])
+
+        var avatarURL: String?
+        if let photo = renderer["accountPhoto"] as? [String: Any],
+           let thumbs = photo["thumbnails"] as? [[String: Any]] {
+            avatarURL = thumbs.last?["url"] as? String
+        }
+
+        return YouTubeAccountInfo(
+            name: name,
+            email: email,
+            channelHandle: channelHandle,
+            avatarURL: avatarURL
+        )
+    }
+
+    /// 取得首頁推薦（對應 Android HomePage，需登入才能拿到個人化結果，但未登入也可抓公共內容）。
+    func fetchHomeFeed() async throws -> HomeFeed {
+        var payload = baseContext()
+        payload["browseId"] = "FEmusic_home"
+        let data = try await requestJSON(
+            endpoint: "https://music.youtube.com/youtubei/v1/browse",
+            payload: payload,
+            clientName: webRemixClientId,
+            clientVersion: webRemixClientVersion,
+            userAgent: webRemixUserAgent,
+            useLogin: true
+        )
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw YouTubeMusicServiceError.parsingFailed
+        }
+
+        let carousels = collectDictionaries(forKey: "musicCarouselShelfRenderer", in: object)
+        var sections: [HomeSection] = []
+
+        for carousel in carousels {
+            guard let section = parseHomeSection(from: carousel) else { continue }
+            if section.items.isEmpty { continue }
+            sections.append(section)
+        }
+
+        return HomeFeed(sections: sections)
+    }
+
+    /// 取得登入使用者的播放清單（對應 Android LibraryPage FEmusic_liked_playlists）。
+    func fetchLibraryPlaylists() async throws -> [LibraryPlaylist] {
+        var payload = baseContext()
+        payload["browseId"] = "FEmusic_liked_playlists"
+        let data = try await requestJSON(
+            endpoint: "https://music.youtube.com/youtubei/v1/browse",
+            payload: payload,
+            clientName: webRemixClientId,
+            clientVersion: webRemixClientVersion,
+            userAgent: webRemixUserAgent,
+            useLogin: true
+        )
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw YouTubeMusicServiceError.parsingFailed
+        }
+
+        let grids = collectDictionaries(forKey: "musicTwoRowItemRenderer", in: object)
+        var playlists: [LibraryPlaylist] = []
+        var seen = Set<String>()
+
+        for renderer in grids {
+            guard
+                let nav = renderer["navigationEndpoint"] as? [String: Any],
+                let browse = nav["browseEndpoint"] as? [String: Any],
+                let browseId = browse["browseId"] as? String,
+                browseId.hasPrefix("VL") || browseId.hasPrefix("MPRE") || browseId.hasPrefix("MPSP") || browseId.contains("playlist")
+            else {
+                continue
+            }
+            if seen.contains(browseId) { continue }
+            seen.insert(browseId)
+
+            let title = firstRunText(in: renderer["title"]) ?? "未命名播放清單"
+            let subtitle = firstRunText(in: renderer["subtitle"])
+            var thumbURL: String?
+            if let thumbRenderer = renderer["thumbnailRenderer"] as? [String: Any],
+               let musicThumb = thumbRenderer["musicThumbnailRenderer"] as? [String: Any],
+               let container = musicThumb["thumbnail"] as? [String: Any],
+               let thumbs = container["thumbnails"] as? [[String: Any]] {
+                thumbURL = thumbs.last?["url"] as? String
+            }
+
+            playlists.append(
+                LibraryPlaylist(id: browseId, title: title, subtitle: subtitle, thumbnailURL: thumbURL)
+            )
+        }
+
+        return playlists
+    }
+
+    // MARK: parsing helpers
+
+    private func parseHomeSection(from carousel: [String: Any]) -> HomeSection? {
+        let header = (carousel["header"] as? [String: Any])?["musicCarouselShelfBasicHeaderRenderer"] as? [String: Any]
+        let title = firstRunText(in: header?["title"]) ?? ""
+        let strapline = firstRunText(in: header?["strapline"])
+        let contents = (carousel["contents"] as? [[String: Any]]) ?? []
+        var items: [HomeItem] = []
+
+        for content in contents {
+            if let twoRow = content["musicTwoRowItemRenderer"] as? [String: Any],
+               let parsed = parseHomeItem(from: twoRow) {
+                items.append(parsed)
+                continue
+            }
+            if let responsive = content["musicResponsiveListItemRenderer"] as? [String: Any],
+               let parsed = parseHomeItemFromResponsive(from: responsive) {
+                items.append(parsed)
+            }
+        }
+
+        guard !title.isEmpty else { return nil }
+        return HomeSection(title: title, strapline: strapline, items: items)
+    }
+
+    private func parseHomeItem(from renderer: [String: Any]) -> HomeItem? {
+        let title = firstRunText(in: renderer["title"]) ?? ""
+        let subtitle = firstRunText(in: renderer["subtitle"])
+        var thumb: String?
+        if let thumbRenderer = renderer["thumbnailRenderer"] as? [String: Any],
+           let musicThumb = thumbRenderer["musicThumbnailRenderer"] as? [String: Any],
+           let container = musicThumb["thumbnail"] as? [String: Any],
+           let thumbs = container["thumbnails"] as? [[String: Any]] {
+            thumb = thumbs.last?["url"] as? String
+        }
+
+        guard let nav = renderer["navigationEndpoint"] as? [String: Any] else {
+            return nil
+        }
+
+        if let watch = nav["watchEndpoint"] as? [String: Any],
+           let videoId = watch["videoId"] as? String {
+            return HomeItem(kind: .song, primaryId: videoId, title: title, subtitle: subtitle, thumbnailURL: thumb)
+        }
+        if let browse = nav["browseEndpoint"] as? [String: Any],
+           let browseId = browse["browseId"] as? String {
+            if browseId.hasPrefix("MPREb") {
+                return HomeItem(kind: .album, primaryId: browseId, title: title, subtitle: subtitle, thumbnailURL: thumb)
+            }
+            if browseId.hasPrefix("UC") {
+                return HomeItem(kind: .artist, primaryId: browseId, title: title, subtitle: subtitle, thumbnailURL: thumb)
+            }
+            return HomeItem(kind: .playlist, primaryId: browseId, title: title, subtitle: subtitle, thumbnailURL: thumb)
+        }
+        return nil
+    }
+
+    private func parseHomeItemFromResponsive(from renderer: [String: Any]) -> HomeItem? {
+        let title = extractTitle(from: renderer)
+        let subtitle = extractSubtitleParts(from: renderer).first
+        let thumb = extractThumbnailURL(from: renderer)
+        if let videoId = extractVideoId(from: renderer) {
+            return HomeItem(kind: .song, primaryId: videoId, title: title, subtitle: subtitle, thumbnailURL: thumb)
+        }
+        return nil
+    }
+
+    private func firstRunText(in object: Any?) -> String? {
+        guard let dict = object as? [String: Any] else { return nil }
+        if let runs = dict["runs"] as? [[String: Any]] {
+            let text = runs.compactMap { $0["text"] as? String }.joined()
+            return text.isEmpty ? nil : text
+        }
+        if let simple = dict["simpleText"] as? String, !simple.isEmpty {
+            return simple
+        }
+        return nil
+    }
+}

@@ -38,6 +38,14 @@ final class AudioPlayerViewModel: ObservableObject {
     @Published private(set) var availableStreamOptions: [AudioStreamOption] = []
     @Published private(set) var nowPlayingStreamInfo: AudioStreamOption?
 
+    @Published var homeFeed: HomeFeed = .empty
+    @Published var isLoadingHome: Bool = false
+    @Published var homeErrorMessage: String?
+
+    @Published var libraryPlaylists: [LibraryPlaylist] = []
+    @Published var isLoadingLibraryPlaylists: Bool = false
+    @Published var libraryErrorMessage: String?
+
     private var player: AVPlayer?
     private var periodicObserverToken: Any?
     private var playbackEndObserverToken: NSObjectProtocol?
@@ -58,6 +66,7 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private let youtubeService = YouTubeMusicService.shared
     private let lyricsService = LyricsService.shared
+    private let accountStore = AccountStore.shared
 
     private let queueStorageKey = "ios.queue.v1"
     private let queueIndexStorageKey = "ios.queue.index.v1"
@@ -87,6 +96,81 @@ final class AudioPlayerViewModel: ObservableObject {
         restoreAudioQualityPreferenceState()
         restoreSearchHistoryState()
         autocompleteSuggestions = Array(searchHistory.prefix(6))
+        wireYouTubeAuthProvider()
+    }
+
+    private func wireYouTubeAuthProvider() {
+        // Bridge AccountStore credentials into the YouTube Music service so
+        // authenticated endpoints (home feed, library, account info) can
+        // attach Cookie / Authorization headers.
+        YouTubeMusicService.shared.authProvider = { [weak self] in
+            guard let self else { return nil }
+            let store = self.accountStore
+            let cookie = store.cookie
+            guard !cookie.isEmpty else { return nil }
+            return YouTubeAuthContext(
+                cookie: cookie,
+                visitorData: store.visitorData,
+                dataSyncId: store.dataSyncId,
+                sapisid: store.sapisidValue()
+            )
+        }
+    }
+
+    @MainActor
+    func refreshAccountInfo() async {
+        guard accountStore.isLoggedIn else {
+            accountStore.updateAccountInfo(nil)
+            return
+        }
+        do {
+            let info = try await youtubeService.fetchAccountInfo()
+            accountStore.updateAccountInfo(info)
+        } catch {
+            // Swallow: UI will just show logged-out state.
+            accountStore.updateAccountInfo(nil)
+        }
+    }
+
+    @MainActor
+    func refreshHomeFeed() async {
+        isLoadingHome = true
+        homeErrorMessage = nil
+        defer { isLoadingHome = false }
+        do {
+            let feed = try await youtubeService.fetchHomeFeed()
+            homeFeed = feed
+        } catch YouTubeMusicServiceError.notLoggedIn {
+            homeFeed = .empty
+            homeErrorMessage = "請先登入 Google 帳號以取得個人化首頁"
+        } catch {
+            homeErrorMessage = "載入首頁失敗：\(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    func refreshLibraryPlaylists() async {
+        isLoadingLibraryPlaylists = true
+        libraryErrorMessage = nil
+        defer { isLoadingLibraryPlaylists = false }
+        do {
+            let playlists = try await youtubeService.fetchLibraryPlaylists()
+            libraryPlaylists = playlists
+        } catch YouTubeMusicServiceError.notLoggedIn {
+            libraryPlaylists = []
+            libraryErrorMessage = "請先登入 Google 帳號以查看您的音樂庫"
+        } catch {
+            libraryErrorMessage = "載入音樂庫失敗：\(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    func logoutYouTubeAccount() {
+        accountStore.logout()
+        homeFeed = .empty
+        libraryPlaylists = []
+        homeErrorMessage = nil
+        libraryErrorMessage = nil
     }
 
     deinit {
