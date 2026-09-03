@@ -46,6 +46,19 @@ final class AudioPlayerViewModel: ObservableObject {
     @Published var isLoadingLibraryPlaylists: Bool = false
     @Published var libraryErrorMessage: String?
 
+    /// 最近的 debug 日誌（環形緩衝），供用戶回報問題時複製
+    @Published var recentDebugLogs: [String] = []
+    private let maxDebugLogCount = 50
+
+    func appendDebugLog(_ msg: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let entry = "[\(ts)] \(msg)"
+        recentDebugLogs.append(entry)
+        if recentDebugLogs.count > maxDebugLogCount {
+            recentDebugLogs.removeFirst(recentDebugLogs.count - maxDebugLogCount)
+        }
+    }
+
     private var player: AVPlayer?
     private var periodicObserverToken: Any?
     private var playbackEndObserverToken: NSObjectProtocol?
@@ -140,11 +153,11 @@ final class AudioPlayerViewModel: ObservableObject {
         do {
             let feed = try await youtubeService.fetchHomeFeed()
             homeFeed = feed
-        } catch YouTubeMusicServiceError.notLoggedIn {
-            homeFeed = .empty
-            homeErrorMessage = "請先登入 Google 帳號以取得個人化首頁"
+            print("[Home] refreshHomeFeed: OK, \(feed.sections.count) sections")
         } catch {
             homeErrorMessage = "載入首頁失敗：\(error.localizedDescription)"
+            appendDebugLog("首頁失敗: \(error)")
+            print("[Home] refreshHomeFeed FAILED: \(error)")
         }
     }
 
@@ -574,6 +587,11 @@ final class AudioPlayerViewModel: ObservableObject {
             activePlaybackTrackStableId = track.stableId
             nowPlayingStreamInfo = playbackCandidates.first
 
+            print("[Player] playTrack: resolved \(playbackCandidates.count) candidates for \(track.title)")
+            for (i, c) in playbackCandidates.enumerated() {
+                print("[Player]   [\(i)] \(c.sourceClientName) HLS=\(c.isHLSManifest) itag=\(c.itag ?? 0) \(c.container ?? "?") \(c.audioQuality ?? "?")")
+            }
+
             guard !playbackCandidates.isEmpty else {
                 throw YouTubeMusicServiceError.noPlayableStream
             }
@@ -586,6 +604,7 @@ final class AudioPlayerViewModel: ObservableObject {
             availableStreamOptions = []
             nowPlayingStreamInfo = nil
             statusMessage = "播放失敗：\(error.localizedDescription)"
+            appendDebugLog("播放失敗[\(track.title)]: \(error)")
         }
     }
 
@@ -601,6 +620,7 @@ final class AudioPlayerViewModel: ObservableObject {
                     url: url,
                     sourceClientName: "DIRECT",
                     sourceClientVersion: "-",
+                    sourceUserAgent: nil,
                     mimeType: nil,
                     codec: nil,
                     container: "URL",
@@ -625,6 +645,7 @@ final class AudioPlayerViewModel: ObservableObject {
                         url: localURL,
                         sourceClientName: "LOCAL",
                         sourceClientVersion: "-",
+                        sourceUserAgent: nil,
                         mimeType: nil,
                         codec: nil,
                         container: ext.isEmpty ? "LOCAL" : ext,
@@ -646,16 +667,54 @@ final class AudioPlayerViewModel: ObservableObject {
             isPlaying = false
             nowPlayingStreamInfo = nil
             statusMessage = "播放失敗：找不到可播放串流"
+            print("[Player] startPlaybackAttempt: no candidates at index \(playbackCandidateIndex)")
             updateNowPlayingPlaybackState()
             return
         }
 
         let selectedStream = playbackCandidates[playbackCandidateIndex]
-        let resolvedURL = selectedStream.url
         nowPlayingStreamInfo = selectedStream
-        streamURL = resolvedURL.absoluteString
+        streamURL = selectedStream.url.absoluteString
+        print("[Player] startPlaybackAttempt: idx=\(playbackCandidateIndex)/\(playbackCandidates.count), client=\(selectedStream.sourceClientName), HLS=\(selectedStream.isHLSManifest), itag=\(selectedStream.itag ?? 0), container=\(selectedStream.container ?? "?")")
 
-        let item = AVPlayerItem(url: resolvedURL)
+        // HLS manifests and local/direct files can be played directly by AVPlayer
+        if selectedStream.isHLSManifest || selectedStream.sourceClientName == "LOCAL" || selectedStream.sourceClientName == "DIRECT" {
+            playItemDirectly(url: selectedStream.url, track: track)
+            return
+        }
+
+        // YouTube adaptive streams are DASH fMP4 — CoreMedia can't play them directly.
+        // Download the complete stream, remux to standard M4A, then play from temp file.
+        statusMessage = "下載串流中..."
+        let streamToDownload = selectedStream
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let localURL = try await self.downloadAndRemux(stream: streamToDownload)
+                await MainActor.run {
+                    guard self.activePlaybackTrackStableId == track.stableId,
+                          self.playbackCandidates.indices.contains(self.playbackCandidateIndex),
+                          self.playbackCandidates[self.playbackCandidateIndex].id == streamToDownload.id else {
+                        return // Track changed while downloading
+                    }
+                    self.playItemDirectly(url: localURL, track: track)
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.activePlaybackTrackStableId == track.stableId else { return }
+                    print("[Player] Download+remux failed: \(error.localizedDescription), trying fallback")
+                    self.appendDebugLog("下載+remux失敗[itag=\(streamToDownload.itag ?? 0), \(streamToDownload.sourceClientName)]: \(error.localizedDescription)")
+                    if !self.tryFallbackPlaybackIfNeeded(for: track) {
+                        self.statusMessage = "播放失敗：\(error.localizedDescription)"
+                        self.isPlaying = false
+                    }
+                }
+            }
+        }
+    }
+
+    private func playItemDirectly(url: URL, track: AppTrack) {
+        let item = AVPlayerItem(url: url)
         if player == nil {
             player = AVPlayer(playerItem: item)
             installPeriodicTimeObserver()
@@ -665,7 +724,7 @@ final class AudioPlayerViewModel: ObservableObject {
 
         currentTime = 0
         sliderPosition = 0
-        duration = inferredFallbackDuration(for: track, streamURL: resolvedURL) ?? 0
+        duration = inferredFallbackDuration(for: track, streamURL: url) ?? 0
         lyricsText = ""
 
         observePlayerItemState(item: item, track: track)
@@ -683,13 +742,86 @@ final class AudioPlayerViewModel: ObservableObject {
         }
     }
 
+    /// 專用於串流下載的 URLSession，不帶 cookie（避免登入 cookie 與 IOS/ANDROID_VR 串流 URL 身份衝突導致 403）
+    private static let streamDownloadSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 120
+        return URLSession(configuration: config)
+    }()
+
+    /// Download a YouTube adaptive stream and remux from DASH fMP4 to standard M4A.
+    private func downloadAndRemux(stream: AudioStreamOption) async throws -> URL {
+        var request = URLRequest(url: stream.url)
+        request.httpShouldHandleCookies = false
+
+        // 顯式設定 headers，防止 iOS 系統層注入意外的值
+        if let ua = stream.sourceUserAgent, !ua.isEmpty {
+            request.setValue(ua, forHTTPHeaderField: "User-Agent")
+        }
+        request.setValue("", forHTTPHeaderField: "Cookie")           // 強制清空 cookie
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding") // 不要 gzip
+        request.setValue("bytes=0-", forHTTPHeaderField: "Range")    // yt-dlp 風格 range 請求
+
+        // 清除 HTTPCookieStorage.shared 中可能汙染此請求的 cookies
+        if let cookies = HTTPCookieStorage.shared.cookies(for: stream.url) {
+            for c in cookies { HTTPCookieStorage.shared.deleteCookie(c) }
+        }
+
+        // 記錄實際發送的 headers 方便診斷
+        let reqHeaders = request.allHTTPHeaderFields ?? [:]
+        let sharedCookies = HTTPCookieStorage.shared.cookies(for: stream.url)?.map(\.name) ?? []
+        appendDebugLog("[DL] itag=\(stream.itag ?? 0) client=\(stream.sourceClientName) sharedCookies=\(sharedCookies) reqHeaders=\(reqHeaders)")
+        print("[Player] downloadAndRemux: itag=\(stream.itag ?? 0), client=\(stream.sourceClientName), reqHeaders=\(reqHeaders), sharedCookies=\(sharedCookies)")
+        print("[Player] downloadAndRemux: url=\(stream.url.absoluteString.prefix(200))...")
+
+        let (data, response) = try await Self.streamDownloadSession.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            print("[Player] downloadAndRemux: response is not HTTPURLResponse")
+            throw YouTubeMusicServiceError.invalidResponse
+        }
+
+        // 記錄回應 headers（尤其 403 時的診斷資訊）
+        let respHeaders = httpResponse.allHeaderFields as? [String: Any] ?? [:]
+        print("[Player] downloadAndRemux: HTTP \(httpResponse.statusCode), respHeaders=\(respHeaders)")
+
+        guard (200...206).contains(httpResponse.statusCode) else {
+            let bodyPreview = String(data: data.prefix(300), encoding: .utf8) ?? "(binary)"
+            appendDebugLog("[DL] FAIL HTTP \(httpResponse.statusCode) itag=\(stream.itag ?? 0) body=\(bodyPreview.prefix(150)) respHeaders=\(respHeaders)")
+            print("[Player] downloadAndRemux: HTTP \(httpResponse.statusCode), body=\(bodyPreview.prefix(200))")
+            throw YouTubeMusicServiceError.httpError(
+                statusCode: httpResponse.statusCode,
+                endpoint: "stream/itag=\(stream.itag ?? 0)",
+                bodyPreview: String(bodyPreview.prefix(100))
+            )
+        }
+        appendDebugLog("[DL] OK HTTP \(httpResponse.statusCode) itag=\(stream.itag ?? 0) bytes=\(data.count)")
+        print("[Player] downloadAndRemux: downloaded \(data.count) bytes")
+
+        guard let remuxedData = DashRemuxer.remux(data) else {
+            throw YouTubeMusicServiceError.noPlayableStream
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileName = "remuxed_\(stream.itag ?? 0)_\(UUID().uuidString.prefix(8)).m4a"
+        let tempURL = tempDir.appendingPathComponent(fileName)
+        try remuxedData.write(to: tempURL)
+
+        return tempURL
+    }
+
     private func tryFallbackPlaybackIfNeeded(for track: AppTrack) -> Bool {
         guard activePlaybackTrackStableId == track.stableId else {
+            print("[Player] tryFallback: track changed, skipping")
             return false
         }
 
         let nextIndex = playbackCandidateIndex + 1
         guard playbackCandidates.indices.contains(nextIndex) else {
+            print("[Player] tryFallback: no more candidates (was \(playbackCandidateIndex)/\(playbackCandidates.count))")
             return false
         }
 
@@ -774,6 +906,8 @@ final class AudioPlayerViewModel: ObservableObject {
                         self.updateNowPlayingInfo(for: track)
                     }
                 case .failed:
+                    let failErr = observedItem.error
+                    print("[Player] AVPlayerItem FAILED: \(failErr?.localizedDescription ?? "unknown"), idx=\(self.playbackCandidateIndex)/\(self.playbackCandidates.count)")
                     if self.tryFallbackPlaybackIfNeeded(for: track) {
                         return
                     }
@@ -1146,18 +1280,22 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     private func prioritizePlaybackCandidates(_ candidates: [AudioStreamOption]) -> [AudioStreamOption] {
+        // HLS manifests play instantly (no download+remux needed), always put them first
+        let hls = candidates.filter { $0.isHLSManifest }
+        let adaptive = candidates.filter { !$0.isHLSManifest }
+
         guard audioQualityPreference != .auto else {
-            return candidates
+            return hls + adaptive
         }
 
-        let knownBitrate = candidates.enumerated().filter { (_, stream) in
+        let knownBitrate = adaptive.enumerated().filter { (_, stream) in
             guard let bitrate = stream.effectiveBitrate else {
                 return false
             }
             return bitrate > 0
         }
 
-        let unknownBitrate = candidates.enumerated().filter { (_, stream) in
+        let unknownBitrate = adaptive.enumerated().filter { (_, stream) in
             stream.effectiveBitrate == nil || stream.effectiveBitrate == 0
         }
 
@@ -1192,7 +1330,7 @@ final class AudioPlayerViewModel: ObservableObject {
             }
         }
 
-        return sortedKnown.map(\.element) + unknownBitrate.map(\.element)
+        return hls + sortedKnown.map(\.element) + unknownBitrate.map(\.element)
     }
 
     private func seekAfterSwitch(resumeTime: Double) {

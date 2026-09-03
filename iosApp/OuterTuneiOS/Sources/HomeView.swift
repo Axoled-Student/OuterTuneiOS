@@ -14,27 +14,30 @@ struct HomeView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 22) {
                     nowPlayingCard
+
                     if account.isLoggedIn {
                         accountBanner
-                        if player.isLoadingHome && player.homeFeed.sections.isEmpty {
-                            ProgressView()
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 40)
-                        } else if let msg = player.homeErrorMessage {
-                            errorBox(msg)
-                        } else if player.homeFeed.sections.isEmpty {
-                            Text("目前沒有首頁內容，下拉以重新整理")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                                .padding(.horizontal)
-                        } else {
-                            ForEach(player.homeFeed.sections) { section in
-                                homeSectionView(section)
-                            }
-                        }
                     } else {
                         loginPromptBanner
                     }
+
+                    if player.isLoadingHome && player.homeFeed.sections.isEmpty {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 40)
+                    } else if let msg = player.homeErrorMessage {
+                        errorBox(msg)
+                    } else if player.homeFeed.sections.isEmpty {
+                        Text("目前沒有首頁內容，下拉以重新整理")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal)
+                    } else {
+                        ForEach(player.homeFeed.sections) { section in
+                            homeSectionView(section)
+                        }
+                    }
+
                     Color.clear.frame(height: 120)
                 }
                 .padding(.vertical)
@@ -42,13 +45,15 @@ struct HomeView: View {
             .navigationTitle("首頁")
             .refreshable {
                 await player.refreshHomeFeed()
-                await player.refreshAccountInfo()
+                if account.isLoggedIn {
+                    await player.refreshAccountInfo()
+                }
             }
             .onAppear {
                 Task {
-                    if account.isLoggedIn {
-                        if player.homeFeed.sections.isEmpty { await player.refreshHomeFeed() }
-                        if account.accountInfo == nil { await player.refreshAccountInfo() }
+                    if player.homeFeed.sections.isEmpty { await player.refreshHomeFeed() }
+                    if account.isLoggedIn, account.accountInfo == nil {
+                        await player.refreshAccountInfo()
                     }
                 }
             }

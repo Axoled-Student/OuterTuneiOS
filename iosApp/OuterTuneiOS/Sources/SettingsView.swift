@@ -131,6 +131,41 @@ struct SettingsView: View {
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
+
+            NavigationLink("Debug 日誌") {
+                DebugLogView()
+                    .environmentObject(player)
+            }
+        }
+    }
+}
+
+struct DebugLogView: View {
+    @EnvironmentObject var player: AudioPlayerViewModel
+
+    var body: some View {
+        List {
+            if player.recentDebugLogs.isEmpty {
+                Text("尚無日誌")
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(Array(player.recentDebugLogs.enumerated()), id: \.offset) { _, log in
+                    Text(log)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .navigationTitle("Debug 日誌")
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("複製全部") {
+                    let all = player.recentDebugLogs.joined(separator: "\n")
+                    #if os(iOS)
+                    UIPasteboard.general.string = all
+                    #endif
+                }
+            }
         }
     }
 }

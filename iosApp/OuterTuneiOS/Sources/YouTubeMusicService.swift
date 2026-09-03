@@ -1,10 +1,12 @@
 import Foundation
+import CommonCrypto
 
 struct AudioStreamOption: Identifiable, Equatable {
     let id: String
     let url: URL
     let sourceClientName: String
     let sourceClientVersion: String
+    let sourceUserAgent: String?
     let mimeType: String?
     let codec: String?
     let container: String
@@ -44,6 +46,7 @@ struct AudioStreamOption: Identifiable, Equatable {
 
 enum YouTubeMusicServiceError: LocalizedError {
     case invalidResponse
+    case httpError(statusCode: Int, endpoint: String, bodyPreview: String)
     case parsingFailed
     case noPlayableStream
     case notLoggedIn
@@ -52,6 +55,9 @@ enum YouTubeMusicServiceError: LocalizedError {
         switch self {
         case .invalidResponse:
             return "YouTube 回應無效"
+        case .httpError(let code, let endpoint, let body):
+            let ep = endpoint.components(separatedBy: "?").first?.components(separatedBy: "/").last ?? endpoint
+            return "HTTP \(code) (\(ep)): \(body)"
         case .parsingFailed:
             return "YouTube 資料解析失敗"
         case .noPlayableStream:
@@ -73,7 +79,11 @@ struct YouTubeAuthContext {
 final class YouTubeMusicService {
     static let shared = YouTubeMusicService()
 
+    /// 登入請求專用 session（使用 HTTPCookieStorage.shared，帶 cookies）
     private let session: URLSession
+    /// 匿名請求專用 session（ephemeral，完全不帶 cookies）
+    /// 用於 player API 的 IOS/ANDROID_VR profile，避免 cookie 洩漏導致 stream URL 綁定認證
+    private let anonymousSession: URLSession
 
     /// 提供帳號登入後的 cookie / visitorData / dataSyncId；可為 nil（未登入）。
     /// 這個 closure 會在每次建立 request 前讀取，因此 AccountStore 更新後會自動生效。
@@ -83,10 +93,45 @@ final class YouTubeMusicService {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 20
         configuration.timeoutIntervalForResource = 30
-        // 停用 URLSession 的自動 cookie 儲存，避免 WebView 的 cookie 意外附到 API 請求
-        configuration.httpShouldSetCookies = false
-        configuration.httpCookieAcceptPolicy = .never
+        // 使用系統的 HTTPCookieStorage.shared（與 WKWebView default data store 共用）
+        // 認證請求前會將 cookie 注入到 shared storage，URLSession 自動帶上
         self.session = URLSession(configuration: configuration)
+
+        // 匿名 session：ephemeral 保證完全隔離，不與 HTTPCookieStorage.shared 共用
+        let anonConfig = URLSessionConfiguration.ephemeral
+        anonConfig.timeoutIntervalForRequest = 20
+        anonConfig.timeoutIntervalForResource = 30
+        anonConfig.httpCookieAcceptPolicy = .never
+        anonConfig.httpShouldSetCookies = false
+        anonConfig.httpCookieStorage = nil
+        self.anonymousSession = URLSession(configuration: anonConfig)
+    }
+
+    /// 將 cookie 字串解析後注入到 HTTPCookieStorage.shared，讓 URLSession 自動帶上
+    private func injectCookies(_ cookieString: String, for url: URL) {
+        let storage = HTTPCookieStorage.shared
+        // 清除既有的 youtube.com cookies 以避免衝突
+        if let existing = storage.cookies(for: url) {
+            for c in existing { storage.deleteCookie(c) }
+        }
+        let pairs = cookieString.split(separator: ";")
+        for pair in pairs {
+            let trimmed = pair.trimmingCharacters(in: .whitespaces)
+            let parts = trimmed.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let name = String(parts[0])
+            let value = String(parts[1])
+            let properties: [HTTPCookiePropertyKey: Any] = [
+                .name: name,
+                .value: value,
+                .domain: ".youtube.com",
+                .path: "/",
+                .secure: "TRUE",
+            ]
+            if let cookie = HTTPCookie(properties: properties) {
+                storage.setCookie(cookie)
+            }
+        }
     }
 
     func searchSongs(query: String) async throws -> [YouTubeSearchSong] {
@@ -225,12 +270,29 @@ final class YouTubeMusicService {
     func resolveAudioStreams(videoId: String, limit: Int = 12) async throws -> [AudioStreamOption] {
         var orderedStreams: [AudioStreamOption] = []
 
+        let isLoggedIn = authProvider?()?.cookie.isEmpty == false
+        print("[YTService] resolveAudioStreams: videoId=\(videoId), isLoggedIn=\(isLoggedIn), profiles=\(playerClientProfiles.map(\.clientName))")
+
         for profile in playerClientProfiles {
-            let streams = try await fetchPlayableStreams(videoId: videoId, profile: profile, allowWebM: false)
-            orderedStreams.append(contentsOf: streams)
+            // WEB_REMIX 需要登入 + PoToken 才能取得串流，未登入時跳過
+            if profile.useLogin && !isLoggedIn {
+                print("[YTService] skipping \(profile.clientName) (needs login)")
+                continue
+            }
+
+            do {
+                let streams = try await fetchPlayableStreams(videoId: videoId, profile: profile, allowWebM: false)
+                print("[YTService] \(profile.clientName) → \(streams.count) streams (HLS=\(streams.filter(\.isHLSManifest).count), adaptive=\(streams.filter { !$0.isHLSManifest }.count))")
+                orderedStreams.append(contentsOf: streams)
+            } catch {
+                // 單一 profile 失敗不應阻斷其他 profile
+                print("[YTService] \(profile.clientName) FAILED for \(videoId): \(error.localizedDescription)")
+                continue
+            }
         }
 
         let deduplicated = deduplicate(streams: orderedStreams)
+        print("[YTService] resolveAudioStreams: total=\(orderedStreams.count), deduplicated=\(deduplicated.count)")
         if deduplicated.isEmpty {
             throw YouTubeMusicServiceError.noPlayableStream
         }
@@ -239,7 +301,7 @@ final class YouTubeMusicService {
     }
 
     private func fetchPlayableStreams(videoId: String, profile: PlayerClientProfile, allowWebM: Bool) async throws -> [AudioStreamOption] {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "context": [
                 "client": [
                     "clientName": profile.clientName,
@@ -254,16 +316,45 @@ final class YouTubeMusicService {
             "racyCheckOk": true
         ]
 
+        // 帶登入的 client 需要注入 visitorData 與 dataSyncId
+        if profile.useLogin, let auth = authProvider?() {
+            if var context = payload["context"] as? [String: Any],
+               var client = context["client"] as? [String: Any] {
+                if !auth.visitorData.isEmpty {
+                    client["visitorData"] = auth.visitorData
+                }
+                context["client"] = client
+                if profile.loginSupported, !auth.dataSyncId.isEmpty {
+                    var user = context["user"] as? [String: Any] ?? [:]
+                    user["onBehalfOfUser"] = auth.dataSyncId
+                    context["user"] = user
+                }
+                payload["context"] = context
+            }
+        }
+
         let data = try await requestJSON(
             endpoint: "https://music.youtube.com/youtubei/v1/player",
             payload: payload,
             clientName: profile.clientId,
             clientVersion: profile.clientVersion,
-            userAgent: profile.userAgent
+            userAgent: profile.userAgent,
+            useLogin: profile.useLogin,
+            loginSupported: profile.loginSupported
         )
 
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return []
+        }
+
+        // 檢查 playabilityStatus，只有 OK 才繼續解析串流
+        if let playabilityStatus = object["playabilityStatus"] as? [String: Any] {
+            let status = playabilityStatus["status"] as? String ?? "UNKNOWN"
+            if status != "OK" {
+                let reason = playabilityStatus["reason"] as? String
+                print("[YouTubeMusicService] [\(profile.clientName)] playabilityStatus=\(status)\(reason.map { ", reason=\($0)" } ?? "")")
+                return []
+            }
         }
 
         guard
@@ -282,6 +373,7 @@ final class YouTubeMusicService {
                     url: hlsURL,
                     sourceClientName: profile.clientName,
                     sourceClientVersion: profile.clientVersion,
+                    sourceUserAgent: profile.userAgent,
                     mimeType: "application/x-mpegURL",
                     codec: nil,
                     container: "HLS",
@@ -309,7 +401,7 @@ final class YouTubeMusicService {
     }
 
     private func fetchPlayableURLs(videoId: String, profile: PlayerClientProfile, allowWebM: Bool) async throws -> [URL] {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "context": [
                 "client": [
                     "clientName": profile.clientName,
@@ -324,12 +416,30 @@ final class YouTubeMusicService {
             "racyCheckOk": true
         ]
 
+        if profile.useLogin, let auth = authProvider?() {
+            if var context = payload["context"] as? [String: Any],
+               var client = context["client"] as? [String: Any] {
+                if !auth.visitorData.isEmpty {
+                    client["visitorData"] = auth.visitorData
+                }
+                context["client"] = client
+                if profile.loginSupported, !auth.dataSyncId.isEmpty {
+                    var user = context["user"] as? [String: Any] ?? [:]
+                    user["onBehalfOfUser"] = auth.dataSyncId
+                    context["user"] = user
+                }
+                payload["context"] = context
+            }
+        }
+
         let data = try await requestJSON(
             endpoint: "https://music.youtube.com/youtubei/v1/player",
             payload: payload,
             clientName: profile.clientId,
             clientVersion: profile.clientVersion,
-            userAgent: profile.userAgent
+            userAgent: profile.userAgent,
+            useLogin: profile.useLogin,
+            loginSupported: profile.loginSupported
         )
 
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -373,7 +483,13 @@ final class YouTubeMusicService {
         useLogin: Bool = false,
         loginSupported: Bool = true
     ) async throws -> Data {
-        guard let url = URL(string: endpoint) else {
+        // YouTube Music API 要求所有請求帶上 prettyPrint=false
+        var components = URLComponents(string: endpoint)!
+        let existing = components.queryItems ?? []
+        if !existing.contains(where: { $0.name == "prettyPrint" }) {
+            components.queryItems = existing + [URLQueryItem(name: "prettyPrint", value: "false")]
+        }
+        guard let url = components.url else {
             throw YouTubeMusicServiceError.invalidResponse
         }
 
@@ -387,7 +503,10 @@ final class YouTubeMusicService {
                 }
                 context["client"] = client
                 if loginSupported, !auth.dataSyncId.isEmpty {
-                    context["user"] = ["onBehalfOfUser": auth.dataSyncId]
+                    // 保留 baseContext 中的 lockedSafetyMode，只追加 onBehalfOfUser
+                    var user = context["user"] as? [String: Any] ?? [:]
+                    user["onBehalfOfUser"] = auth.dataSyncId
+                    context["user"] = user
                 }
                 finalPayload["context"] = context
             }
@@ -400,97 +519,73 @@ final class YouTubeMusicService {
         request.setValue(clientName, forHTTPHeaderField: "X-YouTube-Client-Name")
         request.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
         request.setValue("1", forHTTPHeaderField: "X-Goog-Api-Format-Version")
-        request.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
-        request.setValue("https://music.youtube.com", forHTTPHeaderField: "X-Origin")
-        request.setValue("https://music.youtube.com/", forHTTPHeaderField: "Referer")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
 
+        // Origin/Referer 只有 web client 才需要
+        // IOS/ANDROID_VR 是 mobile app，不應帶 web headers，否則 YouTube 可能回傳受限的 stream URL
+        let isWebClient = userAgent.hasPrefix("Mozilla")
+        if isWebClient {
+            request.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
+            request.setValue("https://music.youtube.com", forHTTPHeaderField: "X-Origin")
+            request.setValue("https://music.youtube.com/", forHTTPHeaderField: "Referer")
+        }
+
         if let auth, useLogin, loginSupported, !auth.cookie.isEmpty {
-            request.setValue(auth.cookie, forHTTPHeaderField: "Cookie")
+            // 注入 cookie 到 session 的 cookieStorage，讓 URLSession 自動帶上 Cookie header
+            injectCookies(auth.cookie, for: url)
+            request.httpShouldHandleCookies = true
             if let sapisid = auth.sapisid {
                 let timestamp = Int(Date().timeIntervalSince1970)
                 let hash = sha1("\(timestamp) \(sapisid) https://music.youtube.com")
-                let authHeader = "SAPISIDHASH \(timestamp)_\(hash) SAPISID1PHASH \(timestamp)_\(hash) SAPISID3PHASH \(timestamp)_\(hash)"
-                request.setValue(authHeader, forHTTPHeaderField: "Authorization")
+                request.setValue("SAPISIDHASH \(timestamp)_\(hash)", forHTTPHeaderField: "Authorization")
+            }
+        } else {
+            request.httpShouldHandleCookies = false
+            // 顯式清空 Cookie header，防止 iOS 系統層洩漏
+            request.setValue("", forHTTPHeaderField: "Cookie")
+            // 如果是 player API，同時清除 HTTPCookieStorage.shared 中 youtube.com 的 cookies
+            if endpoint.contains("/player") {
+                let ytDomains = ["music.youtube.com", ".youtube.com", "www.youtube.com"]
+                for domain in ytDomains {
+                    if let domainURL = URL(string: "https://\(domain)"),
+                       let cookies = HTTPCookieStorage.shared.cookies(for: domainURL) {
+                        print("[YTService] clearing \(cookies.count) shared cookies for \(domain) before player API")
+                        for c in cookies { HTTPCookieStorage.shared.deleteCookie(c) }
+                    }
+                }
             }
         }
 
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
+        // 選擇 session：登入請求用 session（帶 cookies），匿名請求用 anonymousSession（完全無 cookies）
+        let activeSession = (useLogin && auth != nil) ? session : anonymousSession
+        let sessionLabel = (useLogin && auth != nil) ? "auth" : "anon"
+        let sharedCookieCount = HTTPCookieStorage.shared.cookies(for: url)?.count ?? 0
+        print("[YTService] requestJSON: \(endpoint.split(separator: "/").last ?? "?") via \(sessionLabel) session, sharedCookies=\(sharedCookieCount), useLogin=\(useLogin), hasAuth=\(auth != nil)")
+
+        let (data, response) = try await activeSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            print("[YTService] requestJSON: response is NOT HTTPURLResponse for \(endpoint)")
             throw YouTubeMusicServiceError.invalidResponse
+        }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            let bodyPreview = String(data: data.prefix(300), encoding: .utf8) ?? "(binary)"
+            print("[YTService] requestJSON: HTTP \(http.statusCode) for \(endpoint), body=\(bodyPreview.prefix(200))")
+            throw YouTubeMusicServiceError.httpError(
+                statusCode: http.statusCode,
+                endpoint: endpoint,
+                bodyPreview: String(bodyPreview.prefix(200))
+            )
         }
         return data
     }
 
     private func sha1(_ input: String) -> String {
-        // 純 Swift SHA-1，避免引入 CommonCrypto
-        let bytes: [UInt8] = Array(input.utf8)
-        var h0: UInt32 = 0x67452301
-        var h1: UInt32 = 0xEFCDAB89
-        var h2: UInt32 = 0x98BADCFE
-        var h3: UInt32 = 0x10325476
-        var h4: UInt32 = 0xC3D2E1F0
-
-        var padded = bytes
-        let messageLengthBits = UInt64(bytes.count) * 8
-        padded.append(0x80)
-        while padded.count % 64 != 56 {
-            padded.append(0)
+        let data = Data(input.utf8)
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        data.withUnsafeBytes { bytes in
+            _ = CC_SHA1(bytes.baseAddress, CC_LONG(data.count), &digest)
         }
-        for i in stride(from: 7, through: 0, by: -1) {
-            padded.append(UInt8((messageLengthBits >> UInt64(i * 8)) & 0xFF))
-        }
-
-        for chunkStart in stride(from: 0, to: padded.count, by: 64) {
-            var w = [UInt32](repeating: 0, count: 80)
-            for i in 0 ..< 16 {
-                let base = chunkStart + i * 4
-                w[i] = (UInt32(padded[base]) << 24) |
-                       (UInt32(padded[base + 1]) << 16) |
-                       (UInt32(padded[base + 2]) << 8) |
-                       UInt32(padded[base + 3])
-            }
-            for i in 16 ..< 80 {
-                let value = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]
-                w[i] = (value << 1) | (value >> 31)
-            }
-
-            var a = h0, b = h1, c = h2, d = h3, e = h4
-
-            for i in 0 ..< 80 {
-                let f: UInt32
-                let k: UInt32
-                switch i {
-                case 0 ..< 20:
-                    f = (b & c) | ((~b) & d)
-                    k = 0x5A827999
-                case 20 ..< 40:
-                    f = b ^ c ^ d
-                    k = 0x6ED9EBA1
-                case 40 ..< 60:
-                    f = (b & c) | (b & d) | (c & d)
-                    k = 0x8F1BBCDC
-                default:
-                    f = b ^ c ^ d
-                    k = 0xCA62C1D6
-                }
-
-                let temp = ((a << 5) | (a >> 27)) &+ f &+ e &+ k &+ w[i]
-                e = d
-                d = c
-                c = (b << 30) | (b >> 2)
-                b = a
-                a = temp
-            }
-
-            h0 = h0 &+ a
-            h1 = h1 &+ b
-            h2 = h2 &+ c
-            h3 = h3 &+ d
-            h4 = h4 &+ e
-        }
-
-        return String(format: "%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4)
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     private func extractVideoId(from renderer: [String: Any]) -> String? {
@@ -704,6 +799,7 @@ final class YouTubeMusicService {
             url: url,
             sourceClientName: profile.clientName,
             sourceClientVersion: profile.clientVersion,
+            sourceUserAgent: profile.userAgent,
             mimeType: mimeType,
             codec: codec,
             container: container,
@@ -774,9 +870,19 @@ final class YouTubeMusicService {
             return false
         }
 
+        // AVPlayer 不支援 Opus codec（即使在 MP4 容器中也不行）
+        if mimeType.contains("opus") {
+            return false
+        }
+        // 也排除 vorbis
+        if mimeType.contains("vorbis") {
+            return false
+        }
+
         // Restrict to codecs/container families that are known to decode reliably in iOS AVPlayer.
-        return mimeType.contains("audio/mp4") ||
-            mimeType.contains("mp4a") ||
+        // 只接受 AAC (mp4a)、MP3、HE-AAC 等
+        return mimeType.contains("mp4a") ||
+            mimeType.contains("audio/mp4") ||
             mimeType.contains("audio/mpeg") ||
             mimeType.contains("audio/mp3") ||
             mimeType.contains("audio/aac") ||
@@ -858,30 +964,41 @@ private struct PlayerClientProfile {
     let clientId: String
     let userAgent: String
     let osVersion: String
+    let loginSupported: Bool
+    let useLogin: Bool
 }
 
 private let playerClientProfiles: [PlayerClientProfile] = [
+    // IOS 最穩定，支援 HLS + AAC/M4A，優先使用
     PlayerClientProfile(
         clientName: "IOS",
         clientVersion: "20.10.4",
         clientId: "5",
         userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-        osVersion: "18.3.2.22D82"
+        osVersion: "18.3.2.22D82",
+        loginSupported: false,
+        useLogin: false
     ),
+    // ANDROID_VR 不需登入，作為備援（部分影片可能觸發 bot detection）
     PlayerClientProfile(
         clientName: "ANDROID_VR",
         clientVersion: "1.61.48",
         clientId: "28",
-        userAgent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Oculus Quest 3)",
-        osVersion: "12"
+        userAgent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Oculus Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)",
+        osVersion: "12",
+        loginSupported: false,
+        useLogin: false
     ),
+    // WEB_REMIX 需要登入 + PoToken，未登入時自動跳過（resolveAudioStreams 控制）
     PlayerClientProfile(
-        clientName: "WEB",
-        clientVersion: "2.20250312.04.00",
-        clientId: "1",
+        clientName: "WEB_REMIX",
+        clientVersion: "1.20250310.01.00",
+        clientId: "67",
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-        osVersion: "10.0"
-    )
+        osVersion: "10.0",
+        loginSupported: true,
+        useLogin: true
+    ),
 ]
 // MARK: - Account / Home / Library APIs
 
@@ -889,7 +1006,7 @@ extension YouTubeMusicService {
     private var webRemixClientName: String { "WEB_REMIX" }
     private var webRemixClientVersion: String { "1.20250310.01.00" }
     private var webRemixClientId: String { "67" }
-    private var webRemixUserAgent: String { "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36" }
+    private var webRemixUserAgent: String { "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0" }
 
     private func baseContext() -> [String: Any] {
         [
@@ -899,6 +1016,13 @@ extension YouTubeMusicService {
                     "clientVersion": webRemixClientVersion,
                     "hl": "zh-TW",
                     "gl": "TW"
+                ],
+                "request": [
+                    "internalExperimentFlags": [] as [Any],
+                    "useSsl": true
+                ],
+                "user": [
+                    "lockedSafetyMode": false
                 ]
             ]
         ]
@@ -945,16 +1069,32 @@ extension YouTubeMusicService {
 
     /// 取得首頁推薦（對應 Android HomePage，需登入才能拿到個人化結果，但未登入也可抓公共內容）。
     func fetchHomeFeed() async throws -> HomeFeed {
-        var payload = baseContext()
-        payload["browseId"] = "FEmusic_home"
-        let data = try await requestJSON(
-            endpoint: "https://music.youtube.com/youtubei/v1/browse",
-            payload: payload,
-            clientName: webRemixClientId,
-            clientVersion: webRemixClientVersion,
-            userAgent: webRemixUserAgent,
-            useLogin: true
-        )
+        // 先嘗試帶 cookie 取得個人化結果；若失敗則 fallback 到匿名取得公共內容
+        let data: Data
+        do {
+            var payload = baseContext()
+            payload["browseId"] = "FEmusic_home"
+            data = try await requestJSON(
+                endpoint: "https://music.youtube.com/youtubei/v1/browse",
+                payload: payload,
+                clientName: webRemixClientId,
+                clientVersion: webRemixClientVersion,
+                userAgent: webRemixUserAgent,
+                useLogin: true
+            )
+        } catch {
+            // 登入態請求失敗 → 匿名 fallback
+            var payload = baseContext()
+            payload["browseId"] = "FEmusic_home"
+            data = try await requestJSON(
+                endpoint: "https://music.youtube.com/youtubei/v1/browse",
+                payload: payload,
+                clientName: webRemixClientId,
+                clientVersion: webRemixClientVersion,
+                userAgent: webRemixUserAgent,
+                useLogin: false
+            )
+        }
 
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw YouTubeMusicServiceError.parsingFailed
