@@ -5,8 +5,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import test_innertube
+import test_recommender
 import test_spotify
 
 if __name__ == "__main__":
-    codes = [test_innertube.run(), test_spotify.run()]
+    codes = [test_innertube.run(), test_spotify.run(), test_recommender.run()]
     sys.exit(1 if any(codes) else 0)

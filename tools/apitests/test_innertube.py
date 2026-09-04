@@ -112,7 +112,12 @@ def run():
         label = it.walk(names[0], "text")
         t.note("signed in as: %s" % (label[0] if label else "?"))
 
-    for client in (it.WEB_REMIX, it.TVHTML5):
+    # Only WEB_REMIX is exercised as a hard requirement: it is the client the
+    # app promotes to first position when signed in, and the only one
+    # observed to be offered itag 141 / 774. TVHTML5 is probed separately
+    # below for information only - it needs a signature-timestamp/PoToken
+    # handshake this suite does not perform, and the app never uses it.
+    for client in (it.WEB_REMIX,):
         with suite.test("player[%s] authenticated -> premium bitrate" % client.name) as t:
             status_code, body = it.call(
                 "player", {"videoId": VIDEO_ID, "contentCheckOk": True,
@@ -137,6 +142,19 @@ def run():
             else:
                 t.warn("no premium itag (141/774) - the account may not have Premium, "
                        "or this client cannot request it")
+
+    with suite.test("TVHTML5 authenticated (informational)") as t:
+        status_code, body = it.call(
+            "player", {"videoId": VIDEO_ID, "contentCheckOk": True, "racyCheckOk": True},
+            it.TVHTML5, cookie=cookie, visitor_data=visitor, data_sync_id=data_sync_id)
+        playability = (body.get("playabilityStatus") or {}) if isinstance(body, dict) else {}
+        formats = it.audio_formats(body) if isinstance(body, dict) else []
+        if formats:
+            t.note("itags=%s" % sorted({f.get("itag") for f in formats}))
+        else:
+            t.warn("TVHTML5 returned no formats (status=%s %s); expected without a "
+                   "signature timestamp / PoToken. The app does not use this client."
+                   % (playability.get("status"), playability.get("reason")))
 
     with suite.test("personalised home feed") as t:
         status_code, body = it.call("browse", {"browseId": "FEmusic_home"}, it.WEB_REMIX,
