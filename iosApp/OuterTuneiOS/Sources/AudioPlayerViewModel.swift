@@ -72,6 +72,8 @@ final class AudioPlayerViewModel: ObservableObject {
 #endif
 
         lines.append("youtube signed in: \(accountStore.isLoggedIn)")
+        lines.append("stream resolver: configured=\(StreamResolverService.shared.isConfigured) "
+            + "reachable=\(StreamResolverService.shared.isReachable.map(String.init) ?? "unknown")")
         lines.append("spotify linked: \(SpotifyService.shared.isAuthenticated)")
         lines.append("ai ranker configured: \(AIRankingService.shared.isConfigured)")
         lines.append("audio quality preference: \(audioQualityPreference.rawValue)")
@@ -137,6 +139,7 @@ final class AudioPlayerViewModel: ObservableObject {
     private let lyricsService = LyricsService.shared
     private let accountStore = AccountStore.shared
     private let autoQueueService = AutoQueueService.shared
+    private let resolverService = StreamResolverService.shared
 
     private let queueStorageKey = "ios.queue.v1"
     private let queueIndexStorageKey = "ios.queue.index.v1"
@@ -866,8 +869,26 @@ final class AudioPlayerViewModel: ObservableObject {
                 )
             ]
         case .youtube(let videoId):
-            let resolved = try await youtubeService.resolveAudioStreams(videoId: videoId)
-            return prioritizePlaybackCandidates(resolved)
+            var options: [AudioStreamOption] = []
+
+            // The companion resolver proxies with Range support and is not
+            // subject to googlevideo's 1 MiB cap, so it goes first when set up.
+            // Direct googlevideo playback stays as a fallback: it works for the
+            // first megabyte, which is better than silence if the resolver is
+            // unreachable.
+            if let viaResolver = await resolverService.playbackOption(for: videoId) {
+                options.append(viaResolver)
+                appendDebugLog("使用串流伺服器：itag=\(viaResolver.itag ?? -1) "
+                    + "\(viaResolver.bitrateText)")
+            }
+
+            let direct = (try? await youtubeService.resolveAudioStreams(videoId: videoId)) ?? []
+            options.append(contentsOf: prioritizePlaybackCandidates(direct))
+
+            guard !options.isEmpty else {
+                throw YouTubeMusicServiceError.noPlayableStream
+            }
+            return options
         case .localFile(let relativePath):
             let localURL = localFileURL(relativePath: relativePath)
             if FileManager.default.fileExists(atPath: localURL.path) {
@@ -914,7 +935,12 @@ final class AudioPlayerViewModel: ObservableObject {
         print("[Player] startPlaybackAttempt: idx=\(playbackCandidateIndex)/\(playbackCandidates.count), client=\(selectedStream.sourceClientName), HLS=\(selectedStream.isHLSManifest), itag=\(selectedStream.itag ?? 0), container=\(selectedStream.container ?? "?")")
 
         // HLS manifests and local/direct files can be played directly by AVPlayer
-        if selectedStream.isHLSManifest || selectedStream.sourceClientName == "LOCAL" || selectedStream.sourceClientName == "DIRECT" {
+        // RESOLVER serves a normal seekable HTTP resource, so AVPlayer streams
+        // it natively - no download, no remux, and playback starts immediately.
+        if selectedStream.isHLSManifest
+            || selectedStream.sourceClientName == "LOCAL"
+            || selectedStream.sourceClientName == "DIRECT"
+            || selectedStream.sourceClientName == "RESOLVER" {
             playItemDirectly(url: selectedStream.url, track: track)
             return
         }

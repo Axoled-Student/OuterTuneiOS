@@ -5,6 +5,7 @@ struct ContentView: View {
     @StateObject private var accountStore = AccountStore.shared
     @StateObject private var spotify = SpotifyService.shared
     @StateObject private var aiRanker = AIRankingService.shared
+    @StateObject private var resolver = StreamResolverService.shared
     @State private var isNowPlayingPresented: Bool = false
     @State private var isLoginPresented: Bool = false
 
@@ -37,6 +38,7 @@ struct ContentView: View {
         .environmentObject(accountStore)
         .environmentObject(spotify)
         .environmentObject(aiRanker)
+        .environmentObject(resolver)
         .overlay(alignment: .bottom) {
             if player.nowPlayingTrack != nil {
                 MiniPlayerBarView {

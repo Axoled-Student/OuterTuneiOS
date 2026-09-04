@@ -144,6 +144,9 @@ struct SettingsView: View {
             NavigationLink("推薦與自動佇列") {
                 RecommendationSettingsView()
             }
+            NavigationLink("串流伺服器") {
+                ResolverSettingsView()
+            }
         }
     }
 
