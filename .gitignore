@@ -119,3 +119,6 @@ tools/apitests/*.cookies.json
 ai.env
 *.key
 tools/apitests/.youtube_oauth.json
+
+# resolver cookie export (never commit)
+build/ytm_cookies.txt
