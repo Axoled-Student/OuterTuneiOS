@@ -1,0 +1,122 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches:
+      - dev
+      - 'feat/**'
+      - 'fix/**'
+    paths:
+      - 'iosApp/**'
+      - 'tools/apitests/**'
+      - '.github/workflows/build_ios.yml'
+  pull_request:
+    paths:
+      - 'iosApp/**'
+      - '.github/workflows/build_ios.yml'
+  workflow_dispatch:
+    inputs:
+      run_api_tests:
+        description: 'Run the live-network API tests'
+        type: boolean
+        default: true
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-tests:
+    name: API tests (live network)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.run_api_tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Anonymous coverage always runs. The authenticated tests self-skip
+      # unless the corresponding secrets are configured on the repository.
+      - name: Run InnerTube API tests
+        env:
+          YTM_COOKIE: ${{ secrets.YTM_COOKIE }}
+          YTM_DATA_SYNC_ID: ${{ secrets.YTM_DATA_SYNC_ID }}
+          FORCE_COLOR: '1'
+        run: python tools/apitests/test_innertube.py
+
+      - name: Run Spotify API tests
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_ACCESS_TOKEN: ${{ secrets.SPOTIFY_ACCESS_TOKEN }}
+          FORCE_COLOR: '1'
+        run: python tools/apitests/test_spotify.py
+
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: iosApp
+        run: xcodegen generate --spec project.yml
+
+      # Signing is disabled outright: the artifact is an unsigned IPA meant to
+      # be re-signed by the installer (AltStore / Sideloadly / a dev cert).
+      - name: Build (Release, iphoneos, unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project iosApp/OuterTuneiOS.xcodeproj \
+            -scheme OuterTuneiOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/ios/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build 2>&1 | xcbeautify --renderer github-actions || \
+          xcodebuild \
+            -project iosApp/OuterTuneiOS.xcodeproj \
+            -scheme OuterTuneiOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/ios/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build
+
+      - name: Package IPA
+        run: |
+          APP="build/ios/DerivedData/Build/Products/Release-iphoneos/OuterTuneiOS.app"
+          test -d "$APP" || { echo "::error::$APP not found"; exit 1; }
+          rm -rf build/ios/Payload
+          mkdir -p build/ios/Payload
+          cp -R "$APP" build/ios/Payload/
+          cd build/ios
+          zip -qry OuterTuneiOS-unsigned.ipa Payload
+          ls -lh OuterTuneiOS-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: OuterTuneiOS-unsigned-ipa
+          path: build/ios/OuterTuneiOS-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
