@@ -934,13 +934,12 @@ final class AudioPlayerViewModel: ObservableObject {
             + "\(selectedStream.bitrateText) host=\(selectedStream.url.host ?? "?")")
         print("[Player] startPlaybackAttempt: idx=\(playbackCandidateIndex)/\(playbackCandidates.count), client=\(selectedStream.sourceClientName), HLS=\(selectedStream.isHLSManifest), itag=\(selectedStream.itag ?? 0), container=\(selectedStream.container ?? "?")")
 
-        // HLS manifests and local/direct files can be played directly by AVPlayer
-        // RESOLVER serves a normal seekable HTTP resource, so AVPlayer streams
-        // it natively - no download, no remux, and playback starts immediately.
+        // HLS manifests and local/direct files can be played directly by AVPlayer.
+        // NOTE: RESOLVER proxies YouTube's itag 140 DASH fMP4, which CoreMedia/AVPlayer
+        // cannot stream directly over plain HTTP. It must be downloaded and remuxed first.
         if selectedStream.isHLSManifest
             || selectedStream.sourceClientName == "LOCAL"
-            || selectedStream.sourceClientName == "DIRECT"
-            || selectedStream.sourceClientName == "RESOLVER" {
+            || selectedStream.sourceClientName == "DIRECT" {
             playItemDirectly(url: selectedStream.url, track: track)
             return
         }

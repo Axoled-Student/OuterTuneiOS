@@ -1,4 +1,4 @@
-# Starts the OuterTune stream resolver and a Cloudflare tunnel.
+﻿# Starts the OuterTune stream resolver and a Cloudflare tunnel.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\resolver\start.ps1
 #
