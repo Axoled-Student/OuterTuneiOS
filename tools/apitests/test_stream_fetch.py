@@ -85,8 +85,13 @@ def run():
 
             playability = body.get("playabilityStatus") or {}
             if playability.get("status") != "OK":
-                t.warn("playabilityStatus=%s %s" % (playability.get("status"),
-                                                    playability.get("reason")))
+                # A client being bot-gated ("Sign in to confirm you're not a
+                # bot") or login-walled is a YouTube-side condition, not a
+                # defect in the app. Record it and move on: the suite's real
+                # assertion is that *some* client yields a downloadable stream.
+                t.warn("playabilityStatus=%s %s - client unusable right now"
+                       % (playability.get("status"), playability.get("reason")))
+                return
 
             formats = it.audio_formats(body)
             streaming = body.get("streamingData") or {}
