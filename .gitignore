@@ -118,3 +118,4 @@ tools/apitests/ytmusic.json
 tools/apitests/*.cookies.json
 ai.env
 *.key
+tools/apitests/.youtube_oauth.json

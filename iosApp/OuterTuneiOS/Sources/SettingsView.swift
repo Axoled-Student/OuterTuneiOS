@@ -167,30 +167,63 @@ struct SettingsView: View {
 
 struct DebugLogView: View {
     @EnvironmentObject var player: AudioPlayerViewModel
+    @State private var shareItem: DiagnosticsPayload?
 
     var body: some View {
         List {
-            if player.recentDebugLogs.isEmpty {
-                Text("尚無日誌")
-                    .foregroundColor(.secondary)
-            } else {
-                ForEach(Array(player.recentDebugLogs.enumerated()), id: \.offset) { _, log in
-                    Text(log)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
+            Section {
+                Button {
+                    shareItem = DiagnosticsPayload(text: player.diagnosticsReport())
+                } label: {
+                    Label("分享診斷報告", systemImage: "square.and.arrow.up")
+                }
+                Button {
+#if os(iOS)
+                    UIPasteboard.general.string = player.diagnosticsReport()
+#endif
+                } label: {
+                    Label("複製診斷報告", systemImage: "doc.on.doc")
+                }
+            } footer: {
+                Text("診斷報告包含播放器狀態、所有候選串流與最近的日誌，"
+                     + "回報問題時附上這份即可。不含帳號 cookie 或 API 金鑰。")
+            }
+
+            Section("日誌") {
+                if player.recentDebugLogs.isEmpty {
+                    Text("尚無日誌")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(Array(player.recentDebugLogs.enumerated()), id: \.offset) { _, log in
+                        Text(log)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
                 }
             }
         }
         .navigationTitle("Debug 日誌")
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button("複製全部") {
-                    let all = player.recentDebugLogs.joined(separator: "\n")
-                    #if os(iOS)
-                    UIPasteboard.general.string = all
-                    #endif
-                }
-            }
+        .sheet(item: $shareItem) { payload in
+            ActivityView(activityItems: [payload.text])
         }
     }
 }
+
+struct DiagnosticsPayload: Identifiable {
+    let id = UUID()
+    let text: String
+}
+
+#if os(iOS)
+/// UIActivityViewController bridge. ShareLink would be simpler but is iOS 16+,
+/// and this app targets iOS 15.
+struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+#endif

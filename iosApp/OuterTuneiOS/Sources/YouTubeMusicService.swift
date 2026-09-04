@@ -787,11 +787,24 @@ final class YouTubeMusicService {
             return nil
         }
 
-        if let signature = values["sig"] ?? values["signature"],
-           let sp = values["sp"] {
+        // A pre-cleared signature is rare but does occur, and can be used as-is.
+        if let signature = values["sig"] ?? values["signature"] {
             var queryItems = finalComponents.queryItems ?? []
-            queryItems.append(URLQueryItem(name: sp, value: signature))
+            queryItems.append(URLQueryItem(name: values["sp"] ?? "signature", value: signature))
             finalComponents.queryItems = queryItems
+            return finalComponents.url
+        }
+
+        // Otherwise the format carries `s=`, an obfuscated signature that only
+        // YouTube's player JS can descramble. Returning the URL without it
+        // yields a link googlevideo answers with HTTP 403 every single time,
+        // which is worse than having no candidate at all: it displaces working
+        // streams and surfaces as a playback failure. Drop it instead, so the
+        // resolver falls through to a client that hands out direct URLs.
+        if values["s"] != nil {
+            print("[YTService] skipping itag \(format["itag"] as? Int ?? -1): "
+                  + "ciphered signature cannot be descrambled")
+            return nil
         }
 
         return finalComponents.url

@@ -39,19 +39,15 @@ jobs:
 
       # Anonymous coverage always runs. The authenticated tests self-skip
       # unless the corresponding secrets are configured on the repository.
-      - name: Run InnerTube API tests
+      - name: Run all API suites
         env:
           YTM_COOKIE: ${{ secrets.YTM_COOKIE }}
           YTM_DATA_SYNC_ID: ${{ secrets.YTM_DATA_SYNC_ID }}
-          FORCE_COLOR: '1'
-        run: python tools/apitests/test_innertube.py
-
-      - name: Run Spotify API tests
-        env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_ACCESS_TOKEN: ${{ secrets.SPOTIFY_ACCESS_TOKEN }}
+          PYTHONUTF8: '1'
           FORCE_COLOR: '1'
-        run: python tools/apitests/test_spotify.py
+        run: python tools/apitests/run_all.py
 
   build:
     name: Build unsigned IPA

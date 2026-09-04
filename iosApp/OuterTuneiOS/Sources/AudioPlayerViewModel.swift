@@ -53,7 +53,59 @@ final class AudioPlayerViewModel: ObservableObject {
 
     /// 最近的 debug 日誌（環形緩衝），供用戶回報問題時複製
     @Published var recentDebugLogs: [String] = []
-    private let maxDebugLogCount = 50
+    // A single failed track can emit a dozen lines (one per candidate plus
+    // per-attempt results), so 50 truncated the very context needed to debug it.
+    private let maxDebugLogCount = 400
+
+    /// Everything needed to diagnose a playback failure in one pasteable block.
+    func diagnosticsReport() -> String {
+        var lines: [String] = []
+        lines.append("=== OuterTune iOS diagnostics ===")
+        lines.append("generated: \(ISO8601DateFormatter().string(from: Date()))")
+
+        let bundle = Bundle.main
+        let version = bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = bundle.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        lines.append("app: \(version) (\(build))")
+#if os(iOS)
+        lines.append("ios: \(UIDevice.current.systemVersion) \(UIDevice.current.model)")
+#endif
+
+        lines.append("youtube signed in: \(accountStore.isLoggedIn)")
+        lines.append("spotify linked: \(SpotifyService.shared.isAuthenticated)")
+        lines.append("ai ranker configured: \(AIRankingService.shared.isConfigured)")
+        lines.append("audio quality preference: \(audioQualityPreference.rawValue)")
+        lines.append("repeat: \(repeatMode.rawValue), shuffle: \(isShuffleEnabled), "
+            + "auto-queue: \(isAutoQueueEnabled)")
+        lines.append("queue: \(queue.count) items, index: "
+            + "\(currentQueueIndex.map(String.init) ?? "nil")")
+        lines.append("isPlaying: \(isPlaying), duration: \(duration), time: \(currentTime)")
+
+        if let track = nowPlayingTrack {
+            lines.append("now playing: \(track.artist) - \(track.title) [\(track.stableId)]")
+        }
+        if let stream = nowPlayingStreamInfo {
+            lines.append("stream: \(stream.sourceClientName) itag=\(stream.itag ?? -1) "
+                + "\(stream.container) \(stream.bitrateText) "
+                + "quality=\(stream.audioQuality ?? "?") hls=\(stream.isHLSManifest) "
+                + "premium=\(stream.isPremiumFormat)")
+            lines.append("stream host: \(stream.url.host ?? "?")")
+        }
+
+        lines.append("candidates: \(availableStreamOptions.count)")
+        for (index, option) in availableStreamOptions.enumerated() {
+            lines.append("  [\(index)] \(option.sourceClientName) itag=\(option.itag ?? -1) "
+                + "\(option.container) \(option.bitrateText) "
+                + "hls=\(option.isHLSManifest) premium=\(option.isPremiumFormat)")
+        }
+
+        lines.append("status: \(statusMessage)")
+        lines.append("")
+        lines.append("=== log (\(recentDebugLogs.count) lines) ===")
+        lines.append(contentsOf: recentDebugLogs)
+        return lines.joined(separator: "
+")
+    }
 
     func appendDebugLog(_ msg: String) {
         let ts = ISO8601DateFormatter().string(from: Date())
@@ -765,8 +817,13 @@ final class AudioPlayerViewModel: ObservableObject {
             nowPlayingStreamInfo = playbackCandidates.first
 
             print("[Player] playTrack: resolved \(playbackCandidates.count) candidates for \(track.title)")
+            appendDebugLog("解析完成[\(track.title)]：\(playbackCandidates.count) 個候選，"
+                + "登入=\(accountStore.isLoggedIn)，音質偏好=\(audioQualityPreference.rawValue)")
             for (i, c) in playbackCandidates.enumerated() {
                 print("[Player]   [\(i)] \(c.sourceClientName) HLS=\(c.isHLSManifest) itag=\(c.itag ?? 0) \(c.container ?? "?") \(c.audioQuality ?? "?")")
+                appendDebugLog("  候選[\(i)] \(c.sourceClientName) itag=\(c.itag ?? 0) "
+                    + "\(c.container) \(c.bitrateText) HLS=\(c.isHLSManifest) "
+                    + "premium=\(c.isPremiumFormat)")
             }
 
             guard !playbackCandidates.isEmpty else {
@@ -852,6 +909,9 @@ final class AudioPlayerViewModel: ObservableObject {
         let selectedStream = playbackCandidates[playbackCandidateIndex]
         nowPlayingStreamInfo = selectedStream
         streamURL = selectedStream.url.absoluteString
+        appendDebugLog("嘗試候選 \(playbackCandidateIndex + 1)/\(playbackCandidates.count)："
+            + "\(selectedStream.sourceClientName) itag=\(selectedStream.itag ?? 0) "
+            + "\(selectedStream.bitrateText) host=\(selectedStream.url.host ?? "?")")
         print("[Player] startPlaybackAttempt: idx=\(playbackCandidateIndex)/\(playbackCandidates.count), client=\(selectedStream.sourceClientName), HLS=\(selectedStream.isHLSManifest), itag=\(selectedStream.itag ?? 0), container=\(selectedStream.container ?? "?")")
 
         // HLS manifests and local/direct files can be played directly by AVPlayer
@@ -870,6 +930,16 @@ final class AudioPlayerViewModel: ObservableObject {
             BackgroundActivityGuard.shared.begin("stream-download")
             defer { BackgroundActivityGuard.shared.end() }
             do {
+                guard await self.validateStream(streamToDownload) else {
+                    await MainActor.run {
+                        guard self.activePlaybackTrackStableId == track.stableId else { return }
+                        if !self.tryFallbackPlaybackIfNeeded(for: track) {
+                            self.statusMessage = "播放失敗：所有串流來源皆無法存取"
+                            self.isPlaying = false
+                        }
+                    }
+                    return
+                }
                 let localURL = try await self.downloadAndRemux(stream: streamToDownload)
                 await MainActor.run {
                     guard self.activePlaybackTrackStableId == track.stableId,
@@ -940,6 +1010,43 @@ final class AudioPlayerViewModel: ObservableObject {
         return URLSession(configuration: config)
     }()
 
+    /// Cheap liveness check before committing to a whole-file download.
+    ///
+    /// Ported from the Android client's `validateStatus`. Without it a dead URL
+    /// is only discovered after downloading the entire track, which both wastes
+    /// the transfer and delays the fallback. It matters more here than on
+    /// Android because YouTube expires IOS-client stream URLs aggressively -
+    /// the upstream project notes "recent api changes produce error 403 after
+    /// 30 seconds" - so a URL can rot between resolution and playback.
+    private func validateStream(_ stream: AudioStreamOption) async -> Bool {
+        guard !stream.isHLSManifest, !stream.url.isFileURL else { return true }
+
+        var request = URLRequest(url: stream.url)
+        request.httpMethod = "GET"
+        request.httpShouldHandleCookies = false
+        request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        request.setValue("", forHTTPHeaderField: "Cookie")
+        if let userAgent = stream.sourceUserAgent, !userAgent.isEmpty {
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        }
+
+        do {
+            let (_, response) = try await Self.streamDownloadSession.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            let ok = (200 ... 206).contains(http.statusCode)
+            if !ok {
+                appendDebugLog("串流驗證失敗：itag=\(stream.itag ?? 0) "
+                    + "\(stream.sourceClientName) HTTP \(http.statusCode)")
+            }
+            return ok
+        } catch {
+            appendDebugLog("串流驗證錯誤：itag=\(stream.itag ?? 0) "
+                + "\(error.localizedDescription)")
+            return false
+        }
+    }
+
     /// Download a YouTube adaptive stream and remux from DASH fMP4 to standard M4A.
     private func downloadAndRemux(stream: AudioStreamOption) async throws -> URL {
         var request = URLRequest(url: stream.url)
@@ -1009,6 +1116,7 @@ final class AudioPlayerViewModel: ObservableObject {
         let nextIndex = playbackCandidateIndex + 1
         guard playbackCandidates.indices.contains(nextIndex) else {
             print("[Player] tryFallback: no more candidates (was \(playbackCandidateIndex)/\(playbackCandidates.count))")
+            appendDebugLog("所有 \(playbackCandidates.count) 個候選皆失敗，無法播放")
             return false
         }
 
@@ -1095,6 +1203,8 @@ final class AudioPlayerViewModel: ObservableObject {
                 case .failed:
                     let failErr = observedItem.error
                     print("[Player] AVPlayerItem FAILED: \(failErr?.localizedDescription ?? "unknown"), idx=\(self.playbackCandidateIndex)/\(self.playbackCandidates.count)")
+                    self.appendDebugLog("AVPlayer 失敗[候選 \(self.playbackCandidateIndex + 1)]："
+                        + "\(self.describePlaybackFailure(from: observedItem))")
                     if self.tryFallbackPlaybackIfNeeded(for: track) {
                         return
                     }
@@ -1543,6 +1653,8 @@ final class AudioPlayerViewModel: ObservableObject {
         let hls = candidates.filter { !$0.isPremiumFormat && $0.isHLSManifest }
         let adaptive = candidates.filter { !$0.isPremiumFormat && !$0.isHLSManifest }
 
+        // Premium formats only reach this point if they carry a usable URL;
+        // ciphered ones are dropped during resolution because they always 403.
         if audioQualityPreference == .high || audioQualityPreference == .auto {
             if !premium.isEmpty {
                 return premium + hls + adaptive
@@ -1550,6 +1662,8 @@ final class AudioPlayerViewModel: ObservableObject {
         }
 
         guard audioQualityPreference != .auto else {
+            // Auto favours the HLS manifest: it starts instantly with no
+            // download+remux, and adapts on its own.
             return hls + adaptive + premium
         }
 
@@ -1595,6 +1709,12 @@ final class AudioPlayerViewModel: ObservableObject {
             }
         }
 
+        // For an explicit quality preference the ranked adaptive streams come
+        // first. Leading with HLS meant "high" silently played an adaptive
+        // ladder of unknown bitrate instead of the best stream on offer.
+        if audioQualityPreference == .high {
+            return sortedKnown.map(\.element) + hls + unknownBitrate.map(\.element)
+        }
         return hls + sortedKnown.map(\.element) + unknownBitrate.map(\.element)
     }
 
