@@ -161,10 +161,19 @@ final class AudioPlayerViewModel: ObservableObject {
         homeErrorMessage = nil
         defer { isLoadingHome = false }
         do {
+            // Spotify-derived shelves go first: they reflect where the
+            // listener's taste actually lives, whereas YouTube's own home feed
+            // is personalised to the YouTube account.
+            let personalized = await autoQueueService.personalizedHomeSections()
             let feed = try await youtubeService.fetchHomeFeed()
-            homeFeed = feed
-            print("[Home] refreshHomeFeed: OK, \(feed.sections.count) sections")
+            homeFeed = HomeFeed(sections: personalized + feed.sections)
+            print("[Home] refreshHomeFeed: OK, \(personalized.count) personalised + \(feed.sections.count) YouTube sections")
         } catch {
+            // A YouTube failure must not discard shelves we already built.
+            let personalized = await autoQueueService.personalizedHomeSections()
+            if !personalized.isEmpty {
+                homeFeed = HomeFeed(sections: personalized)
+            }
             homeErrorMessage = "載入首頁失敗：\(error.localizedDescription)"
             appendDebugLog("首頁失敗: \(error)")
             print("[Home] refreshHomeFeed FAILED: \(error)")

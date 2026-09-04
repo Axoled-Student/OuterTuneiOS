@@ -293,3 +293,95 @@ final class AutoQueueService {
         }
     }
 }
+
+// MARK: - Personalised home shelves
+
+extension AutoQueueService {
+    /// Home shelves built from the Spotify taste profile.
+    ///
+    /// These sit above YouTube Music's own home feed, which is personalised to
+    /// the *YouTube* account. When the listener's real taste lives in Spotify,
+    /// that feed is the wrong signal, so these shelves reintroduce it.
+    func personalizedHomeSections() async -> [HomeSection] {
+        guard spotify.isAuthenticated else { return [] }
+        await spotify.refreshTasteProfile()
+
+        let taste = spotify.profile
+        guard !taste.isEmpty else { return [] }
+
+        var sections: [HomeSection] = []
+
+        // 1. Straight from the Spotify affinity ranking.
+        let favouriteSeeds = taste.weightedTracks.prefix(10).map(\.track)
+        let favourites = await resolve(queries: favouriteSeeds.map(\.searchQuery))
+        if !favourites.isEmpty {
+            sections.append(
+                HomeSection(title: "為你推薦",
+                            strapline: "來自你的 Spotify 聆聽紀錄",
+                            items: favourites))
+        }
+
+        // 2. Radio seeded from the single strongest track.
+        if let anchor = taste.weightedTracks.first?.track,
+           let resolved = try? await youtubeService.searchSongs(query: anchor.searchQuery),
+           let first = resolved.first,
+           let radio = try? await youtubeService.fetchRadioQueue(videoId: first.videoId,
+                                                                 limit: 12) {
+            let items = radio.map { song in
+                HomeItem(kind: .song, primaryId: song.videoId, title: song.title,
+                         subtitle: song.artist, thumbnailURL: song.thumbnailURL)
+            }
+            if !items.isEmpty {
+                sections.append(
+                    HomeSection(title: "因為你常聽 \(anchor.artistName)",
+                                strapline: nil, items: items))
+            }
+        }
+
+        // 3. Deezer similarity around the strongest artist.
+        if let topArtist = taste.weightedArtists.first?.artist.name {
+            var queries = await MusicSimilarityService.deezerArtistRadio(for: topArtist,
+                                                                        limit: 10)
+            if queries.isEmpty {
+                queries = await MusicSimilarityService.deezerSimilarArtists(to: topArtist,
+                                                                           limit: 8)
+            }
+            let items = await resolve(queries: queries)
+            if !items.isEmpty {
+                sections.append(
+                    HomeSection(title: "相似藝人", strapline: "與 \(topArtist) 相近",
+                                items: items))
+            }
+        }
+
+        return sections
+    }
+
+    /// Resolve free-text queries to YouTube Music songs, concurrently,
+    /// preserving the input ordering.
+    private func resolve(queries: [String]) async -> [HomeItem] {
+        guard !queries.isEmpty else { return [] }
+
+        let found = await withTaskGroup(of: (Int, YouTubeSearchSong?).self) { group in
+            for (index, query) in queries.enumerated() {
+                group.addTask { [youtubeService] in
+                    let results = try? await youtubeService.searchSongs(query: query)
+                    return (index, results?.first)
+                }
+            }
+            var buffer: [(Int, YouTubeSearchSong?)] = []
+            for await entry in group { buffer.append(entry) }
+            return buffer
+        }
+
+        var seen = Set<String>()
+        return found
+            .sorted { $0.0 < $1.0 }
+            .compactMap(\.1)
+            .filter { seen.insert($0.videoId).inserted }
+            .map { song in
+                HomeItem(kind: .song, primaryId: song.videoId, title: song.title,
+                         subtitle: song.artist, thumbnailURL: song.thumbnailURL)
+            }
+    }
+}
