@@ -103,8 +103,7 @@ final class AudioPlayerViewModel: ObservableObject {
         lines.append("")
         lines.append("=== log (\(recentDebugLogs.count) lines) ===")
         lines.append(contentsOf: recentDebugLogs)
-        return lines.joined(separator: "
-")
+        return lines.joined(separator: "\n")
     }
 
     func appendDebugLog(_ msg: String) {

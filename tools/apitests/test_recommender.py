@@ -109,7 +109,9 @@ def ytm_search_track(query, visitor):
     for r in it.walk(body, "musicResponsiveListItemRenderer"):
         for pid in it.walk(r, "playlistItemData"):
             if pid.get("videoId"):
-                texts = it.walk(r, "text")
+                # walk() also yields the dicts that *contain* a "text" key, so
+                # filter to actual strings before using them as a title/artist.
+                texts = [t for t in it.walk(r, "text") if isinstance(t, str)]
                 return {"videoId": pid["videoId"],
                         "title": texts[0] if texts else query,
                         "artist": texts[2] if len(texts) > 2 else "Unknown"}
