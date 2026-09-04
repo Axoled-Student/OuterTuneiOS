@@ -110,3 +110,7 @@ lint/tmp/
 # iOS generated project files
 /iosApp/*.xcodeproj
 /iosApp/*.xcworkspace
+
+# API test credentials / tokens (never commit)
+tools/apitests/.env
+tools/apitests/.spotify_tokens.json
