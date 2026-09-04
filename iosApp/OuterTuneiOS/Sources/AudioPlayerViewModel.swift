@@ -19,6 +19,11 @@ final class AudioPlayerViewModel: ObservableObject {
 
     @Published var queue: [AppTrack] = []
     @Published var currentQueueIndex: Int? = nil
+    @Published var repeatMode: RepeatMode = .off
+    @Published var isShuffleEnabled: Bool = false
+    /// When the queue runs dry, keep playing by appending recommendations.
+    @Published var isAutoQueueEnabled: Bool = true
+    @Published private(set) var isExtendingQueue: Bool = false
 
     @Published var isPlaying: Bool = false
     @Published var statusMessage: String = "就緒"
@@ -80,6 +85,7 @@ final class AudioPlayerViewModel: ObservableObject {
     private let youtubeService = YouTubeMusicService.shared
     private let lyricsService = LyricsService.shared
     private let accountStore = AccountStore.shared
+    private let autoQueueService = AutoQueueService.shared
 
     private let queueStorageKey = "ios.queue.v1"
     private let queueIndexStorageKey = "ios.queue.index.v1"
@@ -88,6 +94,9 @@ final class AudioPlayerViewModel: ObservableObject {
     private let historyStorageKey = "ios.history.v1"
     private let searchHistoryStorageKey = "ios.searchHistory.v1"
     private let audioQualityStorageKey = "ios.audioQualityPreference.v1"
+    private let repeatModeStorageKey = "ios.repeatMode.v1"
+    private let shuffleStorageKey = "ios.shuffle.v1"
+    private let autoQueueStorageKey = "ios.autoQueue.v1"
 
     private var searchHistory: [String] = []
 
@@ -107,6 +116,7 @@ final class AudioPlayerViewModel: ObservableObject {
         restoreFavoritesState()
         restoreHistoryState()
         restoreAudioQualityPreferenceState()
+        restorePlaybackModeState()
         restoreSearchHistoryState()
         autocompleteSuggestions = Array(searchHistory.prefix(6))
         wireYouTubeAuthProvider()
@@ -399,17 +409,167 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     func playNext() {
-        guard let currentQueueIndex, currentQueueIndex + 1 < queue.count else {
+        guard let currentQueueIndex else { return }
+
+        let nextIndex = currentQueueIndex + 1
+        if nextIndex < queue.count {
+            playQueueItem(at: nextIndex)
             return
         }
-        playQueueItem(at: currentQueueIndex + 1)
+
+        if repeatMode == .all, !queue.isEmpty {
+            playQueueItem(at: 0)
+            return
+        }
+
+        if isAutoQueueEnabled {
+            Task { await self.extendQueueWithRecommendations(startPlaying: true) }
+        }
     }
 
     func playPrevious() {
-        guard let currentQueueIndex, currentQueueIndex - 1 >= 0 else {
+        // Match the platform convention: past the first few seconds, "previous"
+        // restarts the current track instead of leaving it.
+        if currentTime > 3, currentQueueIndex != nil {
+            seek(to: 0)
             return
         }
-        playQueueItem(at: currentQueueIndex - 1)
+
+        guard let currentQueueIndex else { return }
+
+        if currentQueueIndex - 1 >= 0 {
+            playQueueItem(at: currentQueueIndex - 1)
+            return
+        }
+
+        if repeatMode == .all, !queue.isEmpty {
+            playQueueItem(at: queue.count - 1)
+            return
+        }
+
+        seek(to: 0)
+    }
+
+    func toggleRepeatMode() {
+        repeatMode = repeatMode.next
+        persistPlaybackModeState()
+        statusMessage = "循環模式：\(repeatMode.rawValue)"
+    }
+
+    func toggleShuffle() {
+        isShuffleEnabled.toggle()
+        persistPlaybackModeState()
+
+        guard isShuffleEnabled else {
+            statusMessage = "隨機播放：關閉"
+            return
+        }
+
+        // Shuffle only what has not been played yet, so the current track keeps
+        // its position and history stays meaningful.
+        guard let index = currentQueueIndex, index + 1 < queue.count else {
+            statusMessage = "隨機播放：開啟"
+            return
+        }
+
+        let head = Array(queue[...index])
+        let tail = Array(queue[(index + 1)...]).shuffled()
+        queue = head + tail
+        persistQueueState()
+        statusMessage = "隨機播放：開啟"
+    }
+
+    /// Called when the current item reaches its end and the queue should move on.
+    private func advanceAfterPlaybackEnded() {
+        guard let index = currentQueueIndex else {
+            isPlaying = false
+            updateNowPlayingPlaybackState()
+            return
+        }
+
+        let nextIndex = index + 1
+        if nextIndex < queue.count {
+            playQueueItem(at: nextIndex)
+            return
+        }
+
+        if repeatMode == .all, !queue.isEmpty {
+            playQueueItem(at: 0)
+            return
+        }
+
+        if isAutoQueueEnabled {
+            Task { await self.extendQueueWithRecommendations(startPlaying: true) }
+            return
+        }
+
+        isPlaying = false
+        player?.seek(to: .zero)
+        statusMessage = "播放完成"
+        updateNowPlayingPlaybackState()
+    }
+
+    /// Append recommendations based on what is playing and optionally continue
+    /// straight into them. Holds a background assertion because this runs at the
+    /// exact moment audio has stopped.
+    func extendQueueWithRecommendations(startPlaying: Bool) async {
+        guard !isExtendingQueue else { return }
+        guard let seed = nowPlayingTrack ?? queue.last else {
+            isPlaying = false
+            updateNowPlayingPlaybackState()
+            return
+        }
+
+        isExtendingQueue = true
+        defer { isExtendingQueue = false }
+
+        let previousCount = queue.count
+        await withBackgroundActivity("auto-queue") {
+            statusMessage = "尋找相似歌曲..."
+            let existing = Set(queue.map(\.stableId))
+            let suggestions = await autoQueueService.recommendations(
+                seed: seed,
+                excluding: existing,
+                limit: 20
+            )
+
+            guard !suggestions.isEmpty else {
+                appendDebugLog("自動佇列：找不到推薦（seed=\(seed.title)）")
+                return
+            }
+
+            queue.append(contentsOf: suggestions)
+            persistQueueState()
+            statusMessage = "已加入 \(suggestions.count) 首推薦歌曲"
+        }
+
+        guard queue.count > previousCount else {
+            isPlaying = false
+            statusMessage = "播放完成"
+            updateNowPlayingPlaybackState()
+            return
+        }
+
+        if startPlaying {
+            playQueueItem(at: previousCount)
+        }
+    }
+
+    private func persistPlaybackModeState() {
+        UserDefaults.standard.set(repeatMode.rawValue, forKey: repeatModeStorageKey)
+        UserDefaults.standard.set(isShuffleEnabled, forKey: shuffleStorageKey)
+        UserDefaults.standard.set(isAutoQueueEnabled, forKey: autoQueueStorageKey)
+    }
+
+    private func restorePlaybackModeState() {
+        if let raw = UserDefaults.standard.string(forKey: repeatModeStorageKey),
+           let restored = RepeatMode(rawValue: raw) {
+            repeatMode = restored
+        }
+        isShuffleEnabled = UserDefaults.standard.bool(forKey: shuffleStorageKey)
+        if UserDefaults.standard.object(forKey: autoQueueStorageKey) != nil {
+            isAutoQueueEnabled = UserDefaults.standard.bool(forKey: autoQueueStorageKey)
+        }
     }
 
     func setAudioQualityPreference(_ preference: AudioQualityPreference) {
@@ -574,6 +734,14 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func playTrack(at index: Int) async {
         guard index >= 0, index < queue.count else { return }
+        // Resolving streams and downloading them happens while nothing is
+        // rendering, and the `audio` background mode only protects us while
+        // audio is actually playing. Without this assertion iOS suspends the
+        // process mid-transition and playback never resumes - the single
+        // biggest cause of "it stops when I leave the app".
+        BackgroundActivityGuard.shared.begin("play-track")
+        defer { BackgroundActivityGuard.shared.end() }
+
         let track = queue[index]
         currentQueueIndex = index
         persistQueueState()
@@ -689,6 +857,9 @@ final class AudioPlayerViewModel: ObservableObject {
         let streamToDownload = selectedStream
         Task { [weak self] in
             guard let self else { return }
+            // This outlives playTrack's own assertion, so it takes its own.
+            BackgroundActivityGuard.shared.begin("stream-download")
+            defer { BackgroundActivityGuard.shared.end() }
             do {
                 let localURL = try await self.downloadAndRemux(stream: streamToDownload)
                 await MainActor.run {
@@ -715,12 +886,19 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func playItemDirectly(url: URL, track: AppTrack) {
         let item = AVPlayerItem(url: url)
+        // Everything reaching this point is either a local file or an HLS
+        // manifest. For a file already on disk there is nothing to buffer, so
+        // waiting to minimise stalling only delays the first sample.
+        if url.isFileURL {
+            item.preferredForwardBufferDuration = 0
+        }
         if player == nil {
             player = AVPlayer(playerItem: item)
             installPeriodicTimeObserver()
         } else {
             player?.replaceCurrentItem(with: item)
         }
+        player?.automaticallyWaitsToMinimizeStalling = !url.isFileURL
 
         currentTime = 0
         sliderPosition = 0
@@ -951,17 +1129,32 @@ final class AudioPlayerViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
 
-                self.isPlaying = false
                 self.currentTime = 0
                 self.sliderPosition = 0
-                self.player?.seek(to: .zero)
-                self.updateNowPlayingPlaybackState()
 
-                if self.shouldAutoPlayNext {
-                    self.playNext()
-                } else {
-                    self.statusMessage = "播放完成"
+                // Repeat-one restarts the same item without touching the queue.
+                if self.repeatMode == .one {
+                    self.player?.seek(to: .zero)
+                    self.player?.play()
+                    self.isPlaying = true
+                    self.updateNowPlayingPlaybackState()
+                    return
                 }
+
+                guard self.shouldAutoPlayNext else {
+                    self.isPlaying = false
+                    self.player?.seek(to: .zero)
+                    self.statusMessage = "播放完成"
+                    self.updateNowPlayingPlaybackState()
+                    return
+                }
+
+                // Deliberately leave `isPlaying` true across the handover.
+                // Flipping it to false here published a paused state to the lock
+                // screen and Control Center on every track change, and told the
+                // system the session had gone idle at the exact moment we still
+                // needed it alive to load the next track.
+                self.advanceAfterPlaybackEnded()
             }
         }
     }
@@ -1081,6 +1274,54 @@ final class AudioPlayerViewModel: ObservableObject {
             return .success
         }
 
+        // Headphone and steering-wheel controls send togglePlayPause rather than
+        // discrete play/pause, so without this a single-press control does
+        // nothing at all.
+        commandCenter.togglePlayPauseCommand.isEnabled = true
+        commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.togglePlayback() }
+            return .success
+        }
+
+        commandCenter.stopCommand.isEnabled = true
+        commandCenter.stopCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.pause() }
+            return .success
+        }
+
+        commandCenter.skipForwardCommand.isEnabled = true
+        commandCenter.skipForwardCommand.preferredIntervals = [15]
+        commandCenter.skipForwardCommand.addTarget { [weak self] event in
+            guard let skip = event as? MPSkipIntervalCommandEvent else {
+                return .commandFailed
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                self.seek(to: min(self.currentTime + skip.interval,
+                                  self.duration > 0 ? self.duration : self.currentTime + skip.interval))
+            }
+            return .success
+        }
+
+        commandCenter.skipBackwardCommand.isEnabled = true
+        commandCenter.skipBackwardCommand.preferredIntervals = [15]
+        commandCenter.skipBackwardCommand.addTarget { [weak self] event in
+            guard let skip = event as? MPSkipIntervalCommandEvent else {
+                return .commandFailed
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                self.seek(to: max(self.currentTime - skip.interval, 0))
+            }
+            return .success
+        }
+
+        // Seeking by scrubbing on some accessories uses the rating/like slot;
+        // leave those disabled so they do not appear as dead controls.
+        commandCenter.ratingCommand.isEnabled = false
+        commandCenter.likeCommand.isEnabled = false
+        commandCenter.dislikeCommand.isEnabled = false
+
         hasConfiguredRemoteCommands = true
 #endif
     }
@@ -1175,6 +1416,10 @@ final class AudioPlayerViewModel: ObservableObject {
 
                 switch type {
                 case .began:
+                    // AVPlayer is usually stopped for us, but not always (and not
+                    // at all for a route we own). Pausing explicitly keeps our
+                    // published state and the actual player in agreement.
+                    self.player?.pause()
                     self.isPlaying = false
                     self.statusMessage = "音訊被中斷"
                 case .ended:
@@ -1280,12 +1525,23 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     private func prioritizePlaybackCandidates(_ candidates: [AudioStreamOption]) -> [AudioStreamOption] {
-        // HLS manifests play instantly (no download+remux needed), always put them first
-        let hls = candidates.filter { $0.isHLSManifest }
-        let adaptive = candidates.filter { !$0.isHLSManifest }
+        // Premium formats (itag 141 / 774) are the reason to sign in with a
+        // Music Premium account at all, so they outrank the instant-start HLS
+        // manifest whenever the user has not explicitly asked for a lower tier.
+        // They cost one download+remux before playback starts; that trade is
+        // worth roughly double the bitrate (279kbps vs 143kbps, measured).
+        let premium = candidates.filter { $0.isPremiumFormat }
+        let hls = candidates.filter { !$0.isPremiumFormat && $0.isHLSManifest }
+        let adaptive = candidates.filter { !$0.isPremiumFormat && !$0.isHLSManifest }
+
+        if audioQualityPreference == .high || audioQualityPreference == .auto {
+            if !premium.isEmpty {
+                return premium + hls + adaptive
+            }
+        }
 
         guard audioQualityPreference != .auto else {
-            return hls + adaptive
+            return hls + adaptive + premium
         }
 
         let knownBitrate = adaptive.enumerated().filter { (_, stream) in
@@ -1632,10 +1888,17 @@ enum AudioSessionConfigurator {
 #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
+            // `.allowBluetooth` opts the session into HFP, a mono voice profile.
+            // Requesting it on a playback-only session can drag a Bluetooth route
+            // down to call quality, so a music player wants A2DP + AirPlay only.
+            // `.longFormAudio` tells the system this is music rather than a UI
+            // sound, which is also what lets AirPlay 2 and CarPlay treat it as a
+            // long-running now-playing session.
             try session.setCategory(
                 .playback,
                 mode: .default,
-                options: [.allowAirPlay, .allowBluetooth, .allowBluetoothA2DP]
+                policy: .longFormAudio,
+                options: [.allowAirPlay, .allowBluetoothA2DP]
             )
             try session.setActive(true)
             return true

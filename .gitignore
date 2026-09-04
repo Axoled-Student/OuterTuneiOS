@@ -114,3 +114,7 @@ lint/tmp/
 # API test credentials / tokens (never commit)
 tools/apitests/.env
 tools/apitests/.spotify_tokens.json
+tools/apitests/ytmusic.json
+tools/apitests/*.cookies.json
+ai.env
+*.key

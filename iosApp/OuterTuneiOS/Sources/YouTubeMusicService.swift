@@ -17,6 +17,16 @@ struct AudioStreamOption: Identifiable, Equatable {
     let itag: Int?
     let isHLSManifest: Bool
 
+    /// itag 141 is 256kbps AAC and itag 774 is high-rate Opus. YouTube only
+    /// offers either to a session carrying a Music Premium account, so their
+    /// presence is a reliable signal that premium audio was unlocked.
+    static let premiumITags: Set<Int> = [141, 774]
+
+    var isPremiumFormat: Bool {
+        guard let itag else { return false }
+        return Self.premiumITags.contains(itag)
+    }
+
     var effectiveBitrate: Int? {
         averageBitrate ?? bitrate
     }
@@ -271,9 +281,24 @@ final class YouTubeMusicService {
         var orderedStreams: [AudioStreamOption] = []
 
         let isLoggedIn = authProvider?()?.cookie.isEmpty == false
-        print("[YTService] resolveAudioStreams: videoId=\(videoId), isLoggedIn=\(isLoggedIn), profiles=\(playerClientProfiles.map(\.clientName))")
 
-        for profile in playerClientProfiles {
+        // Order matters. Premium formats (itag 141 / 774) are only ever offered
+        // to WEB_REMIX when it carries the account cookie, so a signed-in user
+        // must ask that client first. Asking IOS first - as this did - meant a
+        // Premium subscriber was still served the free 128kbps ladder, because
+        // IOS answered successfully and nothing ever consulted WEB_REMIX.
+        // Anonymous sessions keep the old order, where IOS is the most reliable.
+        let orderedProfiles: [PlayerClientProfile]
+        if isLoggedIn {
+            orderedProfiles = playerClientProfiles.filter { $0.useLogin }
+                + playerClientProfiles.filter { !$0.useLogin }
+        } else {
+            orderedProfiles = playerClientProfiles
+        }
+
+        print("[YTService] resolveAudioStreams: videoId=\(videoId), isLoggedIn=\(isLoggedIn), profiles=\(orderedProfiles.map(\.clientName))")
+
+        for profile in orderedProfiles {
             // WEB_REMIX 需要登入 + PoToken 才能取得串流，未登入時跳過
             if profile.useLogin && !isLoggedIn {
                 print("[YTService] skipping \(profile.clientName) (needs login)")
@@ -902,6 +927,14 @@ final class YouTubeMusicService {
         }
 
         var score = 0
+
+        // Premium formats outrank every codec preference below: a 256kbps AAC
+        // stream is the whole point of signing in with Premium.
+        if let itag = format["itag"] as? Int,
+           AudioStreamOption.premiumITags.contains(itag) {
+            score += 10_000
+        }
+
         if mimeType.contains("audio/mp4") || mimeType.contains("mp4a") {
             score += 1_000
         } else if mimeType.contains("audio/aac") {
@@ -1240,5 +1273,79 @@ extension YouTubeMusicService {
             return simple
         }
         return nil
+    }
+}
+
+// MARK: - Radio / auto-queue
+
+extension YouTubeMusicService {
+    /// YouTube Music's own radio continuation for a track.
+    ///
+    /// `RDAMVM<videoId>` is the "start radio from this song" playlist the web
+    /// player uses. It works without login and returns roughly 50 ordered
+    /// tracks, which makes it the reliable backbone of the auto-queue: every
+    /// entry already has a playable videoId, so nothing downstream has to
+    /// guess or resolve a title back into an id.
+    func fetchRadioQueue(videoId: String, limit: Int = 40) async throws -> [YouTubeSearchSong] {
+        let payload: [String: Any] = [
+            "videoId": videoId,
+            "playlistId": "RDAMVM" + videoId,
+            "isAudioOnly": true,
+            "params": "wAEB",
+        ]
+
+        let data = try await requestJSON(
+            endpoint: "https://music.youtube.com/youtubei/v1/next",
+            payload: payload,
+            clientName: webRemixClientId,
+            clientVersion: webRemixClientVersion,
+            userAgent: webRemixUserAgent,
+            useLogin: true,
+            loginSupported: true
+        )
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        let renderers = collectDictionaries(forKey: "playlistPanelVideoRenderer", in: object)
+        var seen = Set<String>()
+        var songs: [YouTubeSearchSong] = []
+
+        for renderer in renderers {
+            guard let id = renderer["videoId"] as? String, !id.isEmpty else { continue }
+            guard id != videoId, seen.insert(id).inserted else { continue }
+
+            let title = extractTitle(from: renderer) ?? firstText(in: renderer["title"])
+            guard let title, !title.isEmpty else { continue }
+
+            let byline = firstText(in: renderer["longBylineText"])
+                ?? firstText(in: renderer["shortBylineText"])
+
+            songs.append(
+                YouTubeSearchSong(
+                    videoId: id,
+                    title: title,
+                    artist: byline ?? "Unknown",
+                    thumbnailURL: extractThumbnailURL(from: renderer),
+                    durationText: firstText(in: renderer["lengthText"])
+                )
+            )
+
+            if songs.count >= limit { break }
+        }
+
+        return songs
+    }
+
+    /// First `text` run inside a `{ runs: [...] }` / `{ simpleText: }` node.
+    private func firstText(in node: Any?) -> String? {
+        guard let dict = node as? [String: Any] else { return nil }
+        if let simple = dict["simpleText"] as? String, !simple.isEmpty {
+            return simple
+        }
+        guard let runs = dict["runs"] as? [[String: Any]] else { return nil }
+        let joined = runs.compactMap { $0["text"] as? String }.joined()
+        return joined.isEmpty ? nil : joined
     }
 }
