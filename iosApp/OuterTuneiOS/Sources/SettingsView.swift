@@ -17,6 +17,7 @@ struct SettingsView: View {
                 accountSection
                 audioSection
                 playbackSection
+                recommendationSection
                 aboutSection
             }
             .navigationTitle("設定")
@@ -119,6 +120,30 @@ struct SettingsView: View {
             Toggle("自動播放下一首", isOn: $autoPlayNext)
             Toggle("允許行動網路播放", isOn: $allowCellular)
             Toggle("顯示 Explicit 標記", isOn: $showExplicit)
+
+            Picker("循環模式", selection: Binding(
+                get: { player.repeatMode },
+                set: { mode in
+                    while player.repeatMode != mode { player.toggleRepeatMode() }
+                }
+            )) {
+                Text("關閉").tag(RepeatMode.off)
+                Text("全部循環").tag(RepeatMode.all)
+                Text("單曲循環").tag(RepeatMode.one)
+            }
+
+            Toggle("隨機播放", isOn: Binding(
+                get: { player.isShuffleEnabled },
+                set: { _ in player.toggleShuffle() }
+            ))
+        }
+    }
+
+    private var recommendationSection: some View {
+        Section("推薦") {
+            NavigationLink("推薦與自動佇列") {
+                RecommendationSettingsView()
+            }
         }
     }
 

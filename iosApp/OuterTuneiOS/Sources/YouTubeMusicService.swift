@@ -1316,8 +1316,11 @@ extension YouTubeMusicService {
             guard let id = renderer["videoId"] as? String, !id.isEmpty else { continue }
             guard id != videoId, seen.insert(id).inserted else { continue }
 
-            let title = extractTitle(from: renderer) ?? firstText(in: renderer["title"])
-            guard let title, !title.isEmpty else { continue }
+            var title = extractTitle(from: renderer)
+            if title.isEmpty {
+                title = firstText(in: renderer["title"]) ?? ""
+            }
+            guard !title.isEmpty else { continue }
 
             let byline = firstText(in: renderer["longBylineText"])
                 ?? firstText(in: renderer["shortBylineText"])
