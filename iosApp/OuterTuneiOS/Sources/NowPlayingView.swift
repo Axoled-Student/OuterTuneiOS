@@ -10,6 +10,11 @@ struct NowPlayingView: View {
     /// the chevron collapses the panel instead of dismissing a sheet.
     var onClose: (() -> Void)?
 
+    /// Set alongside `onClose` to offer a full-screen control: a docked panel
+    /// is a narrow column, and the artwork and lyrics deserve the whole width
+    /// when the listener wants them.
+    var onExpand: (() -> Void)?
+
     @State private var isImportPickerPresented: Bool = false
     @State private var showAdvancedSource: Bool = false
     @State private var isAudioInfoPresented: Bool = false
@@ -116,6 +121,14 @@ struct NowPlayingView: View {
                 .foregroundColor(AppTheme.textPrimary)
                 .textCase(.uppercase)
             Spacer()
+            if let onExpand {
+                Button(action: onExpand) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(AppTheme.textPrimary)
+                }
+                .padding(.trailing, 16)
+            }
             Button { isAudioInfoPresented = true } label: {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 17, weight: .semibold))

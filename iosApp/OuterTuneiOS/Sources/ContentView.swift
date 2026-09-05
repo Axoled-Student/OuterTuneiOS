@@ -50,9 +50,12 @@ struct ContentView: View {
                     mainColumn
                     if isSidePanelVisible, player.nowPlayingTrack != nil {
                         Divider().background(Color.white.opacity(0.08))
-                        NowPlayingView(onClose: { isSidePanelVisible = false })
-                            .environmentObject(player)
-                            .frame(width: 380)
+                        NowPlayingView(
+                            onClose: { isSidePanelVisible = false },
+                            onExpand: { isNowPlayingPresented = true }
+                        )
+                        .environmentObject(player)
+                        .frame(width: 380)
                             .transition(.move(edge: .trailing))
                     }
                 }
@@ -73,6 +76,15 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $isNowPlayingPresented) {
             NowPlayingView()
                 .environmentObject(player)
+        }
+        // Reopening the panel while full screen is up would stack the player on
+        // itself, so the two presentations stay mutually exclusive.
+        .onChange(of: isNowPlayingPresented) { presented in
+            if presented, usesSidePanel {
+                isSidePanelVisible = false
+            } else if !presented, usesSidePanel {
+                isSidePanelVisible = true
+            }
         }
         .sheet(isPresented: $isLoginPresented) {
             LoginContainerView()
