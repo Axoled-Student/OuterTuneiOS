@@ -126,3 +126,5 @@ build/ytm_cookies.txt
 
 # learned playback feedback (local)
 tools/resolver/.feedback.json
+
+tools/resolver/.home_cache.json

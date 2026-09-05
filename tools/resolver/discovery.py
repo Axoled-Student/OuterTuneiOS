@@ -4,6 +4,7 @@ Both live server side for the same reason the queue does: the algorithm can
 change without shipping a new build, and this machine already holds the Spotify
 profile and a signed-in YouTube session.
 """
+import concurrent.futures
 import json
 import os
 import random
@@ -21,7 +22,57 @@ AI_ENV = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "ai.env")
 
-_home_cache = {"payload": None, "at": 0}
+# Search results and radios for a given seed barely move, and the same seeds
+# recur across refreshes, so memoising them removes most of the network work.
+_lookup_cache = {}
+_lookup_lock = threading.Lock()
+LOOKUP_TTL = 60 * 60 * 6
+
+
+def _memo(key, produce):
+    now = time.time()
+    with _lookup_lock:
+        hit = _lookup_cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    value = produce()
+    if value:
+        with _lookup_lock:
+            _lookup_cache[key] = (now + LOOKUP_TTL, value)
+            if len(_lookup_cache) > 800:
+                for stale in [k for k, v in _lookup_cache.items() if v[0] <= now][:200]:
+                    _lookup_cache.pop(stale, None)
+    return value
+
+
+_home_cache = {"payload": None, "at": 0, "building": False}
+# Survives a restart, so a fresh process still answers the first request
+# instantly instead of making it wait for a cold build.
+HOME_STATE = os.path.join(HERE, ".home_cache.json")
+
+
+def _load_home_state():
+    if _home_cache["payload"] is not None or not os.path.exists(HOME_STATE):
+        return
+    try:
+        with open(HOME_STATE, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if saved.get("sections"):
+            _home_cache["payload"] = saved
+            # Treated as stale: served at once, rebuilt behind the request.
+            _home_cache["at"] = 0
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _save_home_state(payload):
+    try:
+        tmp = HOME_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, HOME_STATE)
+    except Exception:  # noqa: BLE001
+        pass
 _home_lock = threading.Lock()
 # Short enough that the page feels alive, long enough that a pull-to-refresh
 # does not hammer YouTube. `refresh=1` bypasses it entirely.
@@ -140,23 +191,29 @@ def _shelf_from_queries(engine, visitor, queries, script, per, per_artist_cap=2)
 
     # Collect each seed's contribution separately, then interleave. Draining one
     # seed at a time let a single weak query fill the whole shelf.
-    buckets = []
-    for query in queries[:8]:
-        found = rec.search_song(query, visitor, engine.cookie)
+    def build(query):
+        found = _memo("s:" + query,
+                      lambda: rec.search_song(query, visitor, engine.cookie))
         if not found:
-            continue
-        bucket = [found]
-        for candidate in rec.radio(found["videoId"], visitor, engine.cookie,
-                                   limit=20):
-            if script and rec.track_script(candidate) != script:
-                continue
-            bucket.append(candidate)
+            return []
+        rows = _memo("r:" + found["videoId"],
+                     lambda: rec.radio(found["videoId"], visitor,
+                                       engine.cookie, limit=20)) or []
+        bucket = [found] + list(rows)
         if script:
             bucket = [r for r in bucket if rec.track_script(r) == script]
-        if bucket:
-            buckets.append(bucket)
-        if len(buckets) >= 6:
-            break
+        return bucket
+
+    # Each seed is two independent round-trips; running them sequentially was
+    # what made a cold home page take the better part of a minute.
+    selected = queries[:6]
+    buckets = []
+    if selected:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(6, len(selected))) as pool:
+            for bucket in pool.map(build, selected):
+                if bucket:
+                    buckets.append(bucket)
 
     rows = []
     depth = 0
@@ -182,22 +239,85 @@ def _shelf_from_queries(engine, visitor, queries, script, per, per_artist_cap=2)
     return [_track_row(r) for r in _dedupe(spread, seen_ids, seen_identities, per)]
 
 
-def home(engine, per=20, force=False, rotate=None):
-    """Language-split browse shelves plus a personalised one."""
+def warm(engine, per=20):
+    """Build the page in the background so the first open is instant."""
+    def run():
+        try:
+            home(engine, per=per, force=True, _internal=True)
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+_auto_thread = None
+
+
+def start_auto_refresh(engine, per=20, interval=None):
+    """Keep the home page rebuilt on a timer.
+
+    A cold build is around eight seconds of parallel network calls. Doing that
+    on demand means somebody waits for it, so the server rebuilds on its own
+    schedule and every request is served from something already finished.
+    """
+    global _auto_thread
+    if _auto_thread and _auto_thread.is_alive():
+        return
+    period = interval or HOME_TTL
+
+    def loop():
+        # Build once immediately, then on the period.
+        while True:
+            try:
+                home(engine, per=per, force=True, _internal=True)
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(period)
+
+    _auto_thread = threading.Thread(target=loop, daemon=True)
+    _auto_thread.start()
+
+
+def home(engine, per=20, force=False, rotate=None, _internal=False):
+    """Language-split browse shelves plus a personalised one.
+
+    Serves whatever is cached immediately and refreshes behind it: rebuilding
+    takes tens of seconds of network round-trips, and making the page wait for
+    that is the difference between instant and unusable.
+    """
     with _home_lock:
+        _load_home_state()
         cached = _home_cache["payload"]
-        if cached and not force and time.time() - _home_cache["at"] < HOME_TTL:
+        fresh = cached and time.time() - _home_cache["at"] < HOME_TTL
+        building = _home_cache.get("building")
+
+        # Anything already built is served immediately - including on an
+        # explicit refresh, which only needs to *start* the rebuild. A cold
+        # build is around eight seconds and no request should sit through one
+        # when a usable page exists; the client collects the new one shortly
+        # after. Only a genuinely empty cache blocks.
+        if cached is not None and not _internal:
+            if (not fresh or force) and not building:
+                _home_cache["building"] = True
+
+                def rebuild():
+                    try:
+                        home(engine, per=per, force=True, rotate=rotate,
+                             _internal=True)
+                    finally:
+                        with _home_lock:
+                            _home_cache["building"] = False
+
+                threading.Thread(target=rebuild, daemon=True).start()
             return cached
 
     engine.taste.refresh()
     visitor = engine.visitor()
-    sections = []
-
     # Advances every cache period, so a refresh genuinely changes the page
     # rather than rebuilding the same shelves from the same seeds.
     if rotate is None:
         rotate = int(time.time() // HOME_TTL)
     shuffler = random.Random(rotate)
+    built = {}
 
     for key, title, script in SECTION_TITLES:
         try:
@@ -244,9 +364,10 @@ def home(engine, per=20, force=False, rotate=None):
             items = []
 
         if items:
-            sections.append({"id": key, "title": title,
-                             "subtitle": subtitle, "items": items})
+            built[key] = {"id": key, "title": title,
+                          "subtitle": subtitle, "items": items}
 
+    sections = [built[key] for key, _, _ in SECTION_TITLES if key in built]
     payload = {"sections": sections,
                "tasteArtists": len(engine.taste.artists),
                "rotation": rotate,
@@ -254,6 +375,8 @@ def home(engine, per=20, force=False, rotate=None):
     with _home_lock:
         _home_cache["payload"] = payload
         _home_cache["at"] = time.time()
+        _home_cache["building"] = False
+    _save_home_state(payload)
     return payload
 
 

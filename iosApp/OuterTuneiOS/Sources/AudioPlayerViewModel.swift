@@ -242,6 +242,21 @@ final class AudioPlayerViewModel: ObservableObject {
             if let remote = await StreamResolverService.shared
                 .fetchHomeSections(refresh: forceRefresh) {
                 homeFeed = HomeFeed(sections: remote)
+
+                if forceRefresh {
+                    // The server answers a refresh from cache immediately and
+                    // rebuilds behind it (about eight seconds), so collect the
+                    // new page once it exists rather than leaving the pull
+                    // looking like it did nothing.
+                    Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 9 * 1_000_000_000)
+                        guard let self else { return }
+                        if let updated = await StreamResolverService.shared
+                            .fetchHomeSections() {
+                            self.homeFeed = HomeFeed(sections: updated)
+                        }
+                    }
+                }
                 print("[Home] refreshHomeFeed: \(remote.count) server sections")
                 return
             }

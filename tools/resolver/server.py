@@ -528,6 +528,16 @@ def main():
                     pairs.append("%s=%s" % (parts[5], parts[6]))
         cookie_header = "; ".join(pairs) if pairs else None
     Handler.queue_engine = recommender.QueueEngine(cookie=cookie_header)
+
+    # Build the home page up front; a cold build is tens of seconds of network
+    # round-trips and nobody should be made to wait for it interactively.
+    try:
+        import discovery
+        discovery.start_auto_refresh(Handler.queue_engine)
+        print("  home shelves rebuild automatically every %d min"
+              % (discovery.HOME_TTL // 60))
+    except Exception as e:  # noqa: BLE001
+        print("  home warmup skipped: %s" % e)
     Handler.token = args.token
 
     server = ThreadedServer((args.host, args.port), Handler)
