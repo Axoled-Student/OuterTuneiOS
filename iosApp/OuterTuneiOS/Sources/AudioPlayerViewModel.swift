@@ -231,7 +231,7 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     @MainActor
-    func refreshHomeFeed() async {
+    func refreshHomeFeed(forceRefresh: Bool = false) async {
         isLoadingHome = true
         homeErrorMessage = nil
         defer { isLoadingHome = false }
@@ -239,7 +239,8 @@ final class AudioPlayerViewModel: ObservableObject {
             // The resolver builds language-split shelves from the Spotify
             // profile, and can be retuned without shipping a new build, so it
             // is preferred when configured.
-            if let remote = await StreamResolverService.shared.fetchHomeSections() {
+            if let remote = await StreamResolverService.shared
+                .fetchHomeSections(refresh: forceRefresh) {
                 homeFeed = HomeFeed(sections: remote)
                 print("[Home] refreshHomeFeed: \(remote.count) server sections")
                 return
@@ -1071,6 +1072,31 @@ final class AudioPlayerViewModel: ObservableObject {
         case .youtube(let videoId):
             var options: [AudioStreamOption] = []
 
+            // A previously played track is already on disk; nothing needs to be
+            // fetched at all.
+            if let local = await AudioCache.shared.existing(
+                for: AudioCache.key(for: track)) {
+                options.append(
+                    AudioStreamOption(
+                        id: "cache:" + track.stableId,
+                        url: local,
+                        sourceClientName: "LOCAL",
+                        sourceClientVersion: "cache",
+                        sourceUserAgent: nil,
+                        mimeType: "audio/mp4",
+                        codec: "m4a",
+                        container: "M4A",
+                        bitrate: nil,
+                        averageBitrate: nil,
+                        audioQuality: "cached",
+                        contentLength: nil,
+                        itag: nil,
+                        isHLSManifest: false
+                    )
+                )
+                appendDebugLog("使用本機快取：\(track.title)")
+            }
+
             // A configured resolver is the only full-track source. Do not hide
             // an auth/network failure by falling through to a googlevideo URL:
             // that path is capped or rejected and creates silent, bad-duration
@@ -1141,8 +1167,15 @@ final class AudioPlayerViewModel: ObservableObject {
         if selectedStream.isHLSManifest
             || !selectedStream.requiresRemux
             || selectedStream.sourceClientName == "LOCAL"
-            || selectedStream.sourceClientName == "DIRECT" {
+            || selectedStream.sourceClientName == "DIRECT"
+            // The resolver serves a fast-start M4A (moov at offset 32,
+            // verified) over Range requests, so AVPlayer can begin on the first
+            // few KB instead of waiting for a whole download and remux.
+            || selectedStream.sourceClientName == "RESOLVER" {
             playItemDirectly(url: selectedStream.url, track: track)
+            if selectedStream.sourceClientName == "RESOLVER" {
+                cacheResolverStreamInBackground(stream: selectedStream, track: track)
+            }
             return
         }
 
@@ -1186,6 +1219,25 @@ final class AudioPlayerViewModel: ObservableObject {
                     }
                 }
             }
+        }
+    }
+
+    /// Copy a streamed track to disk while it plays, so the next play needs no
+    /// network at all. Playback does not wait on this.
+    private func cacheResolverStreamInBackground(stream: AudioStreamOption,
+                                                 track: AppTrack) {
+        let key = AudioCache.key(for: track)
+        Task.detached(priority: .utility) {
+            if await AudioCache.shared.existing(for: key) != nil { return }
+            var request = URLRequest(url: stream.url)
+            request.timeoutInterval = 120
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse,
+                  (200 ... 206).contains(http.statusCode),
+                  data.count > 1024 else {
+                return
+            }
+            await AudioCache.shared.store(data, for: key)
         }
     }
 

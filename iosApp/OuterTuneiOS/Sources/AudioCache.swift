@@ -10,8 +10,9 @@ import Foundation
 actor AudioCache {
     static let shared = AudioCache()
 
-    /// Roughly 200 tracks at 128kbps, or 100 at premium bitrates.
-    private static let budget: UInt64 = 512 << 20
+    /// 10GB. At premium bitrates that is on the order of a thousand tracks,
+    /// so in practice the listener's whole rotation stays local.
+    private static let budget: UInt64 = 10 << 30
 
     private let directory: URL
 
@@ -22,6 +23,12 @@ actor AudioCache {
         directory = caches.appendingPathComponent("audio", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory,
                                                  withIntermediateDirectories: true)
+    }
+
+    /// Stable key for a track's cached audio, independent of the signed URL
+    /// (googlevideo issues a fresh one every request, so a URL key never hits).
+    nonisolated static func key(for track: AppTrack) -> String {
+        "resolver#" + track.stableId
     }
 
     private func fileURL(for key: String) -> URL {

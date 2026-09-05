@@ -52,7 +52,7 @@ struct HomeView: View {
                     .padding(.top, 8)
                 }
                 .refreshable {
-                    await player.refreshHomeFeed()
+                    await player.refreshHomeFeed(forceRefresh: true)
                     if account.isLoggedIn {
                         await player.refreshAccountInfo()
                     }

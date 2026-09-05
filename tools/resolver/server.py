@@ -294,7 +294,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             track_key = recommender.identity({"artist": artist, "title": title})
             artist_key = recommender.primary_artist(artist)
             outcome = engine.learned.record(track_key, artist_key, played,
-                                            duration, explicit)
+                                            duration, explicit,
+                                            title=title, artist=artist)
             return self._send_json(200, {"ok": True, "outcome": outcome})
 
         if route == "/feedback/summary":
@@ -308,7 +309,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 per = 12
             try:
                 import discovery
-                payload = discovery.home(self.__class__.queue_engine, per=per)
+                # `refresh=1` (pull-to-refresh) forces a fresh rotation.
+                force = (params.get("refresh") or ["0"])[0] not in ("0", "", "false")
+                rotate = int(time.time()) if force else None
+                payload = discovery.home(self.__class__.queue_engine, per=per,
+                                         force=force, rotate=rotate)
             except Exception as e:  # noqa: BLE001
                 return self._send_json(502, {"error": str(e)[:300]})
             return self._send_json(200, payload)

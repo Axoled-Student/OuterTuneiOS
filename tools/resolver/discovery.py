@@ -6,6 +6,7 @@ profile and a signed-in YouTube session.
 """
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -22,19 +23,24 @@ AI_ENV = os.path.join(
 
 _home_cache = {"payload": None, "at": 0}
 _home_lock = threading.Lock()
-HOME_TTL = 60 * 20
+# Short enough that the page feels alive, long enough that a pull-to-refresh
+# does not hammer YouTube. `refresh=1` bypasses it entirely.
+HOME_TTL = 60 * 8
 
 # Seed queries per language, used only when the listener's own profile has
 # nothing in that script to build a shelf from.
+# Seeds are named-artist queries on purpose. Mood queries ("acoustic chill",
+# "lofi") resolve to compilation and ambient channels, which is how the English
+# shelf once came back as Nature Sounds and Penguin Piano.
 FALLBACK_SEEDS = {
-    "latin": ["top hits english", "pop hits 2026", "indie pop essentials",
-              "rnb hits", "rock classics", "edm dance hits", "hip hop hits",
-              "acoustic chill english"],
-    "jp": ["j-pop hits", "vocaloid best", "anime opening hits",
-           "city pop classics", "j-rock hits", "ボカロ 人気曲"],
-    "han": ["華語流行", "mandopop hits", "c-pop 熱門", "華語情歌",
-            "中文饒舌", "台語歌 熱門"],
-    "kr": ["k-pop hits", "korean r&b", "k-indie", "kpop ballad"],
+    "latin": ["Taylor Swift", "The Weeknd", "Ed Sheeran", "Billie Eilish",
+              "Bruno Mars", "Coldplay", "Dua Lipa", "Post Malone",
+              "Glass Animals", "Imagine Dragons"],
+    "jp": ["YOASOBI", "Official髭男dism", "Fujii Kaze", "Vaundy",
+           "King Gnu", "Aimer", "DECO*27", "Yorushika"],
+    "han": ["周杰倫", "林俊傑", "五月天", "鄧紫棋", "田馥甄",
+            "李榮浩", "薛之謙", "告五人"],
+    "kr": ["NewJeans", "IU", "BTS", "SEVENTEEN", "aespa", "BIGBANG"],
 }
 
 SECTION_TITLES = [
@@ -69,44 +75,100 @@ def _dedupe(rows, seen_ids, seen_identities, limit):
     return out
 
 
-def _seeds_for_script(engine, script, wanted=3):
-    """Taste tracks in a given writing system, best first."""
+def _history_seeds(engine, script, wanted=3, rotate=0):
+    """Seeds from what was actually played *in this app*.
+
+    First-hand evidence, unlike the Spotify profile, which describes listening
+    that happened somewhere else.
+    """
+    try:
+        rows = engine.learned.liked_tracks(limit=60)
+    except Exception:  # noqa: BLE001
+        return []
+
+    picked, seen = [], set()
+    for row in rows:
+        label = ("%s %s" % (row.get("artist", ""), row.get("title", ""))).strip()
+        if not label:
+            continue
+        if script and rec.script_of(label) != script:
+            continue
+        key = rec.primary_artist(row.get("artist") or row.get("title"))
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(label)
+
+    if not picked:
+        return []
+    start = rotate % len(picked)
+    return (picked[start:] + picked[:start])[:wanted]
+
+
+def _seeds_for_script(engine, script, wanted=3, rotate=0):
+    """Taste tracks in a given writing system.
+
+    `rotate` walks a window through the candidates so successive refreshes seed
+    from different favourites; keeping the top N fixed was why the shelves came
+    back identical every time.
+    """
     taste = engine.taste
     rows = [t for t in taste.tracks
             if rec.script_of("%s %s" % (t["name"], t["artist"])) == script]
     rows.sort(key=lambda t: -t.get("weight", 0))
-    seen, picked = set(), []
+
+    seen, unique = set(), []
     for row in rows:
         key = rec.primary_artist(row["artist"])
         if key in seen:
             continue
         seen.add(key)
-        picked.append("%s %s" % (row["artist"], row["name"]))
-        if len(picked) >= wanted:
-            break
-    return picked
+        unique.append("%s %s" % (row["artist"], row["name"]))
+
+    if not unique:
+        return []
+    # Draw from the strongest couple of dozen, offset by the rotation.
+    pool = unique[:24]
+    start = rotate % len(pool)
+    ordered = pool[start:] + pool[:start]
+    return ordered[:wanted]
 
 
 def _shelf_from_queries(engine, visitor, queries, script, per, per_artist_cap=2):
     """Resolve queries to seeds, then take their radios as shelf material."""
     seen_ids, seen_identities = set(), set()
-    rows = []
-    for query in queries:
+
+    # Collect each seed's contribution separately, then interleave. Draining one
+    # seed at a time let a single weak query fill the whole shelf.
+    buckets = []
+    for query in queries[:8]:
         found = rec.search_song(query, visitor, engine.cookie)
         if not found:
             continue
-        rows.append(found)
+        bucket = [found]
         for candidate in rec.radio(found["videoId"], visitor, engine.cookie,
-                                   limit=25):
+                                   limit=20):
             if script and rec.track_script(candidate) != script:
                 continue
-            rows.append(candidate)
-        # Enough raw material to survive de-duplication and the artist cap.
-        if len(rows) >= per * 6:
+            bucket.append(candidate)
+        if script:
+            bucket = [r for r in bucket if rec.track_script(r) == script]
+        if bucket:
+            buckets.append(bucket)
+        if len(buckets) >= 6:
             break
 
-    if script:
-        rows = [r for r in rows if rec.track_script(r) == script]
+    rows = []
+    depth = 0
+    while buckets and len(rows) < per * 4:
+        progressed = False
+        for bucket in buckets:
+            if depth < len(bucket):
+                rows.append(bucket[depth])
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
 
     # A couple per artist keeps a shelf browsable without turning it into one
     # artist's discography. One was too strict and left shelves half empty.
@@ -120,7 +182,7 @@ def _shelf_from_queries(engine, visitor, queries, script, per, per_artist_cap=2)
     return [_track_row(r) for r in _dedupe(spread, seen_ids, seen_identities, per)]
 
 
-def home(engine, per=20, force=False):
+def home(engine, per=20, force=False, rotate=None):
     """Language-split browse shelves plus a personalised one."""
     with _home_lock:
         cached = _home_cache["payload"]
@@ -131,22 +193,34 @@ def home(engine, per=20, force=False):
     visitor = engine.visitor()
     sections = []
 
+    # Advances every cache period, so a refresh genuinely changes the page
+    # rather than rebuilding the same shelves from the same seeds.
+    if rotate is None:
+        rotate = int(time.time() // HOME_TTL)
+    shuffler = random.Random(rotate)
+
     for key, title, script in SECTION_TITLES:
         try:
             if key == "madeForYou":
-                queries = _seeds_for_script(engine, "latin", 1) \
-                    + _seeds_for_script(engine, "jp", 1) \
-                    + _seeds_for_script(engine, "han", 1)
+                # What this app has actually played comes first; the Spotify
+                # profile fills in when there is not enough local history yet.
+                queries = _history_seeds(engine, None, 3, rotate)
+                queries += (_seeds_for_script(engine, "latin", 1, rotate)
+                            + _seeds_for_script(engine, "jp", 2, rotate)
+                            + _seeds_for_script(engine, "han", 1, rotate))
+                shuffler.shuffle(queries)
                 if not queries:
                     queries = FALLBACK_SEEDS["latin"][:2]
                 items = _shelf_from_queries(engine, visitor, queries, None, per)
-                subtitle = "來自你的 Spotify 聆聽紀錄"
+                subtitle = "來自你的聆聽紀錄"
             elif key == "discover":
-                anchors = [a for a, _ in sorted(engine.taste.artists.items(),
-                                                key=lambda kv: -kv[1])[:3]]
+                top = [a for a, _ in sorted(engine.taste.artists.items(),
+                                            key=lambda kv: -kv[1])[:12]]
+                anchors = top[rotate % max(len(top), 1):][:3] or top[:3]
                 names = []
                 for anchor in anchors:
-                    names += rec.deezer_similar_artists(anchor, limit=3)
+                    names += rec.deezer_similar_artists(anchor, limit=4)
+                shuffler.shuffle(names)
                 items = _shelf_from_queries(engine, visitor, names[:6], None, per)
                 subtitle = "與你常聽的藝人相近"
             else:
@@ -156,8 +230,14 @@ def home(engine, per=20, force=False):
                 # Miku)" from Western pop. Their own taste in that script is
                 # still appended, so the shelf stays personal where it can be.
                 queries = list(FALLBACK_SEEDS.get(script, []))
-                personal = _seeds_for_script(engine, script, 4)
-                queries += personal
+                shuffler.shuffle(queries)
+                personal = _history_seeds(engine, script, 2, rotate)
+                if len(personal) < 2:
+                    personal = personal + _seeds_for_script(engine, script, 2, rotate)
+                # Language seeds must lead. With personal seeds first the
+                # shelf filled from them before the language seeds were ever
+                # reached, which turned "English" into romanised Vocaloid.
+                queries = queries + personal
                 subtitle = "熱門與你的喜好" if personal else "熱門"
                 items = _shelf_from_queries(engine, visitor, queries, script, per)
         except Exception:  # noqa: BLE001
@@ -169,6 +249,7 @@ def home(engine, per=20, force=False):
 
     payload = {"sections": sections,
                "tasteArtists": len(engine.taste.artists),
+               "rotation": rotate,
                "generatedAt": int(time.time())}
     with _home_lock:
         _home_cache["payload"] = payload

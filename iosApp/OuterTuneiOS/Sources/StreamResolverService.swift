@@ -226,10 +226,14 @@ final class StreamResolverService: ObservableObject {
     }
 
     /// Browse shelves built server side, already split by language.
-    func fetchHomeSections(per: Int = 12) async -> [HomeSection]? {
-        guard isConfigured,
-              let endpoint = url(path: "/home",
-                                 query: [URLQueryItem(name: "per", value: String(per))])
+    func fetchHomeSections(per: Int = 20, refresh: Bool = false) async -> [HomeSection]? {
+        var query = [URLQueryItem(name: "per", value: String(per))]
+        if refresh {
+            // Pull-to-refresh should genuinely re-roll the shelves, not replay
+            // the cached page.
+            query.append(URLQueryItem(name: "refresh", value: "1"))
+        }
+        guard isConfigured, let endpoint = url(path: "/home", query: query)
         else { return nil }
 
         do {

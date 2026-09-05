@@ -55,7 +55,7 @@ class FeedbackStore:
     # ------------------------------------------------------------ record
 
     def record(self, track_key, artist_key, played_seconds, duration,
-               explicit=None):
+               explicit=None, title=None, artist=None):
         """Register one playback outcome.
 
         `explicit` is "like"/"dislike" when the user says so directly; otherwise
@@ -83,6 +83,11 @@ class FeedbackStore:
                 row = store.setdefault(key, {"skips": 0, "completes": 0,
                                              "partials": 0, "seen": 0,
                                              "updated": 0})
+                # Keep the human-readable name so home shelves can be seeded
+                # from what was actually played, not just counted.
+                if store is self.tracks and title:
+                    row["title"] = title
+                    row["artist"] = artist or ""
                 row["seen"] += 1
                 row["updated"] = int(time.time())
                 if outcome == "skip":
@@ -135,6 +140,20 @@ class FeedbackStore:
         if not row:
             return False
         return row.get("skips", 0) >= 3 and row.get("completes", 0) == 0
+
+    def liked_tracks(self, limit=40):
+        """Tracks the listener actually finished, most recent first.
+
+        This is first-hand evidence from this app, as opposed to the Spotify
+        profile, which reflects listening that happened somewhere else.
+        """
+        with self._lock:
+            rows = [dict(row, key=key) for key, row in self.tracks.items()
+                    if row.get("title") and row.get("completes", 0) > 0
+                    and row.get("completes", 0) >= row.get("skips", 0)]
+        rows.sort(key=lambda r: -r.get("updated", 0))
+        return [{"title": r["title"], "artist": r.get("artist", ""),
+                 "completes": r.get("completes", 0)} for r in rows[:limit]]
 
     def summary(self):
         with self._lock:
