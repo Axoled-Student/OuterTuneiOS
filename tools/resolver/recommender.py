@@ -26,6 +26,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import feedback as feedback_module
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 APITESTS = os.path.join(os.path.dirname(HERE), "apitests")
 
@@ -72,6 +74,54 @@ def identity(track):
     """Same recording under a different videoId collapses to one key."""
     return "%s::%s" % (primary_artist(track.get("artist")),
                        normalize(track.get("title")))
+
+
+# ---------------------------------------------------------------- language
+
+
+def script_of(text):
+    """Rough writing-system bucket for a title/artist string."""
+    kana = hangul = han = False
+    for ch in text or "":
+        code = ord(ch)
+        if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+            kana = True
+        elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF:
+            hangul = True
+        elif 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
+            han = True
+    if kana:
+        return "jp"
+    if hangul:
+        return "kr"
+    if han:
+        return "han"
+    return "latin"
+
+
+def track_script(track):
+    return script_of("%s %s" % (track.get("title") or "", track.get("artist") or ""))
+
+
+def language_compatible(seed_script, candidate_script):
+    """Whether a candidate is a sensible continuation of a seed.
+
+    An English seed used to inherit the whole taste profile, which for a
+    Vocaloid-heavy listener meant 7 of 10 picks came back in Japanese and the
+    seed's own radio never made it into the queue at all. Latin seeds are now
+    kept strictly latin. Japanese keeps han, because plenty of J-pop titles and
+    artist names are written in kanji alone; Chinese does not keep jp, because
+    kana is unambiguous evidence of Japanese.
+    """
+    if seed_script == "latin":
+        return candidate_script == "latin"
+    if seed_script == "jp":
+        return candidate_script in ("jp", "han", "latin")
+    if seed_script == "kr":
+        return candidate_script in ("kr", "latin")
+    if seed_script == "han":
+        return candidate_script in ("han", "latin")
+    return True
 
 
 # ---------------------------------------------------------------- innertube
@@ -222,6 +272,9 @@ class TasteProfile:
     def __init__(self):
         self.artists = {}
         self.tracks = []
+        # Identities of tracks already in the profile: familiar *songs*, as
+        # opposed to familiar artists.
+        self.known = set()
         self.fetched_at = 0
         self._lock = threading.Lock()
 
@@ -296,6 +349,8 @@ class TasteProfile:
             if artists or tracks:
                 self.artists = artists
                 self.tracks = tracks
+                self.known = {identity({"artist": t["artist"], "title": t["name"]})
+                              for t in tracks}
                 self.fetched_at = time.time()
 
 
@@ -308,7 +363,7 @@ SESSION_ARTIST_CAP = 3
 ARTIST_SPACING = 4
 
 
-def relevance(candidate, taste):
+def relevance(candidate, taste, learned=None):
     source = candidate.get("source")
     rank = candidate.get("rank", 40)
     if source == "radio":
@@ -323,10 +378,23 @@ def relevance(candidate, taste):
     affinity = taste.artists.get(primary_artist(candidate.get("artist")), 0.0)
     # Saturating: one heavily weighted favourite must not outscore everything.
     score += 1.6 * (affinity / (0.6 + affinity))
+
+    # A song already in the profile is one the listener can play on demand.
+    # Surfacing it here is what made the queue feel like a shuffle of their own
+    # library rather than a radio, so it has to earn its slot against new
+    # material by the same artists.
+    if identity(candidate) in taste.known:
+        score -= 0.9
     # Targeted discovery only. Rewarding any unheard artist just promotes radio
     # filler, which measured at a 0.11 taste match.
     if affinity == 0.0 and source == "similar":
         score += 0.55
+
+    # What actually happened when this was played outranks what the profile
+    # predicts: skips push it down, completions pull it up.
+    if learned is not None:
+        score *= learned.multiplier(identity(candidate),
+                                    primary_artist(candidate.get("artist")))
     return score
 
 
@@ -343,8 +411,15 @@ def similarity(a, b):
 
 
 def select(pool, taste, limit, blocked_ids, blocked_identities,
-           session_artists):
-    """Maximal Marginal Relevance with hard artist caps and spacing."""
+           session_artists, seed_script=None, min_seed_share=0.5,
+           learned=None):
+    """Maximal Marginal Relevance with hard artist caps and spacing.
+
+    `min_seed_share` reserves part of the batch for the seed's own radio. Taste
+    candidates carry a large affinity bonus, and without a reservation they took
+    every slot - two different English seeds produced byte-identical queues,
+    neither containing anything from the seed's radio.
+    """
     seen_ids = set(blocked_ids)
     seen_identities = set(blocked_identities)
     chosen, batch_artists = [], {}
@@ -354,10 +429,41 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
                  if c["videoId"] not in seen_ids
                  and identity(c) not in seen_identities]
 
+    if learned is not None:
+        # Skipped three times and never finished: stop offering it.
+        survivors = [c for c in remaining if not learned.is_rejected(identity(c))]
+        if len(survivors) >= max(limit, 6):
+            remaining = survivors
+
+    if seed_script:
+        coherent = [c for c in remaining
+                    if language_compatible(seed_script, track_script(c))]
+        # Only apply the filter when it leaves enough to work with, so an
+        # unusual seed degrades to a mixed queue rather than an empty one.
+        if len(coherent) >= max(limit, 8):
+            remaining = coherent
+
+    radio_pool = sum(1 for c in remaining if c.get("source") == "radio")
+    seed_quota = min(int(limit * min_seed_share + 0.999), radio_pool)
+    radio_taken = 0
+
+    # At most a fifth of a batch may be songs already in the taste profile.
+    familiar_cap = max(1, int(limit * 0.2))
+    familiar_taken = 0
+
     while remaining and len(chosen) < limit:
+        # Once the remaining slots are exactly what the seed quota still needs,
+        # stop considering anything else.
+        slots_left = limit - len(chosen)
+        radio_only = (seed_quota - radio_taken) >= slots_left
+
         best, best_value = None, None
         for candidate in remaining:
             if identity(candidate) in seen_identities:
+                continue
+            if radio_only and candidate.get("source") != "radio":
+                continue
+            if identity(candidate) in taste.known and familiar_taken >= familiar_cap:
                 continue
             artist = primary_artist(candidate.get("artist"))
             if batch_artists.get(artist, 0) >= ARTIST_CAP:
@@ -370,7 +476,8 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
                 if artist in recent:
                     continue
             penalty = max((similarity(candidate, x) for x in chosen), default=0.0)
-            value = LAMBDA * relevance(candidate, taste) - (1 - LAMBDA) * penalty
+            value = (LAMBDA * relevance(candidate, taste, learned)
+                     - (1 - LAMBDA) * penalty)
             if best_value is None or value > best_value:
                 best, best_value = candidate, value
 
@@ -381,6 +488,10 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
             break
 
         chosen.append(best)
+        if identity(best) in taste.known:
+            familiar_taken += 1
+        if best.get("source") == "radio":
+            radio_taken += 1
         artist = primary_artist(best.get("artist"))
         batch_artists[artist] = batch_artists.get(artist, 0) + 1
         session_artists[artist] = session_artists.get(artist, 0) + 1
@@ -402,6 +513,7 @@ class QueueEngine:
     def __init__(self, cookie=None):
         self.cookie = cookie
         self.taste = TasteProfile()
+        self.learned = feedback_module.FeedbackStore()
         self._visitor = None
         self._visitor_at = 0
         self._sessions = {}
@@ -440,8 +552,15 @@ class QueueEngine:
         # confined to one artist's orbit. This is the largest single lever on
         # both artist diversity and taste match.
         seed_artist = primary_artist(seed.get("artist"))
+        seed_script = script_of("%s %s" % (seed.get("title") or "",
+                                           seed.get("artist") or ""))
+        # Seeding taste radios from tracks in a different writing system is what
+        # dragged Japanese material into English queues.
         others = [t for t in taste.tracks[:24]
-                  if primary_artist(t["artist"]) != seed_artist]
+                  if primary_artist(t["artist"]) != seed_artist
+                  and language_compatible(
+                      seed_script,
+                      script_of("%s %s" % (t["name"], t["artist"])))]
         others.sort(key=lambda t: -t.get("weight", 0))
         for track in others[:3]:
             found = search_song("%s %s" % (track["artist"], track["name"]),
@@ -449,6 +568,10 @@ class QueueEngine:
             if found:
                 for index, row in enumerate(radio(found["videoId"], visitor,
                                                   self.cookie, limit=20)):
+                    # The radio for a favourite usually opens with that very
+                    # track; it is the least interesting thing it can offer.
+                    if row["videoId"] == found["videoId"]:
+                        continue
                     row["source"] = "taste"
                     row["rank"] = index
                     pool.append(row)
@@ -457,7 +580,8 @@ class QueueEngine:
         # profile, so "new" still means "near what you already like".
         anchors = [seed.get("artist")]
         anchors += [a for a, _ in sorted(taste.artists.items(),
-                                         key=lambda kv: -kv[1])[:3]]
+                                         key=lambda kv: -kv[1])[:6]
+                    if language_compatible(seed_script, script_of(a))][:3]
         for anchor in anchors:
             for name in deezer_similar_artists(anchor, limit=3):
                 found = search_song(name, visitor, self.cookie)
@@ -490,8 +614,11 @@ class QueueEngine:
         blocked_ids = set(state["ids"]) | {video_id}
         blocked_identities = set(state["identities"]) | {identity(seed)}
 
+        seed_script = script_of("%s %s" % (seed.get("title") or "",
+                                           seed.get("artist") or ""))
         picks = select(pool, self.taste, limit, blocked_ids,
-                       blocked_identities, state["artists"])
+                       blocked_identities, state["artists"],
+                       seed_script=seed_script, learned=self.learned)
 
         with self._lock:
             for pick in picks:

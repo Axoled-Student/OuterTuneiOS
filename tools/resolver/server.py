@@ -278,6 +278,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
 
         video_id = (params.get("v") or params.get("videoId") or [None])[0]
+        if route == "/feedback":
+            engine = self.__class__.queue_engine
+            artist = (params.get("artist") or [""])[0]
+            title = (params.get("title") or [""])[0]
+            if not video_id and not title:
+                return self._send_json(400, {"error": "missing v or title"})
+            try:
+                played = float((params.get("played") or ["0"])[0])
+                duration = float((params.get("duration") or ["0"])[0])
+            except ValueError:
+                played, duration = 0.0, 0.0
+            explicit = (params.get("explicit") or [None])[0]
+            import recommender
+            track_key = recommender.identity({"artist": artist, "title": title})
+            artist_key = recommender.primary_artist(artist)
+            outcome = engine.learned.record(track_key, artist_key, played,
+                                            duration, explicit)
+            return self._send_json(200, {"ok": True, "outcome": outcome})
+
+        if route == "/feedback/summary":
+            return self._send_json(200,
+                                   self.__class__.queue_engine.learned.summary())
+
+        if route == "/home":
+            try:
+                per = max(4, min(int((params.get("per") or ["12"])[0]), 24))
+            except ValueError:
+                per = 12
+            try:
+                import discovery
+                payload = discovery.home(self.__class__.queue_engine, per=per)
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)[:300]})
+            return self._send_json(200, payload)
+
+        if route == "/airadio":
+            prompt = (params.get("prompt") or params.get("q") or [""])[0]
+            if not prompt.strip():
+                return self._send_json(400, {"error": "missing prompt"})
+            try:
+                limit = max(1, min(int((params.get("limit") or ["20"])[0]), 40))
+            except ValueError:
+                limit = 20
+            try:
+                import discovery
+                payload = discovery.ai_radio(self.__class__.queue_engine,
+                                             prompt.strip(), limit=limit)
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)[:300]})
+            return self._send_json(200, payload)
+
         if route == "/queue":
             if not video_id:
                 return self._send_json(400, {"error": "missing v"})
