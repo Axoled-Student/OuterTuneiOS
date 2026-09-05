@@ -117,12 +117,14 @@ final class AutoQueueService {
     private var listeningRecords: [String: LocalListeningRecord] = [:]
     private let listeningRecordsKey = "ios.recommendations.listening.v1"
     private let recentSuggestionsKey = "ios.recommendations.suggested.v1"
+    private let policyVersionKey = "ios.recommendations.policyVersion.v1"
+    private let policyVersion = 2
     private let listeningRecordLimit = 500
     /// A short cooldown prevents annoying loops without forcing the listener
     /// into an endless stream of unknown songs. The longer persisted list is
     /// retained for diagnostics and future scoring, but is not a hard ban.
-    private let suggestedCooldownCount = 30
-    private let playedCooldownCount = 15
+    private let suggestedCooldownCount = 36
+    private let playedCooldownCount = 30
     private var spotifyCandidateFingerprint = ""
     private var cachedSpotifyCandidates: [AppTrack] = []
     private var spotifyArtistAliasFingerprint = ""
@@ -143,9 +145,17 @@ final class AutoQueueService {
            ) {
             listeningRecords = decoded
         }
-        if let data = UserDefaults.standard.data(forKey: recentSuggestionsKey),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            recentlySuggested = Array(decoded.suffix(recentMemoryLimit))
+        if UserDefaults.standard.integer(forKey: policyVersionKey) == policyVersion {
+            if let data = UserDefaults.standard.data(forKey: recentSuggestionsKey),
+               let decoded = try? JSONDecoder().decode([String].self, from: data) {
+                recentlySuggested = Array(decoded.suffix(recentMemoryLimit))
+            }
+        } else {
+            // Old builds stored video IDs and low-quality queue choices here.
+            // Keep the learned listen/skip history, but do not let stale queue
+            // memory block every familiar track after this policy upgrade.
+            UserDefaults.standard.removeObject(forKey: recentSuggestionsKey)
+            UserDefaults.standard.set(policyVersion, forKey: policyVersionKey)
         }
     }
 
@@ -258,8 +268,22 @@ final class AutoQueueService {
         let generated = await generateCandidates(seed: seed, limit: limit)
         var pool = generated.tracks
         guard !Task.isCancelled else { return [] }
-        if preferredQueueLanguage(seed: seed, candidates: pool) == .chinese {
+        let queueLanguage = preferredQueueLanguage(seed: seed, candidates: pool)
+        if queueLanguage == .chinese {
             pool = pool.filter { trackLanguage($0) == .chinese }
+        } else if queueLanguage == .japanese {
+            // Romanised/English titles from Japanese artists are common, so
+            // retain `.other`; explicitly Chinese and Korean rows are not a
+            // sensible continuation for a Japanese seed.
+            pool = pool.filter {
+                let language = trackLanguage($0)
+                return language == .japanese || language == .other
+            }
+        } else if queueLanguage == .korean {
+            pool = pool.filter {
+                let language = trackLanguage($0)
+                return language == .korean || language == .other
+            }
         }
         pool = pool.filter {
             !blocked.contains($0.stableId)
@@ -346,19 +370,24 @@ final class AutoQueueService {
         }
 
         pool = dedupe(pool)
-        if pool.count >= max(limit, 12) {
-            return (pool, true)
+        let hasCoherentRadio = pool.count >= max(limit, 12)
+
+        // Exact Spotify/local-history tracks are candidate material on every
+        // generation, not merely when radio fails. This makes the queue reflect
+        // what the listener demonstrably chose instead of treating history as
+        // a weak score on an otherwise raw radio feed.
+        pool.append(contentsOf: localFavoriteCandidates(limit: 30))
+        pool.append(contentsOf: await spotifyDerivedCandidates(limit: 30))
+
+        // Broader radios and cross-service similarity are emergency fallbacks
+        // for a sparse seed only. A healthy seed radio plus real history is much
+        // safer than injecting unrelated artists from a global similarity API.
+        if !hasCoherentRadio {
+            pool.append(contentsOf: await listeningHistoryDerivedCandidates())
+            pool.append(contentsOf: await similarityDerivedCandidates(seed: seed))
         }
 
-        // Only a sparse/failed radio is enriched with direct favourites. For a
-        // healthy radio, Spotify remains a ranking signal so a Jay Chou seed
-        // cannot jump into unrelated favourites merely because they are known.
-        pool.append(contentsOf: localFavoriteCandidates(limit: 12))
-        pool.append(contentsOf: await spotifyDerivedCandidates(limit: 16))
-        pool.append(contentsOf: await listeningHistoryDerivedCandidates())
-        pool.append(contentsOf: await similarityDerivedCandidates(seed: seed))
-
-        return (dedupe(pool), false)
+        return (dedupe(pool), hasCoherentRadio)
     }
 
     private func localFavoriteCandidates(limit: Int) -> [AppTrack] {
@@ -410,7 +439,9 @@ final class AutoQueueService {
 
     /// Turns the Spotify taste profile into YouTube Music tracks.
     private func spotifyDerivedCandidates(limit: Int) async -> [AppTrack] {
-        guard spotify.isAuthenticated else { return [] }
+        // A cached profile is useful even when the account is temporarily
+        // offline or its refresh token is unavailable.
+        guard !spotify.profile.weightedTracks.isEmpty else { return [] }
 
         let recentIds = Set(spotify.profile.recentlyPlayed.map(\.id))
         let seeds = spotify.profile.weightedTracks
@@ -452,7 +483,7 @@ final class AutoQueueService {
     }
 
     private func refreshSpotifyArtistAliases(limit: Int = 16) async {
-        guard spotify.isAuthenticated else {
+        guard !spotify.profile.weightedArtists.isEmpty else {
             cachedSpotifyArtistAliasWeights = [:]
             spotifyArtistAliasFingerprint = ""
             return
@@ -553,12 +584,56 @@ final class AutoQueueService {
             artistWeights[alias] = max(artistWeights[alias] ?? 0, weight)
         }
 
-        let knownTrackKeys = Set(taste.weightedTracks.map {
+        var knownTrackKeys = Set(taste.weightedTracks.map {
             normalizedTrackKey(title: $0.track.name, artist: $0.track.artistName)
         })
+        var knownExactTrackKeys = Set(taste.weightedTracks.map {
+            normalizedExactTrackKey(title: $0.track.name, artist: $0.track.artistName)
+        })
+        knownTrackKeys.formUnion(
+            listeningRecords.values
+                .filter {
+                    $0.completions > 0
+                        || ($0.listenedSeconds >= 120 && $0.skips == 0)
+                }
+                .map {
+                    normalizedTrackKey(
+                        title: $0.track.title,
+                        artist: $0.track.artist
+                    )
+                }
+        )
+        knownExactTrackKeys.formUnion(
+            listeningRecords.values
+                .filter {
+                    $0.completions > 0
+                        || ($0.listenedSeconds >= 120 && $0.skips == 0)
+                }
+                .map {
+                    normalizedExactTrackKey(
+                        title: $0.track.title,
+                        artist: $0.track.artist
+                    )
+                }
+        )
         let seedArtist = normalizedArtistName(seed.artist)
+        let locallyKnownArtists = Set(
+            listeningRecords.values
+                .filter {
+                    $0.completions > 0
+                        || ($0.listenedSeconds >= 120 && $0.skips == 0)
+                }
+                .map { normalizedArtistName($0.track.artist) }
+                .filter { !$0.isEmpty }
+        )
+        var knownArtistIdentities = Set(
+            artistWeights.keys.flatMap { artistIdentityTokens($0) }
+        )
+        for artist in locallyKnownArtists {
+            knownArtistIdentities.formUnion(artistIdentityTokens(artist))
+        }
         let hasTasteSignals = !taste.isEmpty
-            || listeningRecords.values.contains(where: { $0.preferenceScore > 0.25 })
+            || locallyKnownArtists.count >= 3
 
         let scored: [(track: AppTrack, score: Double, familiar: Bool)] = pool.enumerated()
             .compactMap { index, track in
@@ -569,13 +644,25 @@ final class AutoQueueService {
             let isKnownTrack = knownTrackKeys.contains(
                 normalizedTrackKey(title: track.title, artist: track.artist)
             )
+            let isExactKnownRecording = knownExactTrackKeys.contains(
+                normalizedExactTrackKey(title: track.title, artist: track.artist)
+            )
+            let isKnownArtist = !artistIdentityTokens(track.artist)
+                .isDisjoint(with: knownArtistIdentities)
             let isFamiliar = !hasTasteSignals || isSeedArtist || isKnownTrack
-                || tasteWeight > 0 || localAffinity > 0.15
+                || isKnownArtist
 
             // Do not let low-quality alternate uploads crowd out an available
             // official/familiar recording. A variant the listener actually has
-            // in Spotify remains eligible through isKnownTrack.
-            if isUndesiredVariant(track), !isKnownTrack {
+            // as that exact recording in history remains eligible.
+            if isUndesiredVariant(track), !isExactKnownRecording {
+                return nil
+            }
+
+            // The listener explicitly rejected raw discovery/unknown artists.
+            // Once we have a meaningful Spotify or local-history profile, an
+            // unfamiliar artist is ineligible rather than merely penalised.
+            if hasTasteSignals, !isFamiliar {
                 return nil
             }
 
@@ -589,7 +676,6 @@ final class AutoQueueService {
             score += localAffinity * 1.4
             if isSeedArtist { score += 2.5 }
             if isKnownTrack { score += 3.0 }
-            if hasTasteSignals, !isFamiliar { score -= 2.5 }
             if let local = listeningRecords[track.stableId] {
                 score += max(-3.0, min(local.preferenceScore, 3.0))
             }
@@ -598,7 +684,6 @@ final class AutoQueueService {
 
         let ranked = scored.sorted { $0.score > $1.score }
         var familiar = ranked.filter { $0.familiar }
-        var discovery = ranked.filter { !$0.familiar }
         var result: [AppTrack] = []
         var artistCounts: [String: Int] = [:]
 
@@ -608,13 +693,13 @@ final class AutoQueueService {
                 let previousArtist = result.last.map { normalizedArtistName($0.artist) }
                 let preferred = candidates.firstIndex { candidate in
                     let artist = normalizedArtistName(candidate.track.artist)
-                    let artistLimit = artist == seedArtist ? 5 : 3
+                    let artistLimit = artist == seedArtist ? 8 : 2
                     return (artistCounts[artist] ?? 0) < artistLimit
                         && (previousArtist == nil || artist != previousArtist)
                 }
                 let fallback = candidates.firstIndex { candidate in
                     let artist = normalizedArtistName(candidate.track.artist)
-                    let artistLimit = artist == seedArtist ? 5 : 3
+                    let artistLimit = artist == seedArtist ? 8 : 2
                     return (artistCounts[artist] ?? 0) < artistLimit
                 }
                 guard let nextIndex = preferred ?? fallback else { break }
@@ -626,21 +711,10 @@ final class AutoQueueService {
         }
 
         // Keep batches compact enough to rotate when the same seed is chosen
-        // again. Reserve a few slots for contextual discovery instead of
-        // exhausting every familiar candidate in the first generation.
+        // again. Every row is now from a known artist/track when taste signals
+        // exist; there is deliberately no unknown-artist discovery quota.
         let targetCount = min(limit, 12)
-        let reservedDiscovery = hasTasteSignals ? min(3, targetCount / 4) : 0
-        let familiarTarget = targetCount - reservedDiscovery
-        appendBest(from: &familiar, upTo: familiarTarget)
-        if result.count < targetCount {
-            let discoveryAllowance = hasTasteSignals
-                ? min(max(2, targetCount - result.count), 4)
-                : targetCount
-            appendBest(
-                from: &discovery,
-                upTo: min(targetCount, result.count + discoveryAllowance)
-            )
-        }
+        appendBest(from: &familiar, upTo: targetCount)
 
         return result
     }
@@ -684,7 +758,26 @@ final class AutoQueueService {
     }
 
     private func normalizedArtistName(_ value: String) -> String {
-        let folded = value.folding(
+        // Older queue rows stored the entire YouTube byline as the artist
+        // ("YOASOBI • album • views • year"). Recover the actual leading artist
+        // so that completed history still matches newly parsed clean metadata.
+        let segments = value
+            .replacingOccurrences(of: "·", with: "•")
+            .components(separatedBy: "•")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let metadataLabels: Set<String> = [
+            "song", "songs", "music", "歌曲", "音樂", "音乐"
+        ]
+        let core = segments.first { segment in
+            let lowered = segment.lowercased()
+            return !metadataLabels.contains(lowered)
+                && !lowered.contains("觀看次數")
+                && !lowered.contains("观看次数")
+                && !lowered.hasSuffix("年")
+        } ?? value
+
+        let folded = core.folding(
             options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
             locale: Locale(identifier: "en_US_POSIX")
         )
@@ -736,6 +829,49 @@ final class AutoQueueService {
         normalizedArtistName(artist) + "|" + AppTrack.normalizedRecommendationTitle(title)
     }
 
+    private func normalizedExactTrackKey(title: String, artist: String) -> String {
+        normalizedArtistName(artist) + "|" + normalizedFullText(title)
+    }
+
+    private func normalizedFullText(_ value: String) -> String {
+        let folded = value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        return folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .joined()
+    }
+
+    /// Match native and romanised forms without accepting arbitrary substring
+    /// collisions. For example `JJ林俊傑` and `林俊傑 JJ Lin` share the stable Han
+    /// identity `林俊傑`, while unrelated Latin artist names remain exact-only.
+    private func artistIdentityTokens(_ value: String) -> Set<String> {
+        var tokens = Set<String>()
+        let normalized = normalizedArtistName(value)
+        if normalized.count >= 2 { tokens.insert(normalized) }
+
+        let components = value.components(
+            separatedBy: CharacterSet(charactersIn: "&,、")
+        )
+        for component in components {
+            let token = normalizedArtistName(component)
+            if token.count >= 2 { tokens.insert(token) }
+        }
+
+        var han = ""
+        for scalar in value.unicodeScalars {
+            if (0x3400 ... 0x4DBF).contains(scalar.value)
+                || (0x4E00 ... 0x9FFF).contains(scalar.value) {
+                han.unicodeScalars.append(scalar)
+            }
+        }
+        if han.count >= 2 {
+            tokens.insert(han)
+        }
+        return tokens
+    }
+
     private func tasteArtistWeight(
         for artist: String,
         weights: [String: Double]
@@ -755,7 +891,8 @@ final class AutoQueueService {
         let normalized = normalizedArtistName(track.title)
         let markers = [
             "cover", "coveredby", "karaoke", "instrumental", "acoustic",
-            "spedup", "slowed", "nightcore", "remix", "tvsize", "テレビサイズ",
+            "spedup", "slowed", "nightcore", "remix", "tvsize", "tvサイズ",
+            "テレビサイズ", "shortver", "shortversion", "ノンクレジット",
             "翻唱", "伴奏", "純音樂", "纯音乐", "カバー", "歌ってみた"
         ]
         return markers.contains { normalized.contains($0) }
@@ -822,8 +959,9 @@ extension AutoQueueService {
     /// the *YouTube* account. When the listener's real taste lives in Spotify,
     /// that feed is the wrong signal, so these shelves reintroduce it.
     func personalizedHomeSections() async -> [HomeSection] {
-        guard spotify.isAuthenticated else { return [] }
-        await spotify.refreshTasteProfile()
+        if spotify.isAuthenticated {
+            await spotify.refreshTasteProfile()
+        }
 
         let taste = spotify.profile
         guard !taste.isEmpty else { return [] }

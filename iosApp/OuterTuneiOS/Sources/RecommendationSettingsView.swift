@@ -54,8 +54,8 @@ struct RecommendationSettingsView: View {
         } header: {
             Text("自動佇列")
         } footer: {
-            Text("播放清單結束時，會依照 YouTube Music 電台、Spotify 聆聽紀錄與 "
-                 + "Deezer 相似藝人自動加入歌曲。")
+            Text("播放清單結束時，會用 YouTube Music 電台提供情境，並以 Spotify "
+                 + "與本機聆聽紀錄限制為你熟悉的藝人；只有資料不足時才使用其他來源。")
         }
     }
 
@@ -100,6 +100,16 @@ struct RecommendationSettingsView: View {
                     confirmSpotifyLogout = true
                 }
             } else {
+                if !spotify.profile.isEmpty {
+                    HStack {
+                        Text("聆聽快照")
+                        Spacer()
+                        Text("已載入")
+                            .foregroundColor(.green)
+                    }
+                    tasteSummary
+                }
+
                 TextField("Spotify Client ID", text: $clientIdDraft)
                     .textInputAutocapitalization(.never)
                     .disableAutocorrection(true)

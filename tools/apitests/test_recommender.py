@@ -31,7 +31,8 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 SEARCH_SONGS_PARAMS = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"
 VARIANT_MARKERS = (
     "cover", "coveredby", "karaoke", "instrumental", "acoustic",
-    "spedup", "slowed", "nightcore", "remix", "tvsize", "テレビサイズ",
+    "spedup", "slowed", "nightcore", "remix", "tvsize", "tvサイズ",
+    "テレビサイズ", "shortver", "shortversion", "ノンクレジット",
     "翻唱", "伴奏", "純音樂", "纯音乐", "カバー", "歌ってみた",
 )
 
@@ -201,8 +202,37 @@ def normalized_title(value):
     return normalized(re.sub(r"\s*[\(（\[【].*$", "", value))
 
 
+def normalized_artist(value):
+    parts = [part.strip() for part in value.replace("·", "•").split("•")
+             if part.strip()]
+    metadata = {"song", "songs", "music", "歌曲", "音樂", "音乐"}
+    core = next((part for part in parts
+                 if part.casefold() not in metadata
+                 and "觀看次數" not in part and "观看次数" not in part
+                 and not part.endswith("年")), value)
+    return normalized(core)
+
+
+def artist_tokens(value):
+    tokens = {normalized_artist(value)}
+    tokens.update(normalized_artist(part)
+                  for part in re.split(r"[&,、]", value))
+    han = "".join(ch for ch in value
+                  if 0x3400 <= ord(ch) <= 0x4DBF
+                  or 0x4E00 <= ord(ch) <= 0x9FFF)
+    if len(han) >= 2:
+        tokens.add(han)
+    return {token for token in tokens if len(token) >= 2}
+
+
 def track_key(track):
-    return "%s|%s" % (normalized(track["artist"]), normalized_title(track["title"]))
+    return "%s|%s" % (normalized_artist(track["artist"]),
+                       normalized_title(track["title"]))
+
+
+def exact_track_key(track):
+    return "%s|%s" % (normalized_artist(track["artist"]),
+                       normalized(track["title"]))
 
 
 def is_variant(track):
@@ -224,7 +254,7 @@ def recommendation_language(value):
 
 
 def preferred_language(seed, candidates):
-    seed_language = recommendation_language(seed["title"])
+    seed_language = recommendation_language(seed["title"] + " " + seed["artist"])
     if seed_language == "chinese":
         return "chinese"
     sample = [recommendation_language(row["title"]) for row in candidates[:30]]
@@ -246,14 +276,22 @@ def select_like_app(seed, radio, spotify_references, top_artists,
     } | {
         normalized_title(title) for title in recently_suggested
     }
-    if len(radio) >= max(want, 12):
-        source = radio
-    else:
-        source = radio + spotify_references
+    # The production engine always brings exact Spotify-history recordings
+    # into the pool. Radio is context; real listening history is taste.
+    source = radio + spotify_references
     language = preferred_language(seed, source)
     if language == "chinese":
         source = [row for row in source
-                  if recommendation_language(row["title"]) == "chinese"]
+                  if recommendation_language(row["title"] + " " + row["artist"])
+                  == "chinese"]
+    elif language == "japanese":
+        source = [row for row in source
+                  if recommendation_language(row["title"] + " " + row["artist"])
+                  in ("japanese", "other")]
+    elif language == "korean":
+        source = [row for row in source
+                  if recommendation_language(row["title"] + " " + row["artist"])
+                  in ("korean", "other")]
     for index, track in enumerate(source):
         identity = normalized_title(track["title"])
         if (not identity or identity in blocked_titles or
@@ -265,23 +303,35 @@ def select_like_app(seed, radio, spotify_references, top_artists,
         row["sourceIndex"] = index
         candidates.append(row)
 
-    known_artists = {normalized(name) for name in top_artists}
-    known_artists.update(normalized(artist) for _, artist in top_tracks)
+    known_artists = {normalized_artist(name) for name in top_artists}
+    known_artists.update(normalized_artist(artist) for _, artist in top_tracks)
+    known_artist_tokens = set()
+    for artist in top_artists + [artist for _, artist in top_tracks]:
+        known_artist_tokens.update(artist_tokens(artist))
     known_track_keys = {
-        "%s|%s" % (normalized(artist), normalized_title(title))
+        "%s|%s" % (normalized_artist(artist), normalized_title(title))
+        for title, artist in top_tracks
+    }
+    known_exact_track_keys = {
+        "%s|%s" % (normalized_artist(artist), normalized(title))
         for title, artist in top_tracks
     }
     has_taste = bool(known_artists or known_track_keys)
-    seed_artist = normalized(seed["artist"])
-    artist_rank = {normalized(name): index for index, name in enumerate(top_artists)}
+    seed_artist = normalized_artist(seed["artist"])
+    artist_rank = {normalized_artist(name): index
+                   for index, name in enumerate(top_artists)}
 
     scored = []
     for row in candidates:
-        artist = normalized(row["artist"])
+        artist = normalized_artist(row["artist"])
         exact_known = track_key(row) in known_track_keys
+        exact_known_recording = exact_track_key(row) in known_exact_track_keys
+        known_artist = not artist_tokens(row["artist"]).isdisjoint(known_artist_tokens)
         familiar = (not has_taste or artist == seed_artist
-                    or artist in known_artists or exact_known)
-        if is_variant(row) and not exact_known:
+                    or known_artist or exact_known)
+        if is_variant(row) and not exact_known_recording:
+            continue
+        if has_taste and not familiar:
             continue
         source_score = 4.0 / (1.0 + row["sourceIndex"] * 0.08)
         rank = artist_rank.get(artist)
@@ -293,36 +343,30 @@ def select_like_app(seed, radio, spotify_references, top_artists,
     scored.sort(key=lambda entry: -entry[0])
 
     familiar = [entry for entry in scored if entry[1]]
-    discovery = [entry for entry in scored if not entry[1]]
     result, artist_counts = [], {}
 
     def append_best(rows, maximum):
         while rows and len(result) < maximum:
-            previous = normalized(result[-1]["artist"]) if result else None
+            previous = normalized_artist(result[-1]["artist"]) if result else None
             chosen = next((i for i, entry in enumerate(rows)
-                           if artist_counts.get(normalized(entry[2]["artist"]), 0) <
-                           (5 if normalized(entry[2]["artist"]) == seed_artist else 3)
-                           and normalized(entry[2]["artist"]) != previous), None)
+                           if artist_counts.get(normalized_artist(entry[2]["artist"]), 0) <
+                           (8 if normalized_artist(entry[2]["artist"]) == seed_artist else 2)
+                           and normalized_artist(entry[2]["artist"]) != previous), None)
             if chosen is None:
                 chosen = next((i for i, entry in enumerate(rows)
-                               if artist_counts.get(normalized(entry[2]["artist"]), 0) <
-                               (5 if normalized(entry[2]["artist"]) == seed_artist else 3)),
+                               if artist_counts.get(normalized_artist(entry[2]["artist"]), 0) <
+                               (8 if normalized_artist(entry[2]["artist"]) == seed_artist else 2)),
                               None)
             if chosen is None:
                 break
             _, _, row = rows.pop(chosen)
-            artist = normalized(row["artist"])
+            artist = normalized_artist(row["artist"])
             artist_counts[artist] = artist_counts.get(artist, 0) + 1
             result.append(row)
 
     target = min(want, 12)
-    reserved_discovery = min(3, target // 4) if has_taste else 0
-    append_best(familiar, target - reserved_discovery)
-    if len(result) < target:
-        allowance = (min(max(2, target - len(result)), 4)
-                     if has_taste else target)
-        append_best(discovery, min(target, len(result) + allowance))
-    return result, known_artists, known_track_keys
+    append_best(familiar, target)
+    return result, known_artist_tokens, known_track_keys
 
 
 def rerank_with_llm(cfg, model, profile_summary, now_playing, candidates, want=10):
@@ -517,11 +561,12 @@ def run():
 
         artist_counts = {}
         unfamiliar = []
-        seed_artist = normalized(scenario_seed["artist"])
+        seed_artist = normalized_artist(scenario_seed["artist"])
         for row in queue:
-            artist = normalized(row["artist"])
+            artist = normalized_artist(row["artist"])
             artist_counts[artist] = artist_counts.get(artist, 0) + 1
-            if not (artist == seed_artist or artist in known_artists
+            if not (artist == seed_artist
+                    or not artist_tokens(row["artist"]).isdisjoint(known_artists)
                     or track_key(row) in known_tracks):
                 unfamiliar.append(row)
             test.require(row.get("thumbnail"),
@@ -532,30 +577,32 @@ def run():
                          "unfamiliar alternate upload survived: %s" % row["title"])
 
         for artist, count in artist_counts.items():
-            allowed = 5 if artist == seed_artist else 3
+            allowed = 8 if artist == seed_artist else 2
             test.require(count <= allowed,
                          "one artist occupies too many queue slots")
         if top_artists or top_tracks:
-            familiar_count = len(queue) - len(unfamiliar)
-            discovery_limit = min(max(2, familiar_count), 4)
-            test.require(len(unfamiliar) <= discovery_limit,
-                         "%d/%d tracks are unfamiliar" % (len(unfamiliar), len(queue)))
+            test.require(not unfamiliar,
+                         "%d/%d tracks use unknown artists" %
+                         (len(unfamiliar), len(queue)))
             first = queue[0]
-            test.require(normalized(first["artist"]) in known_artists
-                         or normalized(first["artist"]) == seed_artist
+            test.require(not artist_tokens(first["artist"]).isdisjoint(known_artists)
+                         or normalized_artist(first["artist"]) == seed_artist
                          or track_key(first) in known_tracks,
                          "queue opens with an unfamiliar artist")
 
-        test.note("selected %d tracks; familiar=%d, discovery=%d, max/artist=%d"
+        test.note("selected %d tracks; familiar=%d, unknown artists=%d, max/artist=%d"
                   % (len(queue), len(queue) - len(unfamiliar), len(unfamiliar),
                      max(artist_counts.values())))
         for index, row in enumerate(queue[:10], 1):
-            label = "known" if row not in unfamiliar else "discovery"
-            test.note("  %2d. [%s] %s - %s"
-                      % (index, label, row["artist"], row["title"]))
+            test.note("  %2d. [known] %s - %s"
+                      % (index, row["artist"], row["title"]))
         return queue
 
     first_queue = []
+    with suite.test("phone regression rejects TV-size/short alternate uploads") as t:
+        bad_row = {"artist": "Kitri", "title": "ヒカレイノチ (TVサイズ)"}
+        t.require(is_variant(bad_row), "TV-size row escaped the variant policy")
+
     with suite.test("queue policy fits the real Spotify seed without repeats") as t:
         first_queue = audit_policy(t, seed, radio)
 
@@ -583,7 +630,8 @@ def run():
                       "only %d radio candidates" % len(scenario_radio))
             scenario_queue = audit_policy(t, scenario_seed, scenario_radio)
             if label.startswith("Jay Chou"):
-                t.require(all(recommendation_language(row["title"]) == "chinese"
+                t.require(all(recommendation_language(
+                    row["title"] + " " + row["artist"]) == "chinese"
                               for row in scenario_queue),
                           "Chinese seed produced a non-Chinese queue item")
 

@@ -189,6 +189,7 @@ final class SpotifyService: NSObject, ObservableObject {
 
     private let clientIdKey = "ios.spotify.clientId.v1"
     private let profileKey = "ios.spotify.tasteProfile.v1"
+    private let profileImportFilename = "spotify-taste-profile.json"
     private let accessTokenAccount = "accessToken"
     private let refreshTokenAccount = "refreshToken"
     private let expiryKey = "ios.spotify.tokenExpiry.v1"
@@ -232,10 +233,36 @@ final class SpotifyService: NSObject, ObservableObject {
         displayName = UserDefaults.standard.string(forKey: "ios.spotify.displayName.v1")
         product = UserDefaults.standard.string(forKey: "ios.spotify.product.v1")
 
+        importTasteProfileSnapshotIfPresent()
         if let data = UserDefaults.standard.data(forKey: profileKey),
            let restored = try? JSONDecoder().decode(SpotifyTasteProfile.self, from: data) {
             profile = restored
         }
+    }
+
+    /// Import a credential-free Spotify taste snapshot placed in Documents.
+    /// This is useful for a sideloaded build where OAuth has not been connected
+    /// on-device yet. The snapshot contains artist/track affinity only—never an
+    /// access or refresh token—and is removed immediately after a valid import.
+    private func importTasteProfileSnapshotIfPresent() {
+        guard let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first else {
+            return
+        }
+        let url = documents.appendingPathComponent(profileImportFilename)
+        guard let data = try? Data(contentsOf: url),
+              let imported = try? JSONDecoder().decode(
+                  SpotifyTasteProfile.self,
+                  from: data
+              ),
+              !imported.isEmpty else {
+            return
+        }
+        profile = imported
+        UserDefaults.standard.set(data, forKey: profileKey)
+        try? FileManager.default.removeItem(at: url)
     }
 
     func logout() {

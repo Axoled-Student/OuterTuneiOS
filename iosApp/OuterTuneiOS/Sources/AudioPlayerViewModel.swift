@@ -147,6 +147,8 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private let queueStorageKey = "ios.queue.v1"
     private let queueIndexStorageKey = "ios.queue.index.v1"
+    private let queuePolicyVersionKey = "ios.queue.policyVersion.v1"
+    private let queuePolicyVersion = 2
     private let downloadsStorageKey = "ios.downloads.v1"
     private let favoritesStorageKey = "ios.favorites.v1"
     private let historyStorageKey = "ios.history.v1"
@@ -2218,14 +2220,29 @@ final class AudioPlayerViewModel: ObservableObject {
             let data = UserDefaults.standard.data(forKey: queueStorageKey),
             let restoredQueue = try? JSONDecoder().decode([AppTrack].self, from: data)
         else {
+            UserDefaults.standard.set(queuePolicyVersion, forKey: queuePolicyVersionKey)
             return
         }
 
-        queue = restoredQueue
-        if let storedIndex = UserDefaults.standard.object(forKey: queueIndexStorageKey) as? Int,
-           queue.indices.contains(storedIndex) {
+        let storedIndex = UserDefaults.standard.object(forKey: queueIndexStorageKey) as? Int
+
+        if UserDefaults.standard.integer(forKey: queuePolicyVersionKey) != queuePolicyVersion {
+            // Preserve the current song and resume position, but discard tails
+            // produced by the old raw-radio policy. The new engine will build a
+            // clean tail as soon as this track starts or the listener chooses a
+            // new seed.
+            let index = storedIndex.flatMap {
+                restoredQueue.indices.contains($0) ? $0 : nil
+            } ?? 0
+            queue = restoredQueue.indices.contains(index) ? [restoredQueue[index]] : []
+            currentQueueIndex = queue.isEmpty ? nil : 0
+            UserDefaults.standard.set(queuePolicyVersion, forKey: queuePolicyVersionKey)
+            persistQueueState()
+        } else if let storedIndex, restoredQueue.indices.contains(storedIndex) {
+            queue = restoredQueue
             currentQueueIndex = storedIndex
-        } else if !queue.isEmpty {
+        } else if !restoredQueue.isEmpty {
+            queue = restoredQueue
             currentQueueIndex = 0
         }
     }
