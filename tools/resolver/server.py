@@ -42,6 +42,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 try:
     import yt_dlp
 except ImportError:
@@ -239,6 +241,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "OuterTuneResolver/1.1"
     resolver = None
+    queue_engine = None
     token = None
 
     def _authorised(self, params):
@@ -275,6 +278,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             })
 
         video_id = (params.get("v") or params.get("videoId") or [None])[0]
+        if route == "/queue":
+            if not video_id:
+                return self._send_json(400, {"error": "missing v"})
+            try:
+                limit = max(1, min(int(params.get("limit", ["20"])[0]), 50))
+            except ValueError:
+                limit = 20
+            session_key = (params.get("session") or ["default"])[0]
+            seed_hint = None
+            title = (params.get("title") or [None])[0]
+            artist = (params.get("artist") or [None])[0]
+            if title or artist:
+                seed_hint = {"videoId": video_id, "title": title or "",
+                             "artist": artist or ""}
+            try:
+                engine = self.__class__.queue_engine
+                payload = engine.queue(video_id, limit=limit,
+                                       session_key=session_key,
+                                       seed_hint=seed_hint)
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)[:300]})
+            return self._send_json(200, payload)
+
+        if route == "/queue/reset":
+            session_key = (params.get("session") or ["default"])[0]
+            self.__class__.queue_engine.reset(session_key)
+            return self._send_json(200, {"ok": True, "session": session_key})
+
         if route == "/resolve":
             if not video_id:
                 return self._send_json(400, {"error": "missing v"})
@@ -408,7 +439,9 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument("--host", default="127.0.0.1")
+    # Bound to every interface so a phone on the same network or through a
+    # tunnel can reach it; loopback-only made the tunnel the sole route in.
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--token", default=os.environ.get("RESOLVER_TOKEN"),
                         help="shared secret the app must present")
     parser.add_argument("--cookies", default=None,
@@ -423,6 +456,22 @@ def main():
 
     Handler.resolver = Resolver(cookies_path=args.cookies,
                                 client_args=args.player_client)
+
+    # Queue generation lives here rather than in the app so the algorithm can be
+    # changed without rebuilding and reinstalling the iOS client.
+    import recommender
+    cookie_header = None
+    if args.cookies and os.path.exists(args.cookies):
+        pairs = []
+        with open(args.cookies, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 7:
+                    pairs.append("%s=%s" % (parts[5], parts[6]))
+        cookie_header = "; ".join(pairs) if pairs else None
+    Handler.queue_engine = recommender.QueueEngine(cookie=cookie_header)
     Handler.token = args.token
 
     server = ThreadedServer((args.host, args.port), Handler)
