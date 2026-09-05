@@ -43,12 +43,17 @@ enum QueueRanker {
     static let artistCap = 2
     /// Minimum gap between two tracks by the same artist.
     static let artistSpacing = 4
+    /// Most tracks one artist may hold across a whole listening session.
+    /// Without this an artist simply takes its per-batch allowance again on
+    /// every extension: the seed artist measured at a third of a long session.
+    static let sessionArtistCap = 3
 
     static func select(
         candidates: [QueueCandidate],
         seed _: AppTrack,
         artistWeights: [String: Double],
         priorityRank: [String: Int] = [:],
+        sessionArtistCounts: [String: Int] = [:],
         limit: Int,
         blockedIdentities: Set<String>,
         blockedIds: Set<String>
@@ -86,6 +91,10 @@ enum QueueRanker {
                 // The seed's own artist gets no special allowance: hearing the
                 // same act on repeat is the exact complaint this addresses.
                 if (artistCounts[artist] ?? 0) >= artistCap { continue }
+                let carried = sessionArtistCounts[artist] ?? 0
+                if carried + (artistCounts[artist] ?? 0) >= sessionArtistCap {
+                    continue
+                }
 
                 if spacing > 0 {
                     let recent = chosen.suffix(spacing).map { normalizedArtist($0.artist) }

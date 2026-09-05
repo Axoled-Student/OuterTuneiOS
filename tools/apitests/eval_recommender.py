@@ -253,8 +253,8 @@ def _similarity(a, b):
     return 0.0
 
 
-def policy_mmr(pool, seed, taste, limit, blocked,
-               lam=0.72, artist_cap=2, spacing=4, seed_artist_cap=2):
+def policy_mmr(pool, seed, taste, limit, blocked, session_artists=None,
+               lam=0.72, artist_cap=2, spacing=4, session_artist_cap=3):
     """Relevance/diversity trade-off with hard artist caps and spacing.
 
     Maximal Marginal Relevance is the standard fix for "the list is all one
@@ -262,8 +262,11 @@ def policy_mmr(pool, seed, taste, limit, blocked,
     what has already been picked. The caps make artist domination impossible
     rather than merely unlikely.
     """
-    seed_artist = primary_artist(seed.get("artist"))
     seen = set(blocked)
+    # Counts carried across batches. Without this an artist simply takes
+    # its per-batch allowance again on every extension, which is how the
+    # seed artist ended up holding a third of a long session.
+    session_artists = session_artists if session_artists is not None else {}
     chosen, artist_counts = [], {}
 
     scored = []
@@ -282,8 +285,9 @@ def policy_mmr(pool, seed, taste, limit, blocked,
             if identity(c) in seen:
                 continue
             artist_key = primary_artist(c.get("artist"))
-            cap = seed_artist_cap if artist_key == seed_artist else artist_cap
-            if artist_counts.get(artist_key, 0) >= cap:
+            if artist_counts.get(artist_key, 0) >= artist_cap:
+                continue
+            if session_artists.get(artist_key, 0) >= session_artist_cap:
                 continue
             # Artist spacing: never stack the same artist back to back.
             recent = [primary_artist(x.get("artist")) for x in chosen[-spacing:]]
@@ -302,6 +306,7 @@ def policy_mmr(pool, seed, taste, limit, blocked,
         chosen.append(best)
         key = primary_artist(best.get("artist"))
         artist_counts[key] = artist_counts.get(key, 0) + 1
+        session_artists[key] = session_artists.get(key, 0) + 1
         seen.add(best["videoId"]); seen.add(identity(best))
         chosen_identity = identity(best)
         scored = [(c, r) for c, r in scored
@@ -516,9 +521,14 @@ def main():
                                    ("mmr", policy_mmr, wide_pool),
                                    ("quota", policy_quota, wide_pool)):
             blocked = {seed["videoId"], identity(seed)}
+            session_artists = {}
             runs = []
             for _ in range(args.runs):
-                picks = policy(pool, seed, taste, args.limit, blocked)
+                if policy is policy_mmr:
+                    picks = policy(pool, seed, taste, args.limit, blocked,
+                                   session_artists=session_artists)
+                else:
+                    picks = policy(pool, seed, taste, args.limit, blocked)
                 if not picks:
                     break
                 runs.append(picks)

@@ -113,6 +113,10 @@ final class AutoQueueService {
     /// Normalized titles handed out recently, so alternate uploads with a new
     /// videoId cannot make the same song reappear in successive extensions.
     private var recentlySuggested: [String] = []
+    /// Normalised artist names from recent batches, newest last. Used to keep
+    /// one artist from reclaiming its per-batch allowance on every extension.
+    private var recentlySuggestedArtists: [String] = []
+    private let recentArtistWindow = 40
     private let recentMemoryLimit = 300
     private var listeningRecords: [String: LocalListeningRecord] = [:]
     private let listeningRecordsKey = "ios.recommendations.listening.v1"
@@ -322,11 +326,17 @@ final class AutoQueueService {
             }
         }
 
+        var sessionArtistCounts: [String: Int] = [:]
+        for artist in recentlySuggestedArtists.suffix(recentArtistWindow) {
+            sessionArtistCounts[artist, default: 0] += 1
+        }
+
         let ordered = QueueRanker.select(
             candidates: pool,
             seed: seed,
             artistWeights: artistWeights,
             priorityRank: priorityRank,
+            sessionArtistCounts: sessionArtistCounts,
             limit: limit,
             blockedIdentities: blockedIdentities,
             blockedIds: blocked
@@ -781,6 +791,13 @@ final class AutoQueueService {
         }
         if let data = try? JSONEncoder().encode(recentlySuggested) {
             UserDefaults.standard.set(data, forKey: recentSuggestionsKey)
+        }
+
+        recentlySuggestedArtists.append(contentsOf:
+            tracks.map { QueueRanker.normalizedArtist($0.artist) })
+        if recentlySuggestedArtists.count > recentArtistWindow * 3 {
+            recentlySuggestedArtists.removeFirst(
+                recentlySuggestedArtists.count - recentArtistWindow * 3)
         }
     }
 
