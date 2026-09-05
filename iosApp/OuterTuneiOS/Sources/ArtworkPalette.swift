@@ -17,11 +17,12 @@ final class ArtworkPalette: ObservableObject {
     @Published private(set) var colors: [String: Color] = [:]
 
     private var inFlight: Set<String> = []
+
+    /// Shares URLCache with the artwork views, so the bytes are usually already
+    /// on disk by the time a colour is wanted.
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.default
-        configuration.requestCachePolicy = .returnCacheDontLoad
-        configuration.urlCache = URLCache(memoryCapacity: 8 << 20,
-                                          diskCapacity: 64 << 20)
+        configuration.urlCache = URLCache.shared
         return URLSession(configuration: configuration)
     }()
 
@@ -45,16 +46,9 @@ final class ArtworkPalette: ObservableObject {
         Task { [weak self] in
             defer { Task { @MainActor in self?.inFlight.remove(urlString) } }
 
-            var data: Data?
-            // Prefer the cache so scrolling artwork does not refetch.
-            if let cached = self?.session.configuration.urlCache?
-                .cachedResponse(for: URLRequest(url: url))?.data {
-                data = cached
-            } else {
-                data = try? await URLSession.shared.data(from: url).0
-            }
-
-            guard let data, let image = UIImage(data: data),
+            guard let session = await self?.session,
+                  let data = try? await session.data(from: url).0,
+                  let image = UIImage(data: data),
                   let average = Self.averageColor(of: image) else {
                 return
             }
