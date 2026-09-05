@@ -46,8 +46,8 @@ enum StreamResolverError: LocalizedError {
 /// to the IP that resolved them, and datacenter ranges are bot-gated.
 ///
 /// The resolver therefore runs on the user's own connection, uses yt-dlp (with
-/// a JS runtime) to resolve, and proxies the bytes. Because it honours Range,
-/// AVPlayer can stream and seek instead of downloading whole files up front.
+/// a JS runtime) to resolve, verifies and losslessly remuxes the full source on
+/// the PC, then serves an AVPlayer-compatible fast-start M4A with byte ranges.
 @MainActor
 final class StreamResolverService: ObservableObject {
     static let shared = StreamResolverService()
@@ -223,7 +223,7 @@ final class StreamResolverService: ObservableObject {
                 id: "resolver:\(videoId)",
                 url: resolved.streamURL,
                 sourceClientName: "RESOLVER",
-                sourceClientVersion: "1",
+                sourceClientVersion: "1.1",
                 sourceUserAgent: nil,
                 mimeType: resolved.mime,
                 codec: resolved.ext,

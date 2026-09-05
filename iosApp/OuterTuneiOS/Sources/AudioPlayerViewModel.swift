@@ -953,7 +953,7 @@ final class AudioPlayerViewModel: ObservableObject {
             appendDebugLog("解析完成[\(track.title)]：\(playbackCandidates.count) 個候選，"
                 + "登入=\(accountStore.isLoggedIn)，音質偏好=\(audioQualityPreference.rawValue)")
             for (i, c) in playbackCandidates.enumerated() {
-                print("[Player]   [\(i)] \(c.sourceClientName) HLS=\(c.isHLSManifest) itag=\(c.itag ?? 0) \(c.container ?? "?") \(c.audioQuality ?? "?")")
+                print("[Player]   [\(i)] \(c.sourceClientName) HLS=\(c.isHLSManifest) itag=\(c.itag ?? 0) \(c.container) \(c.audioQuality ?? "?")")
                 appendDebugLog("  候選[\(i)] \(c.sourceClientName) itag=\(c.itag ?? 0) "
                     + "\(c.container) \(c.bitrateText) HLS=\(c.isHLSManifest) "
                     + "premium=\(c.isPremiumFormat)")
@@ -1076,12 +1076,11 @@ final class AudioPlayerViewModel: ObservableObject {
         appendDebugLog("嘗試候選 \(playbackCandidateIndex + 1)/\(playbackCandidates.count)："
             + "\(selectedStream.sourceClientName) itag=\(selectedStream.itag ?? 0) "
             + "\(selectedStream.bitrateText) host=\(selectedStream.url.host ?? "?")")
-        print("[Player] startPlaybackAttempt: idx=\(playbackCandidateIndex)/\(playbackCandidates.count), client=\(selectedStream.sourceClientName), HLS=\(selectedStream.isHLSManifest), itag=\(selectedStream.itag ?? 0), container=\(selectedStream.container ?? "?")")
+        print("[Player] startPlaybackAttempt: idx=\(playbackCandidateIndex)/\(playbackCandidates.count), client=\(selectedStream.sourceClientName), HLS=\(selectedStream.isHLSManifest), itag=\(selectedStream.itag ?? 0), container=\(selectedStream.container)")
 
-        // HLS manifests and local/direct files can be played directly by AVPlayer.
-        // NOTE: RESOLVER proxies YouTube's DASH fMP4 (Premium itag 141 when
-        // available, otherwise itag 140). CoreMedia/AVPlayer cannot stream it
-        // directly over plain HTTP, so download and remux it first.
+        // HLS, local/direct files, and Resolver 1.1's fast-start M4A can be
+        // played directly. Legacy/raw YouTube DASH still takes the complete
+        // download-and-remux compatibility path below.
         if selectedStream.isHLSManifest
             || !selectedStream.requiresRemux
             || selectedStream.sourceClientName == "LOCAL"
@@ -1135,9 +1134,9 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func playItemDirectly(url: URL, track: AppTrack) {
         let item = AVPlayerItem(url: url)
-        // Everything reaching this point is either a local file or an HLS
-        // manifest. For a file already on disk there is nothing to buffer, so
-        // waiting to minimise stalling only delays the first sample.
+        // For a file already on disk there is nothing to buffer, so waiting to
+        // minimise stalling only delays the first sample. Network-backed HLS
+        // and progressive M4A retain AVPlayer's normal buffering behaviour.
         if url.isFileURL {
             item.preferredForwardBufferDuration = 0
         }
