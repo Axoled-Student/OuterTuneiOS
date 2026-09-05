@@ -314,9 +314,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, payload)
 
         if route == "/airadio":
+            # An empty prompt is valid: the server picks the theme itself, so
+            # the client can offer a single "just play something" button.
             prompt = (params.get("prompt") or params.get("q") or [""])[0]
-            if not prompt.strip():
-                return self._send_json(400, {"error": "missing prompt"})
             try:
                 limit = max(1, min(int((params.get("limit") or ["20"])[0]), 40))
             except ValueError:

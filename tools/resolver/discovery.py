@@ -27,10 +27,14 @@ HOME_TTL = 60 * 20
 # Seed queries per language, used only when the listener's own profile has
 # nothing in that script to build a shelf from.
 FALLBACK_SEEDS = {
-    "latin": ["top hits english", "pop hits 2026", "indie pop essentials"],
-    "jp": ["j-pop hits", "vocaloid best", "anime opening hits"],
-    "han": ["華語流行", "mandopop hits", "c-pop 熱門"],
-    "kr": ["k-pop hits", "korean r&b"],
+    "latin": ["top hits english", "pop hits 2026", "indie pop essentials",
+              "rnb hits", "rock classics", "edm dance hits", "hip hop hits",
+              "acoustic chill english"],
+    "jp": ["j-pop hits", "vocaloid best", "anime opening hits",
+           "city pop classics", "j-rock hits", "ボカロ 人気曲"],
+    "han": ["華語流行", "mandopop hits", "c-pop 熱門", "華語情歌",
+            "中文饒舌", "台語歌 熱門"],
+    "kr": ["k-pop hits", "korean r&b", "k-indie", "kpop ballad"],
 }
 
 SECTION_TITLES = [
@@ -83,7 +87,7 @@ def _seeds_for_script(engine, script, wanted=3):
     return picked
 
 
-def _shelf_from_queries(engine, visitor, queries, script, per):
+def _shelf_from_queries(engine, visitor, queries, script, per, per_artist_cap=2):
     """Resolve queries to seeds, then take their radios as shelf material."""
     seen_ids, seen_identities = set(), set()
     rows = []
@@ -93,27 +97,30 @@ def _shelf_from_queries(engine, visitor, queries, script, per):
             continue
         rows.append(found)
         for candidate in rec.radio(found["videoId"], visitor, engine.cookie,
-                                   limit=12):
+                                   limit=25):
             if script and rec.track_script(candidate) != script:
                 continue
             rows.append(candidate)
-        if len(rows) >= per * 3:
+        # Enough raw material to survive de-duplication and the artist cap.
+        if len(rows) >= per * 6:
             break
 
     if script:
         rows = [r for r in rows if rec.track_script(r) == script]
-    # Keep one track per artist so a shelf is a browse surface, not a discography.
-    per_artist, spread = set(), []
+
+    # A couple per artist keeps a shelf browsable without turning it into one
+    # artist's discography. One was too strict and left shelves half empty.
+    counts, spread = {}, []
     for row in rows:
         key = rec.primary_artist(row.get("artist"))
-        if key in per_artist:
+        if counts.get(key, 0) >= per_artist_cap:
             continue
-        per_artist.add(key)
+        counts[key] = counts.get(key, 0) + 1
         spread.append(row)
     return [_track_row(r) for r in _dedupe(spread, seen_ids, seen_identities, per)]
 
 
-def home(engine, per=12, force=False):
+def home(engine, per=20, force=False):
     """Language-split browse shelves plus a personalised one."""
     with _home_lock:
         cached = _home_cache["payload"]
@@ -149,7 +156,7 @@ def home(engine, per=12, force=False):
                 # Miku)" from Western pop. Their own taste in that script is
                 # still appended, so the shelf stays personal where it can be.
                 queries = list(FALLBACK_SEEDS.get(script, []))
-                personal = _seeds_for_script(engine, script, 2)
+                personal = _seeds_for_script(engine, script, 4)
                 queries += personal
                 subtitle = "熱門與你的喜好" if personal else "熱門"
                 items = _shelf_from_queries(engine, visitor, queries, script, per)
@@ -230,6 +237,40 @@ def _parse_list(text):
     return out
 
 
+def auto_theme(engine, cfg, model=None):
+    """Invent a station for the listener when they have not described one.
+
+    Spotify's DJ needs no input: you press it and it plays. Asking the model to
+    choose the theme first keeps that one-tap behaviour while still producing
+    something specific enough to search for.
+    """
+    top_artists = [a for a, _ in sorted(engine.taste.artists.items(),
+                                        key=lambda kv: -kv[1])[:12]]
+    recent = ["%s - %s" % (t["artist"], t["name"])
+              for t in engine.taste.tracks[:10]]
+    hour = time.localtime().tm_hour
+    part = ("late night" if hour >= 22 or hour < 5 else
+            "morning" if hour < 11 else
+            "afternoon" if hour < 17 else "evening")
+
+    ask = ("A listener just pressed play on an automatic radio, without saying "
+           "what they want. It is %s for them.\n"
+           "Their favourite artists: %s\n"
+           "Recently enjoyed: %s\n\n"
+           "Describe, in one short sentence, the station you would put on for "
+           "them right now. Be specific about mood and genre. Reply with the "
+           "sentence only."
+           % (part, ", ".join(top_artists) or "unknown",
+              "; ".join(recent) or "unknown"))
+    try:
+        theme = _ask_model(cfg, ask, model or "gemini-3.8-flash-high",
+                           timeout=60).strip()
+    except Exception:  # noqa: BLE001
+        return "a mix of what this listener usually enjoys"
+    theme = theme.strip().strip('"').split("\n")[0]
+    return theme[:200] or "a mix of what this listener usually enjoys"
+
+
 def ai_radio(engine, prompt, limit=20, model=None):
     """Build a station from a free-text description.
 
@@ -244,6 +285,12 @@ def ai_radio(engine, prompt, limit=20, model=None):
                 "prompt": prompt, "tracks": []}
 
     engine.taste.refresh()
+
+    # No prompt means "just play something" - pick a theme first.
+    auto = not (prompt or "").strip()
+    if auto:
+        prompt = auto_theme(engine, cfg, model)
+
     top_artists = [a for a, _ in sorted(engine.taste.artists.items(),
                                         key=lambda kv: -kv[1])[:12]]
     liked = ["%s - %s" % (t["artist"], t["name"])
@@ -295,6 +342,7 @@ def ai_radio(engine, prompt, limit=20, model=None):
 
     return {
         "prompt": prompt,
+        "auto": auto,
         "requested": len(queries),
         "resolved": len(resolved),
         "tracks": [_track_row(t) for t in resolved],
