@@ -257,28 +257,44 @@ struct NowPlayingView: View {
     }
 
     private var lyricsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let lines = SyncedLyrics.parse(player.lyricsText)
+        return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("歌詞")
-                    .font(.headline)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(AppTheme.textPrimary)
                 Spacer()
-                if player.isLoadingLyrics { ProgressView() }
+                if player.isLoadingLyrics {
+                    ProgressView().tint(AppTheme.textSecondary)
+                } else if !lines.isEmpty {
+                    Text("點一行可跳轉")
+                        .font(.caption2)
+                        .foregroundColor(AppTheme.textSecondary)
+                }
             }
 
-            if player.lyricsText.isEmpty {
-                Text("尚未載入")
-                    .foregroundColor(.secondary)
-            } else {
-                Text(player.lyricsText)
+            if player.isLoadingLyrics, player.lyricsText.isEmpty {
+                Text("載入中…")
                     .font(.footnote)
-                    .lineLimit(8)
+                    .foregroundColor(AppTheme.textSecondary)
+            } else if lines.isEmpty {
+                // Unsynced transcripts still arrive as plain text.
+                Text(player.lyricsText.isEmpty ? "找不到歌詞" : player.lyricsText)
+                    .font(.footnote)
+                    .foregroundColor(AppTheme.textSecondary)
+            } else {
+                SyncedLyricsView(lines: lines,
+                                 currentTime: player.currentTime) { time in
+                    player.seekTo(time)
+                }
+                .frame(height: 190)
             }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(.ultraThinMaterial)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.07))
         )
     }
 

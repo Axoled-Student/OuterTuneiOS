@@ -816,6 +816,11 @@ final class AudioPlayerViewModel: ObservableObject {
         }
     }
 
+    /// Jump to a point in the track. Used by the lyric transcript.
+    func seekTo(_ seconds: Double) {
+        seek(to: max(0, min(seconds, duration > 0 ? duration : seconds)))
+    }
+
     func loadLyricsForCurrentTrack() {
         guard let track = nowPlayingTrack else {
             lyricsText = ""
@@ -1014,6 +1019,9 @@ final class AudioPlayerViewModel: ObservableObject {
 
             startPlaybackAttempt(track: track)
             trackDidStartPlaying(track)
+            // Fetch the transcript alongside the audio; waiting for the user to
+            // ask meant it was almost never there when they looked.
+            loadLyricsForCurrentTrack()
 
             // Build the tail while this track is still rendering. Waiting for
             // DidPlayToEnd leaves a silent network gap where iOS may suspend a

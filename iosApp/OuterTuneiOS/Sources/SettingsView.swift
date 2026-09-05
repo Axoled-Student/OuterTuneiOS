@@ -18,6 +18,7 @@ struct SettingsView: View {
                 audioSection
                 playbackSection
                 recommendationSection
+                storageSection
                 aboutSection
             }
             .navigationTitle("設定")
@@ -148,6 +149,49 @@ struct SettingsView: View {
                 ResolverSettingsView()
             }
         }
+    }
+
+    @State private var artworkBytes: UInt64 = 0
+    @State private var audioBytes: UInt64 = 0
+
+    private var storageSection: some View {
+        Section {
+            HStack {
+                Text("封面快取")
+                Spacer()
+                Text(Self.formatted(artworkBytes)).foregroundColor(.secondary)
+            }
+            HStack {
+                Text("音訊快取")
+                Spacer()
+                Text(Self.formatted(audioBytes)).foregroundColor(.secondary)
+            }
+            Button("清除快取", role: .destructive) {
+                ImageCache.shared.clear()
+                Task {
+                    await AudioCache.shared.clear()
+                    await refreshStorage()
+                }
+                artworkBytes = 0
+            }
+        } header: {
+            Text("儲存空間")
+        } footer: {
+            Text("封面與已播放過的音訊會存在本機，重複播放時不會再耗用網路流量。")
+        }
+        .task { await refreshStorage() }
+    }
+
+    private func refreshStorage() async {
+        artworkBytes = ImageCache.shared.diskUsage
+        audioBytes = await AudioCache.shared.diskUsage
+    }
+
+    private static func formatted(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useKB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: Int64(bytes))
     }
 
     private var aboutSection: some View {
