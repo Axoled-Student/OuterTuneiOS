@@ -8,8 +8,13 @@ struct ContentView: View {
     @StateObject private var aiRanker = AIRankingService.shared
     @StateObject private var resolver = StreamResolverService.shared
 
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
     @State private var selectedTab: Tab = .home
     @State private var isNowPlayingPresented: Bool = false
+    /// Wide layouts keep the player docked beside the content instead of
+    /// covering it, which is how the tablet versions of these apps behave.
+    @AppStorage("ui.sidePanelVisible") private var isSidePanelVisible: Bool = true
     @State private var isLoginPresented: Bool = false
 
     enum Tab: Hashable {
@@ -34,39 +39,28 @@ struct ContentView: View {
         }
     }
 
+    private var usesSidePanel: Bool {
+        horizontalSizeClass == .regular
+    }
+
     var body: some View {
-        ZStack(alignment: .bottom) {
-            AppTheme.background.ignoresSafeArea()
-
-            // A hand-rolled bar rather than TabView: iPadOS renders TabView's
-            // tabs as a segmented control at the *top*, which is the wrong
-            // shape for a music app and does not match the phone layout.
-            Group {
-                switch selectedTab {
-                case .home:
-                    HomeView(
-                        openNowPlaying: { isNowPlayingPresented = true },
-                        openLogin: { isLoginPresented = true }
-                    )
-                case .search:
-                    SearchView()
-                case .library:
-                    LibraryView()
-                case .settings:
-                    SettingsView()
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            VStack(spacing: 8) {
-                if player.nowPlayingTrack != nil {
-                    MiniPlayerBarView {
-                        isNowPlayingPresented = true
+        Group {
+            if usesSidePanel {
+                HStack(spacing: 0) {
+                    mainColumn
+                    if isSidePanelVisible, player.nowPlayingTrack != nil {
+                        Divider().background(Color.white.opacity(0.08))
+                        NowPlayingView(onClose: { isSidePanelVisible = false })
+                            .environmentObject(player)
+                            .frame(width: 380)
+                            .transition(.move(edge: .trailing))
                     }
-                    .environmentObject(player)
-                    .padding(.horizontal, 8)
                 }
-                tabBar
+                .animation(.easeInOut(duration: 0.25), value: isSidePanelVisible)
+                .animation(.easeInOut(duration: 0.25),
+                           value: player.nowPlayingTrack?.stableId)
+            } else {
+                mainColumn
             }
         }
         .preferredColorScheme(.dark)
@@ -90,6 +84,59 @@ struct ContentView: View {
         }
         .onAppear {
             player.handleScenePhase(scenePhase)
+        }
+    }
+
+    /// Reveal the player wherever it lives on this layout.
+    private func presentNowPlaying() {
+        if usesSidePanel {
+            isSidePanelVisible = true
+        } else {
+            isNowPlayingPresented = true
+        }
+    }
+
+    private var mainColumn: some View {
+        ZStack(alignment: .bottom) {
+            AppTheme.background.ignoresSafeArea()
+
+            // A hand-rolled bar rather than TabView: iPadOS renders TabView's
+            // tabs as a segmented control at the *top*, which is the wrong
+            // shape for a music app and does not match the phone layout.
+            Group {
+                switch selectedTab {
+                case .home:
+                    HomeView(
+                        openNowPlaying: { presentNowPlaying() },
+                        openLogin: { isLoginPresented = true }
+                    )
+                case .search:
+                    SearchView()
+                case .library:
+                    LibraryView()
+                case .settings:
+                    SettingsView()
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            VStack(spacing: 8) {
+                // With the panel docked the mini player would duplicate it, so
+                // it only appears when the player is not already on screen.
+                if player.nowPlayingTrack != nil,
+                   !(usesSidePanel && isSidePanelVisible) {
+                    MiniPlayerBarView {
+                        if usesSidePanel {
+                            isSidePanelVisible = true
+                        } else {
+                            isNowPlayingPresented = true
+                        }
+                    }
+                    .environmentObject(player)
+                    .padding(.horizontal, 8)
+                }
+                tabBar
+            }
         }
     }
 

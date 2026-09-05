@@ -6,6 +6,10 @@ struct NowPlayingView: View {
     @EnvironmentObject private var player: AudioPlayerViewModel
     @Environment(\.dismiss) private var dismiss
 
+    /// Set when the view is hosted as a side panel rather than presented, so
+    /// the chevron collapses the panel instead of dismissing a sheet.
+    var onClose: (() -> Void)?
+
     @State private var isImportPickerPresented: Bool = false
     @State private var showAdvancedSource: Bool = false
     @State private var isAudioInfoPresented: Bool = false
@@ -99,8 +103,10 @@ struct NowPlayingView: View {
 
     private var topBar: some View {
         HStack {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.down")
+            Button {
+                if let onClose { onClose() } else { dismiss() }
+            } label: {
+                Image(systemName: onClose == nil ? "chevron.down" : "chevron.right")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundColor(AppTheme.textPrimary)
             }

@@ -1280,6 +1280,15 @@ final class AudioPlayerViewModel: ObservableObject {
 
     /// Download a YouTube adaptive stream and remux from DASH fMP4 to standard M4A.
     private func downloadAndRemux(stream: AudioStreamOption) async throws -> URL {
+        // Keyed by track + format rather than by URL: googlevideo hands out a
+        // fresh URL every time, so a URL key would never hit. A repeat play of
+        // something already on disk should cost nothing.
+        let cacheKey = "\(activePlaybackTrackStableId ?? stream.id)#\(stream.itag ?? -1)"
+        if let cached = await AudioCache.shared.existing(for: cacheKey) {
+            appendDebugLog("[DL] cache hit itag=\(stream.itag ?? 0)")
+            return cached
+        }
+
         var request = URLRequest(url: stream.url)
         request.httpShouldHandleCookies = false
 
@@ -1341,11 +1350,15 @@ final class AudioPlayerViewModel: ObservableObject {
             throw YouTubeMusicServiceError.noPlayableStream
         }
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = "remuxed_\(stream.itag ?? 0)_\(UUID().uuidString.prefix(8)).m4a"
-        let tempURL = tempDir.appendingPathComponent(fileName)
-        try remuxedData.write(to: tempURL)
+        if let cached = await AudioCache.shared.store(remuxedData, for: cacheKey) {
+            return cached
+        }
 
+        // Cache write failed (disk full, say); fall back to a throwaway file so
+        // playback still starts.
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remuxed_\(UUID().uuidString.prefix(8)).m4a")
+        try remuxedData.write(to: tempURL)
         return tempURL
     }
 

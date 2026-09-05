@@ -6,21 +6,30 @@ struct TrackArtworkView: View {
     let dimension: CGFloat
     let cornerRadius: CGFloat
 
+    // Observed so a view holding a placeholder redraws once the bytes land.
+    @ObservedObject private var cache = ImageCache.shared
+
     var body: some View {
         Group {
-            if let urlString,
-               let url = URL(string: urlString),
-               !urlString.isEmpty {
-                AsyncImage(url: url) { image in
-                    image
+#if os(iOS)
+            // AsyncImage keeps nothing across scrolls or launches, and a home
+            // screen shows about a hundred covers, so artwork was most of the
+            // app's network traffic. ImageCache holds them in memory and on disk.
+            if let urlString, !urlString.isEmpty {
+                if let image = cache.cached(urlString) {
+                    Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
-                } placeholder: {
+                } else {
                     artworkPlaceholder
+                        .onAppear { cache.load(urlString) }
                 }
             } else {
                 artworkPlaceholder
             }
+#else
+            artworkPlaceholder
+#endif
         }
         .frame(width: dimension, height: dimension)
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
