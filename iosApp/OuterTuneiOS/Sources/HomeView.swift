@@ -1,72 +1,69 @@
 import SwiftUI
 
-/// 首頁：登入後顯示 YouTube Music 個人化 feed；未登入顯示登入提示。
-/// 另外保留「目前播放」快速卡片與快速動作。
+/// Home: a dark, art-forward browse surface.
+///
+/// The top grid is the listener's personalised shelf, followed by the
+/// language-split shelves the resolver builds. The DJ card starts an automatic
+/// station in one tap - no prompt, no picking - and long-press opens the
+/// prompt-driven version.
 struct HomeView: View {
-    @State private var isAIRadioPresented = false
     @EnvironmentObject private var player: AudioPlayerViewModel
     @EnvironmentObject private var account: AccountStore
+    @EnvironmentObject private var resolver: StreamResolverService
 
     let openNowPlaying: () -> Void
     let openLogin: () -> Void
 
     @State private var selectedPlaylist: LibraryPlaylist?
+    @State private var isAIRadioPresented = false
+    @State private var isDJBuilding = false
+    @State private var djMessage: String?
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 22) {
-                    nowPlayingCard
+            ZStack {
+                AppTheme.background.ignoresSafeArea()
 
-                    if account.isLoggedIn {
-                        accountBanner
-                    } else {
-                        loginPromptBanner
-                    }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 26) {
+                        header
 
-                    if player.isLoadingHome && player.homeFeed.sections.isEmpty {
-                        ProgressView()
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 40)
-                    } else if let msg = player.homeErrorMessage {
-                        errorBox(msg)
-                    } else if player.homeFeed.sections.isEmpty {
-                        Text("目前沒有首頁內容，下拉以重新整理")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal)
-                    } else {
-                        ForEach(player.homeFeed.sections) { section in
-                            homeSectionView(section)
+                        DJCard(isBuilding: isDJBuilding,
+                               subtitle: djSubtitle) {
+                            Task { await startDJ() }
                         }
-                    }
+                        .padding(.horizontal, 16)
+                        .contextMenu {
+                            Button {
+                                isAIRadioPresented = true
+                            } label: {
+                                Label("自訂電台…", systemImage: "text.bubble")
+                            }
+                        }
 
-                    Color.clear.frame(height: 120)
+                        if !account.isLoggedIn {
+                            loginPrompt
+                        }
+
+                        content
+
+                        Color.clear.frame(height: 140)
+                    }
+                    .padding(.top, 8)
                 }
-                .padding(.vertical)
-            }
-            .navigationTitle("首頁")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        isAIRadioPresented = true
-                    } label: {
-                        Label("AI 電台", systemImage: "sparkles")
+                .refreshable {
+                    await player.refreshHomeFeed()
+                    if account.isLoggedIn {
+                        await player.refreshAccountInfo()
                     }
                 }
             }
-            .sheet(isPresented: $isAIRadioPresented) {
-                AIRadioView()
-            }
-            .refreshable {
-                await player.refreshHomeFeed()
-                if account.isLoggedIn {
-                    await player.refreshAccountInfo()
-                }
-            }
+            .navigationBarHidden(true)
             .onAppear {
                 Task {
-                    if player.homeFeed.sections.isEmpty { await player.refreshHomeFeed() }
+                    if player.homeFeed.sections.isEmpty {
+                        await player.refreshHomeFeed()
+                    }
                     if account.isLoggedIn, account.accountInfo == nil {
                         await player.refreshAccountInfo()
                     }
@@ -78,175 +75,176 @@ struct HomeView: View {
             PlaylistDetailView(playlist: playlist)
                 .environmentObject(player)
         }
+        .sheet(isPresented: $isAIRadioPresented) {
+            AIRadioView()
+        }
     }
 
-    // MARK: - 子區塊
+    // MARK: - Header
 
-    private var nowPlayingCard: some View {
-        Group {
-            if let track = player.nowPlayingTrack {
+    private var header: some View {
+        HStack(alignment: .center) {
+            Text(AppTheme.greeting)
+                .font(.system(size: 26, weight: .bold))
+                .foregroundColor(AppTheme.textPrimary)
+
+            Spacer()
+
+            if player.nowPlayingTrack != nil {
                 Button(action: openNowPlaying) {
-                    HStack(spacing: 12) {
-                        TrackArtworkView(urlString: track.displayThumbnailURL, dimension: 72, cornerRadius: 10)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("正在播放")
-                                .font(.caption)
-                                .foregroundColor(.accentColor)
-                            Text(track.title)
-                                .font(.headline)
-                                .lineLimit(1)
-                            Text(track.artist)
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                        }
-                        Spacer()
-                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 24, weight: .semibold))
-                            .foregroundColor(.accentColor)
-                            .onTapGesture {
-                                player.togglePlayback()
-                            }
-                    }
-                    .padding(12)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(.ultraThinMaterial)
-                    )
-                    .padding(.horizontal)
+                    Image(systemName: "waveform")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(AppTheme.accent)
                 }
-                .buttonStyle(.plain)
-            } else {
-                EmptyView()
             }
         }
+        .padding(.horizontal, 16)
     }
 
-    private var accountBanner: some View {
-        HStack(spacing: 12) {
-            if let avatar = account.accountInfo?.avatarURL, let url = URL(string: avatar) {
-                AsyncImage(url: url) { img in img.resizable().scaledToFill() } placeholder: {
-                    Color.secondary.opacity(0.2)
-                }
-                .frame(width: 40, height: 40)
-                .clipShape(Circle())
-            } else {
-                Image(systemName: "person.crop.circle.fill")
-                    .font(.system(size: 40))
-                    .foregroundColor(.secondary)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(account.accountInfo?.name ?? "YouTube Music")
-                    .font(.headline)
-                if let email = account.accountInfo?.email ?? account.accountInfo?.channelHandle {
-                    Text(email)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-            Spacer()
-        }
-        .padding(.horizontal)
+    private var djSubtitle: String {
+        if let djMessage { return djMessage }
+        if isDJBuilding { return "正在為你挑選歌曲…" }
+        return "一鍵播放，長按可自訂主題"
     }
 
-    private var loginPromptBanner: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                Image(systemName: "person.crop.circle.badge.questionmark")
-                    .font(.system(size: 34))
-                    .foregroundColor(.accentColor)
+    private var loginPrompt: some View {
+        Button(action: openLogin) {
+            HStack(spacing: 12) {
+                Image(systemName: "person.crop.circle.badge.plus")
+                    .font(.system(size: 22))
+                    .foregroundColor(AppTheme.accent)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("登入以取得個人化內容")
-                        .font(.headline)
-                    Text("同步您在 YouTube Music 的推薦與音樂庫")
+                    Text("登入 YouTube Music")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(AppTheme.textPrimary)
+                    Text("同步你的音樂庫與個人化推薦")
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(AppTheme.textSecondary)
                 }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .foregroundColor(AppTheme.textSecondary)
             }
-            Button(action: openLogin) {
-                Text("使用 Google 登入")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.ultraThinMaterial)
-        )
-        .padding(.horizontal)
-    }
-
-    private func errorBox(_ msg: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
-            Text(msg)
-                .font(.footnote)
-                .foregroundColor(.secondary)
-            Spacer()
-        }
-        .padding(12)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.orange.opacity(0.12))
-        )
-        .padding(.horizontal)
-    }
-
-    private func homeSectionView(_ section: HomeSection) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeaderView(title: section.title, subtitle: section.strapline)
-            ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(alignment: .top, spacing: 14) {
-                    ForEach(section.items) { item in
-                        homeItemTile(item)
-                    }
-                }
-                .padding(.horizontal)
-            }
-        }
-    }
-
-    private func homeItemTile(_ item: HomeItem) -> some View {
-        Button {
-            handleTap(item)
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                TrackArtworkView(
-                    urlString: item.thumbnailURL,
-                    dimension: 140,
-                    cornerRadius: item.kind == .artist ? 70 : 10
-                )
-                Text(item.title)
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                    .lineLimit(2)
-                    .foregroundColor(.primary)
-                if let subtitle = item.subtitle {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            .frame(width: 140, alignment: .leading)
+            .padding(12)
+            .background(AppTheme.surface)
+            .cornerRadius(AppTheme.cardCorner)
         }
         .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: - Content
+
+    @ViewBuilder
+    private var content: some View {
+        if player.isLoadingHome && player.homeFeed.sections.isEmpty {
+            ProgressView()
+                .tint(AppTheme.textPrimary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 60)
+        } else if let message = player.homeErrorMessage,
+                  player.homeFeed.sections.isEmpty {
+            errorBox(message)
+        } else if player.homeFeed.sections.isEmpty {
+            Text("目前沒有內容，下拉以重新整理")
+                .font(.subheadline)
+                .foregroundColor(AppTheme.textSecondary)
+                .padding(.horizontal, 16)
+        } else {
+            // The first shelf becomes the compact grid at the top, the way the
+            // big clients surface your most-likely picks above the carousels.
+            if let first = player.homeFeed.sections.first {
+                quickPicks(first)
+            }
+            ForEach(player.homeFeed.sections.dropFirst()) { section in
+                shelf(section)
+            }
+        }
+    }
+
+    private func quickPicks(_ section: HomeSection) -> some View {
+        let columns = [GridItem(.flexible(), spacing: 8),
+                       GridItem(.flexible(), spacing: 8)]
+        return VStack(alignment: .leading, spacing: 12) {
+            ShelfHeader(title: section.title, subtitle: section.strapline)
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(section.items.prefix(8)) { item in
+                    QuickTile(title: item.title,
+                              artworkURL: item.thumbnailURL) {
+                        handleTap(item)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private func shelf(_ section: HomeSection) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ShelfHeader(title: section.title, subtitle: section.strapline)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 14) {
+                    ForEach(section.items) { item in
+                        ShelfTile(title: item.title,
+                                  subtitle: item.subtitle,
+                                  artworkURL: item.thumbnailURL,
+                                  rounded: item.kind == .artist) {
+                            handleTap(item)
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+        }
+    }
+
+    private func errorBox(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("載入失敗")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(AppTheme.textPrimary)
+            Text(message)
+                .font(.caption)
+                .foregroundColor(AppTheme.textSecondary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AppTheme.surface)
+        .cornerRadius(AppTheme.cardCorner)
+        .padding(.horizontal, 16)
+    }
+
+    // MARK: - Actions
+
+    /// One tap, one station. The server chooses the theme when none is given,
+    /// so this needs no input from the listener.
+    private func startDJ() async {
+        guard resolver.isConfigured else {
+            djMessage = "請先在設定中填入串流伺服器網址"
+            return
+        }
+        isDJBuilding = true
+        djMessage = nil
+        defer { isDJBuilding = false }
+
+        if let tracks = await resolver.fetchAIRadio(prompt: "", limit: 30),
+           !tracks.isEmpty {
+            djMessage = resolver.lastAIRadioTheme
+            player.playTracks(tracks)
+            openNowPlaying()
+        } else {
+            djMessage = resolver.lastErrorMessage ?? "無法建立電台，請稍後再試"
+        }
     }
 
     private func handleTap(_ item: HomeItem) {
         if let track = item.asTrack() {
-            // A home song behaves like YouTube Music's radio: play the seed and
-            // immediately generate a visible personalised queue behind it.
+            // A home song behaves like a radio seed: play it and build a
+            // personalised queue behind it.
             player.playHomeTrack(track)
             return
         }
 
-        // Browse-backed cards are real playlists/albums/artist shelves. Open
-        // their rows instead of leaving a visually tappable no-op tile.
         selectedPlaylist = LibraryPlaylist(
             id: item.primaryId,
             title: item.title,

@@ -35,6 +35,8 @@ struct ContentView: View {
                     Label("設定", systemImage: "gearshape")
                 }
         }
+        .preferredColorScheme(.dark)
+        .tint(AppTheme.accent)
         .environmentObject(player)
         .environmentObject(accountStore)
         .environmentObject(spotify)

@@ -57,6 +57,8 @@ final class StreamResolverService: ObservableObject {
     @Published private(set) var isReachable: Bool?
     @Published private(set) var isChecking: Bool = false
     @Published var lastErrorMessage: String?
+    /// Station description the server generated for a promptless request.
+    @Published private(set) var lastAIRadioTheme: String?
 
     private let baseURLKey = "ios.resolver.baseURL.v1"
     private let keychainService = "com.dd3boh.outertune.ios.resolver"
@@ -280,6 +282,7 @@ final class StreamResolverService: ObservableObject {
                 lastErrorMessage = message
                 return nil
             }
+            lastAIRadioTheme = object["prompt"] as? String
             let rows = (object["tracks"] as? [[String: Any]]) ?? []
             let tracks: [AppTrack] = rows.compactMap { row in
                 guard let videoId = row["videoId"] as? String, !videoId.isEmpty
