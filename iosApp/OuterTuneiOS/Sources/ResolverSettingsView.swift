@@ -17,14 +17,13 @@ struct ResolverSettingsView: View {
                     .keyboardType(.URL)
                     .font(.system(.caption, design: .monospaced))
 
-                SecureField(resolver.hasToken ? "Token（已儲存，可留空）" : "Token",
-                            text: $tokenDraft)
+                SecureField("Token（選填；新版伺服器不需要）", text: $tokenDraft)
                     .textInputAutocapitalization(.never)
                     .disableAutocorrection(true)
 
                 Button("儲存並測試") {
                     resolver.configure(baseURL: baseURLDraft,
-                                       token: tokenDraft.isEmpty ? nil : tokenDraft)
+                                       token: tokenDraft)
                     tokenDraft = ""
                     didSave = true
                     Task { await resolver.checkHealth() }
@@ -57,7 +56,9 @@ struct ResolverSettingsView: View {
             } header: {
                 Text("串流伺服器")
             } footer: {
-                Text("YouTube 會拒絕未經處理的完整下載（超過 1 MiB 即回傳 403），"
+                Text("只需貼上 start.ps1 顯示的 Server URL；Token 可留空。"
+                     + "trycloudflare 快速通道重新啟動後網址會改變。"
+                     + "YouTube 會拒絕未經處理的完整下載（超過 1 MiB 即回傳 403），"
                      + "而 YouTube Music 的歌曲也沒有 HLS 串流可用。"
                      + "在電腦上執行 tools/resolver/server.py，再用 cloudflared 對外，"
                      + "即可正常串流與拖曳進度；未設定時仍會嘗試直接播放。")

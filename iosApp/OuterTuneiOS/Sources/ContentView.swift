@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var player = AudioPlayerViewModel()
     @StateObject private var accountStore = AccountStore.shared
     @StateObject private var spotify = SpotifyService.shared
@@ -57,6 +58,12 @@ struct ContentView: View {
             LoginContainerView()
                 .environmentObject(accountStore)
                 .environmentObject(player)
+        }
+        .onChange(of: scenePhase) { phase in
+            player.handleScenePhase(phase)
+        }
+        .onAppear {
+            player.handleScenePhase(scenePhase)
         }
     }
 }

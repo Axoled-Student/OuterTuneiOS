@@ -9,6 +9,7 @@ struct NowPlayingView: View {
     @State private var isImportPickerPresented: Bool = false
     @State private var showAdvancedSource: Bool = false
     @State private var isAudioInfoPresented: Bool = false
+    @State private var isQueuePresented: Bool = false
 
     var body: some View {
         NavigationView {
@@ -98,6 +99,10 @@ struct NowPlayingView: View {
                 AudioSourceInfoSheetView()
                     .environmentObject(player)
             }
+            .sheet(isPresented: $isQueuePresented) {
+                PlaybackQueueView()
+                    .environmentObject(player)
+            }
         }
         .navigationViewStyle(.stack)
     }
@@ -152,7 +157,14 @@ struct NowPlayingView: View {
     }
 
     private func secondaryControls(track: AppTrack) -> some View {
-        HStack(spacing: 26) {
+        HStack(spacing: 22) {
+            Button {
+                isQueuePresented = true
+            } label: {
+                Image(systemName: "list.bullet")
+            }
+            .buttonStyle(.plain)
+
             Button(action: player.seekBackward15) {
                 Image(systemName: "gobackward.15")
             }
@@ -239,6 +251,52 @@ struct NowPlayingView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(.ultraThinMaterial)
         )
+    }
+}
+
+/// The actual upcoming playback queue, including auto-generated tracks.
+struct PlaybackQueueView: View {
+    @EnvironmentObject private var player: AudioPlayerViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            List {
+                if player.queue.isEmpty {
+                    Text("佇列是空的")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(player.queue.indices, id: \.self) { index in
+                        let track = player.queue[index]
+                        TrackRowView(
+                            title: track.title,
+                            subtitle: track.artist,
+                            thumbnailURL: track.thumbnailURL,
+                            onTap: { player.playQueueItem(at: index) }
+                        ) {
+                            if player.currentQueueIndex == index {
+                                Image(systemName: player.isPlaying
+                                      ? "speaker.wave.2.fill" : "pause.circle.fill")
+                                    .foregroundColor(.accentColor)
+                            }
+                        }
+                    }
+                    .onDelete(perform: player.removeQueueItem)
+                    .onMove(perform: player.moveQueueItem)
+                }
+            }
+            .navigationTitle("播放佇列（\(player.queue.count)）")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    EditButton()
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("關閉") { dismiss() }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
     }
 }
 

@@ -9,10 +9,12 @@ on:
     paths:
       - 'iosApp/**'
       - 'tools/apitests/**'
+      - 'tools/resolver/**'
       - '.github/workflows/build_ios.yml'
   pull_request:
     paths:
       - 'iosApp/**'
+      - 'tools/resolver/**'
       - '.github/workflows/build_ios.yml'
   workflow_dispatch:
     inputs:
@@ -36,6 +38,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Install resolver test dependency
+        run: python -m pip install --disable-pip-version-check yt-dlp
+
+      - name: Test resolver protocol
+        run: python tools/resolver/test_server.py
 
       # Anonymous coverage always runs. The authenticated tests self-skip
       # unless the corresponding secrets are configured on the repository.
@@ -109,10 +117,18 @@ jobs:
           zip -qry OuterTuneiOS-unsigned.ipa Payload
           ls -lh OuterTuneiOS-unsigned.ipa
 
+          DSYM="build/ios/DerivedData/Build/Products/Release-iphoneos/OuterTuneiOS.app.dSYM"
+          if test -d "$DSYM"; then
+            ditto -c -k --keepParent "$DSYM" build/ios/OuterTuneiOS.app.dSYM.zip
+            ls -lh build/ios/OuterTuneiOS.app.dSYM.zip
+          fi
+
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: OuterTuneiOS-unsigned-ipa
-          path: build/ios/OuterTuneiOS-unsigned.ipa
+          path: |
+            build/ios/OuterTuneiOS-unsigned.ipa
+            build/ios/OuterTuneiOS.app.dSYM.zip
           if-no-files-found: error
           retention-days: 30

@@ -16,6 +16,47 @@ struct AudioStreamOption: Identifiable, Equatable {
     let contentLength: Int64?
     let itag: Int?
     let isHLSManifest: Bool
+    /// Raw YouTube DASH needs client-side remuxing. Resolver 1.1 serves a
+    /// cached, fast-start M4A and can be handed directly to AVPlayer.
+    let requiresRemux: Bool
+    /// Authoritative media duration when supplied by the companion resolver.
+    let duration: Double?
+
+    init(
+        id: String,
+        url: URL,
+        sourceClientName: String,
+        sourceClientVersion: String,
+        sourceUserAgent: String?,
+        mimeType: String?,
+        codec: String?,
+        container: String,
+        bitrate: Int?,
+        averageBitrate: Int?,
+        audioQuality: String?,
+        contentLength: Int64?,
+        itag: Int?,
+        isHLSManifest: Bool,
+        requiresRemux: Bool = true,
+        duration: Double? = nil
+    ) {
+        self.id = id
+        self.url = url
+        self.sourceClientName = sourceClientName
+        self.sourceClientVersion = sourceClientVersion
+        self.sourceUserAgent = sourceUserAgent
+        self.mimeType = mimeType
+        self.codec = codec
+        self.container = container
+        self.bitrate = bitrate
+        self.averageBitrate = averageBitrate
+        self.audioQuality = audioQuality
+        self.contentLength = contentLength
+        self.itag = itag
+        self.isHLSManifest = isHLSManifest
+        self.requiresRemux = requiresRemux
+        self.duration = duration
+    }
 
     /// itag 141 is 256kbps AAC and itag 774 is high-rate Opus. YouTube only
     /// offers either to a session carrying a Music Premium account, so their
@@ -60,6 +101,7 @@ enum YouTubeMusicServiceError: LocalizedError {
     case parsingFailed
     case noPlayableStream
     case notLoggedIn
+    case incompleteStream(expected: Int64, actual: Int64)
 
     var errorDescription: String? {
         switch self {
@@ -74,6 +116,8 @@ enum YouTubeMusicServiceError: LocalizedError {
             return "找不到可播放音訊串流"
         case .notLoggedIn:
             return "尚未登入 YouTube Music"
+        case .incompleteStream(let expected, let actual):
+            return "音訊下載不完整（\(actual)/\(expected) bytes）"
         }
     }
 }
@@ -615,6 +659,15 @@ final class YouTubeMusicService {
 
     private func extractVideoId(from renderer: [String: Any]) -> String? {
         if
+            let navigation = renderer["navigationEndpoint"] as? [String: Any],
+            let watch = navigation["watchEndpoint"] as? [String: Any],
+            let videoId = watch["videoId"] as? String,
+            !videoId.isEmpty
+        {
+            return videoId
+        }
+
+        if
             let playlistItemData = renderer["playlistItemData"] as? [String: Any],
             let videoId = playlistItemData["videoId"] as? String,
             !videoId.isEmpty
@@ -633,6 +686,27 @@ final class YouTubeMusicService {
             !videoId.isEmpty
         {
             return videoId
+        }
+
+        // Quick-pick rows sometimes put the playable endpoint only on a text
+        // run instead of playlistItemData or the artwork overlay.
+        if let columns = renderer["flexColumns"] as? [[String: Any]] {
+            for column in columns {
+                guard
+                    let flex = column["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any],
+                    let text = flex["text"] as? [String: Any],
+                    let runs = text["runs"] as? [[String: Any]]
+                else { continue }
+
+                for run in runs {
+                    if let navigation = run["navigationEndpoint"] as? [String: Any],
+                       let watch = navigation["watchEndpoint"] as? [String: Any],
+                       let videoId = watch["videoId"] as? String,
+                       !videoId.isEmpty {
+                        return videoId
+                    }
+                }
+            }
         }
 
         return nil
@@ -1209,6 +1283,76 @@ extension YouTubeMusicService {
         return playlists
     }
 
+    /// Load the playable rows for a YouTube Music playlist, album, mix, or
+    /// artist shelf. Continuations are followed so large playlists are not
+    /// silently truncated at the first 100 items.
+    func fetchBrowseSongs(browseId: String, maxTracks: Int = 500) async throws -> [YouTubeSearchSong] {
+        let normalizedId = browseId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedId.isEmpty else {
+            throw YouTubeMusicServiceError.invalidResponse
+        }
+
+        var payload = baseContext()
+        payload["browseId"] = normalizedId
+        var seenVideoIds = Set<String>()
+        var seenContinuations = Set<String>()
+        var songs: [YouTubeSearchSong] = []
+
+        for _ in 0..<10 {
+            let data = try await requestJSON(
+                endpoint: "https://music.youtube.com/youtubei/v1/browse",
+                payload: payload,
+                clientName: webRemixClientId,
+                clientVersion: webRemixClientVersion,
+                userAgent: webRemixUserAgent,
+                useLogin: true
+            )
+
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw YouTubeMusicServiceError.parsingFailed
+            }
+
+            let renderers = collectDictionaries(
+                forKey: "musicResponsiveListItemRenderer",
+                in: object
+            )
+            for renderer in renderers {
+                guard let videoId = extractVideoId(from: renderer),
+                      seenVideoIds.insert(videoId).inserted else { continue }
+
+                let title = extractTitle(from: renderer)
+                guard !title.isEmpty else { continue }
+                let subtitleParts = extractSubtitleParts(from: renderer)
+                songs.append(
+                    YouTubeSearchSong(
+                        videoId: videoId,
+                        title: title,
+                        artist: extractArtistName(from: renderer, subtitleParts: subtitleParts),
+                        thumbnailURL: extractThumbnailURL(from: renderer),
+                        durationText: subtitleParts.reversed().first(where: { isDurationToken($0) })
+                    )
+                )
+                if songs.count >= maxTracks { return songs }
+            }
+
+            let continuation = collectDictionaries(
+                forKey: "continuationItemRenderer",
+                in: object
+            ).compactMap { renderer -> String? in
+                let endpoint = renderer["continuationEndpoint"] as? [String: Any]
+                let command = endpoint?["continuationCommand"] as? [String: Any]
+                return command?["token"] as? String
+            }.first { !$0.isEmpty && !seenContinuations.contains($0) }
+
+            guard let continuation else { break }
+            seenContinuations.insert(continuation)
+            payload = baseContext()
+            payload["continuation"] = continuation
+        }
+
+        return songs
+    }
+
     // MARK: parsing helpers
 
     private func parseHomeSection(from carousel: [String: Any]) -> HomeSection? {
@@ -1252,6 +1396,12 @@ extension YouTubeMusicService {
         if let watch = nav["watchEndpoint"] as? [String: Any],
            let videoId = watch["videoId"] as? String {
             return HomeItem(kind: .song, primaryId: videoId, title: title, subtitle: subtitle, thumbnailURL: thumb)
+        }
+        if let watch = nav["watchEndpoint"] as? [String: Any],
+           let playlistId = watch["playlistId"] as? String,
+           !playlistId.isEmpty {
+            let browseId = playlistId.hasPrefix("VL") ? playlistId : "VL" + playlistId
+            return HomeItem(kind: .playlist, primaryId: browseId, title: title, subtitle: subtitle, thumbnailURL: thumb)
         }
         if let browse = nav["browseEndpoint"] as? [String: Any],
            let browseId = browse["browseId"] as? String {
@@ -1300,12 +1450,14 @@ extension YouTubeMusicService {
     /// entry already has a playable videoId, so nothing downstream has to
     /// guess or resolve a title back into an id.
     func fetchRadioQueue(videoId: String, limit: Int = 40) async throws -> [YouTubeSearchSong] {
-        let payload: [String: Any] = [
-            "videoId": videoId,
-            "playlistId": "RDAMVM" + videoId,
-            "isAudioOnly": true,
-            "params": "wAEB",
-        ]
+        // requestJSON expects callers to supply the InnerTube context. The old
+        // payload omitted it, so /next returned no usable radio rows in-app
+        // even though the same endpoint produced a full queue in live tests.
+        var payload = baseContext()
+        payload["videoId"] = videoId
+        payload["playlistId"] = "RDAMVM" + videoId
+        payload["isAudioOnly"] = true
+        payload["params"] = "wAEB"
 
         let data = try await requestJSON(
             endpoint: "https://music.youtube.com/youtubei/v1/next",

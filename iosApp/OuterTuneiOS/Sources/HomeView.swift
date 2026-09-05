@@ -9,6 +9,8 @@ struct HomeView: View {
     let openNowPlaying: () -> Void
     let openLogin: () -> Void
 
+    @State private var selectedPlaylist: LibraryPlaylist?
+
     var body: some View {
         NavigationView {
             ScrollView {
@@ -59,6 +61,10 @@ struct HomeView: View {
             }
         }
         .navigationViewStyle(.stack)
+        .sheet(item: $selectedPlaylist) { playlist in
+            PlaylistDetailView(playlist: playlist)
+                .environmentObject(player)
+        }
     }
 
     // MARK: - 子區塊
@@ -220,9 +226,19 @@ struct HomeView: View {
 
     private func handleTap(_ item: HomeItem) {
         if let track = item.asTrack() {
-            // playDownloadedTrack 實際上是通用的「取代佇列並播放指定 AppTrack」。
-            player.playDownloadedTrack(track)
+            // A home song behaves like YouTube Music's radio: play the seed and
+            // immediately generate a visible personalised queue behind it.
+            player.playHomeTrack(track)
+            return
         }
-        // album / playlist / artist：目前版本尚未支援詳細頁，之後再補 navigation。
+
+        // Browse-backed cards are real playlists/albums/artist shelves. Open
+        // their rows instead of leaving a visually tappable no-op tile.
+        selectedPlaylist = LibraryPlaylist(
+            id: item.primaryId,
+            title: item.title,
+            subtitle: item.subtitle,
+            thumbnailURL: item.thumbnailURL
+        )
     }
 }

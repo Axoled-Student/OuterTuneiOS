@@ -86,6 +86,22 @@ enum MusicSimilarityService {
 ///    a deterministic weighted blend does. Ranking can only reorder stage one,
 ///    so a failure here degrades quality but never correctness, and playback
 ///    continues either way.
+private struct LocalListeningRecord: Codable {
+    var track: AppTrack
+    var starts: Int
+    var completions: Int
+    var skips: Int
+    var listenedSeconds: Double
+    var lastPlayedAt: Date
+
+    var preferenceScore: Double {
+        Double(completions) * 2.0
+            + min(listenedSeconds / 180.0, 4.0) * 0.45
+            + Double(starts) * 0.05
+            - Double(skips) * 1.4
+    }
+}
+
 @MainActor
 final class AutoQueueService {
     static let shared = AutoQueueService()
@@ -97,8 +113,99 @@ final class AutoQueueService {
     /// Tracks handed out recently, so successive extensions do not loop.
     private var recentlySuggested: [String] = []
     private let recentMemoryLimit = 300
+    private var listeningRecords: [String: LocalListeningRecord] = [:]
+    private let listeningRecordsKey = "ios.recommendations.listening.v1"
+    private let recentSuggestionsKey = "ios.recommendations.suggested.v1"
+    private let listeningRecordLimit = 500
+    /// A short cooldown prevents annoying loops without forcing the listener
+    /// into an endless stream of unknown songs. The longer persisted list is
+    /// retained for diagnostics and future scoring, but is not a hard ban.
+    private let suggestedCooldownCount = 30
+    private let playedCooldownCount = 15
 
-    private init() {}
+    private init() {
+        if let data = UserDefaults.standard.data(forKey: listeningRecordsKey),
+           let decoded = try? JSONDecoder().decode(
+               [String: LocalListeningRecord].self,
+               from: data
+           ) {
+            listeningRecords = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: recentSuggestionsKey),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            recentlySuggested = Array(decoded.suffix(recentMemoryLimit))
+        }
+    }
+
+    var diagnostics: String {
+        let skips = listeningRecords.values.reduce(0) { $0 + $1.skips }
+        let completions = listeningRecords.values.reduce(0) { $0 + $1.completions }
+        return "learned=\(listeningRecords.count), completed=\(completions), "
+            + "skipped=\(skips), repeatBlock=\(recentlySuggested.count)"
+    }
+
+    /// Seed the feedback model with the app's existing listening history. This
+    /// is intentionally a weak positive because old rows have no timing data.
+    func bootstrapHistory(_ tracks: [AppTrack]) {
+        var changed = false
+        for (index, track) in tracks.prefix(100).enumerated()
+            where listeningRecords[track.stableId] == nil {
+            listeningRecords[track.stableId] = LocalListeningRecord(
+                track: track,
+                starts: 1,
+                completions: 0,
+                skips: 0,
+                listenedSeconds: 45,
+                lastPlayedAt: Date().addingTimeInterval(Double(-index * 60))
+            )
+            changed = true
+        }
+        if changed { persistListeningRecords() }
+    }
+
+    func recordStarted(_ track: AppTrack) {
+        var record = listeningRecords[track.stableId] ?? LocalListeningRecord(
+            track: track,
+            starts: 0,
+            completions: 0,
+            skips: 0,
+            listenedSeconds: 0,
+            lastPlayedAt: Date()
+        )
+        record.track = track
+        record.starts += 1
+        record.lastPlayedAt = Date()
+        listeningRecords[track.stableId] = record
+        persistListeningRecords()
+    }
+
+    func recordFinished(
+        _ track: AppTrack,
+        listenedSeconds: Double,
+        duration: Double,
+        completed: Bool
+    ) {
+        var record = listeningRecords[track.stableId] ?? LocalListeningRecord(
+            track: track,
+            starts: 1,
+            completions: 0,
+            skips: 0,
+            listenedSeconds: 0,
+            lastPlayedAt: Date()
+        )
+        let seconds = max(listenedSeconds, 0)
+        let ratio = duration > 0 ? seconds / duration : 0
+        record.track = track
+        record.listenedSeconds += seconds
+        record.lastPlayedAt = Date()
+        if completed || ratio >= 0.85 {
+            record.completions += 1
+        } else if seconds < 45 || ratio < 0.45 {
+            record.skips += 1
+        }
+        listeningRecords[track.stableId] = record
+        persistListeningRecords()
+    }
 
     func recommendations(
         seed: AppTrack,
@@ -107,11 +214,20 @@ final class AutoQueueService {
     ) async -> [AppTrack] {
         var blocked = excluding
         blocked.insert(seed.stableId)
-        for id in recentlySuggested {
+        for id in recentlySuggested.suffix(suggestedCooldownCount) {
+            blocked.insert(id)
+        }
+        for id in recentlyPlayedTrackIds(limit: playedCooldownCount) {
+            blocked.insert(id)
+        }
+        // Repeated early skips are a strong dislike signal, not mere novelty.
+        for (id, record) in listeningRecords
+            where record.skips >= 2 && record.skips > record.completions {
             blocked.insert(id)
         }
 
         var pool = await generateCandidates(seed: seed)
+        guard !Task.isCancelled else { return [] }
         pool = pool.filter { !blocked.contains($0.stableId) }
         pool = dedupe(pool)
 
@@ -121,17 +237,28 @@ final class AutoQueueService {
         if spotify.isAuthenticated {
             await spotify.refreshTasteProfile()
         }
+        guard !Task.isCancelled else { return [] }
+
+        // Ground the shortlist in actual local listens/skips before asking an
+        // optional LLM to sequence it.
+        let locallyOrdered = scoredBlend(
+            pool: pool,
+            taste: spotify.profile,
+            limit: min(pool.count, 60)
+        )
 
         let ordered: [AppTrack]
-        if let ranked = await ranker.rank(candidates: pool,
+        if let ranked = await ranker.rank(candidates: locallyOrdered,
                                           nowPlaying: seed,
                                           taste: spotify.profile,
+                                          localFeedback: feedbackSummary(),
                                           limit: limit) {
             ordered = ranked
         } else {
-            ordered = scoredBlend(pool: pool, taste: spotify.profile, limit: limit)
+            ordered = Array(locallyOrdered.prefix(limit))
         }
 
+        guard !Task.isCancelled else { return [] }
         remember(ordered)
         return ordered
     }
@@ -162,9 +289,44 @@ final class AutoQueueService {
         }
 
         pool.append(contentsOf: await spotifyDerivedCandidates())
+        pool.append(contentsOf: await listeningHistoryDerivedCandidates())
         pool.append(contentsOf: await similarityDerivedCandidates(seed: seed))
 
         return pool
+    }
+
+    /// Generate candidates from tracks the listener actually completed or
+    /// spent time with, not just the current song and Spotify's broad profile.
+    private func listeningHistoryDerivedCandidates() async -> [AppTrack] {
+        let seeds = listeningRecords.values
+            .filter { $0.preferenceScore > 0.10 }
+            .sorted {
+                if $0.preferenceScore == $1.preferenceScore {
+                    return $0.lastPlayedAt > $1.lastPlayedAt
+                }
+                return $0.preferenceScore > $1.preferenceScore
+            }
+            .prefix(3)
+            .compactMap { record -> String? in
+                if case .youtube(let videoId) = record.track.source { return videoId }
+                return nil
+            }
+
+        return await withTaskGroup(of: [AppTrack].self) { group in
+            for videoId in seeds {
+                group.addTask { [youtubeService] in
+                    let radio = try? await youtubeService.fetchRadioQueue(
+                        videoId: videoId,
+                        limit: 15
+                    )
+                    return (radio ?? []).map { $0.asTrack() }
+                }
+            }
+
+            var result: [AppTrack] = []
+            for await tracks in group { result.append(contentsOf: tracks) }
+            return result
+        }
     }
 
     /// Turns the Spotify taste profile into YouTube Music tracks.
@@ -256,6 +418,10 @@ final class AutoQueueService {
             } else if artistWeights.keys.contains(where: { artistKey.contains($0) }) {
                 score += 0.3
             }
+            score += localArtistAffinity(for: artistKey)
+            if let local = listeningRecords[track.stableId] {
+                score += max(-3.0, min(local.preferenceScore, 3.0))
+            }
             return (track, score)
         }
 
@@ -287,9 +453,72 @@ final class AutoQueueService {
     }
 
     private func remember(_ tracks: [AppTrack]) {
-        recentlySuggested.append(contentsOf: tracks.map(\.stableId))
+        for id in tracks.map(\.stableId) {
+            recentlySuggested.removeAll { $0 == id }
+            recentlySuggested.append(id)
+        }
         if recentlySuggested.count > recentMemoryLimit {
             recentlySuggested.removeFirst(recentlySuggested.count - recentMemoryLimit)
+        }
+        if let data = try? JSONEncoder().encode(recentlySuggested) {
+            UserDefaults.standard.set(data, forKey: recentSuggestionsKey)
+        }
+    }
+
+    private func recentlyPlayedTrackIds(limit: Int) -> [String] {
+        listeningRecords
+            .sorted { $0.value.lastPlayedAt > $1.value.lastPlayedAt }
+            .prefix(limit)
+            .map(\.key)
+    }
+
+    private func localArtistAffinity(for normalizedArtist: String) -> Double {
+        guard !normalizedArtist.isEmpty else { return 0 }
+        var score = 0.0
+        for record in listeningRecords.values {
+            let candidate = record.track.artist.lowercased()
+            guard candidate == normalizedArtist
+                    || candidate.contains(normalizedArtist)
+                    || normalizedArtist.contains(candidate) else { continue }
+            score += Double(record.completions) * 0.8
+            score += min(record.listenedSeconds / 300.0, 1.5) * 0.35
+            score -= Double(record.skips) * 0.55
+        }
+        return max(-2.0, min(score, 3.0))
+    }
+
+    private func feedbackSummary() -> String? {
+        guard !listeningRecords.isEmpty else { return nil }
+        let ordered = listeningRecords.values.sorted {
+            $0.preferenceScore > $1.preferenceScore
+        }
+        let liked = ordered.filter { $0.preferenceScore > 0.25 }.prefix(10).map {
+            "\($0.track.artist) - \($0.track.title)"
+        }
+        let skipped = ordered.reversed().filter { $0.skips > 0 }.prefix(8).map {
+            "\($0.track.artist) - \($0.track.title)"
+        }
+        var lines: [String] = []
+        if !liked.isEmpty {
+            lines.append("Locally listened/liked: " + liked.joined(separator: "; "))
+        }
+        if !skipped.isEmpty {
+            lines.append("Frequently skipped: " + skipped.joined(separator: "; "))
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
+
+    private func persistListeningRecords() {
+        if listeningRecords.count > listeningRecordLimit {
+            let keep = listeningRecords
+                .sorted { $0.value.lastPlayedAt > $1.value.lastPlayedAt }
+                .prefix(listeningRecordLimit)
+            listeningRecords = Dictionary(
+                uniqueKeysWithValues: keep.map { ($0.key, $0.value) }
+            )
+        }
+        if let data = try? JSONEncoder().encode(listeningRecords) {
+            UserDefaults.standard.set(data, forKey: listeningRecordsKey)
         }
     }
 }

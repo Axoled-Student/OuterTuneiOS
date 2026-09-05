@@ -11,6 +11,7 @@ struct ResolvedStream: Equatable {
     var mime: String?
     var bitrate: Int?
     var filesize: Int64?
+    var progressive: Bool
     var streamURL: URL
 }
 
@@ -24,6 +25,9 @@ enum StreamResolverError: LocalizedError {
         case .notConfigured:
             return "尚未設定串流伺服器"
         case .badResponse(let status):
+            if status == 401 {
+                return "串流伺服器 Token 不正確（HTTP 401）"
+            }
             return "串流伺服器回應 HTTP \(status)"
         case .malformed:
             return "串流伺服器回應格式錯誤"
@@ -124,10 +128,27 @@ final class StreamResolverService: ObservableObject {
         defer { isChecking = false }
 
         do {
-            let (_, response) = try await session.data(from: healthURL)
+            let (data, response) = try await session.data(from: healthURL)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             isReachable = (200 ..< 300).contains(status)
-            lastErrorMessage = isReachable == true ? nil : "HTTP \(status)"
+            if isReachable == true {
+                lastErrorMessage = nil
+
+                // URL-only mode is now the default. Once the server confirms
+                // that authentication is disabled, remove an old Keychain
+                // token so it is no longer exposed in stream query strings.
+                if let decoded = try? JSONSerialization.jsonObject(with: data),
+                   let object = decoded as? [String: Any],
+                   object["authRequired"] as? Bool == false,
+                   token != nil {
+                    KeychainStore.set(nil, service: keychainService, account: tokenAccount)
+                    hasToken = false
+                }
+            } else if status == 401 {
+                lastErrorMessage = "Token 不正確（HTTP 401）"
+            } else {
+                lastErrorMessage = "HTTP \(status)"
+            }
         } catch {
             isReachable = false
             lastErrorMessage = error.localizedDescription
@@ -169,13 +190,33 @@ final class StreamResolverService: ObservableObject {
             mime: object["mime"] as? String,
             bitrate: (object["bitrate"] as? NSNumber)?.intValue,
             filesize: (object["filesize"] as? NSNumber)?.int64Value,
+            progressive: object["progressive"] as? Bool == true,
             streamURL: playbackURL
         )
     }
 
-    /// A playback candidate for the resolver, or nil when unusable.
-    func playbackOption(for videoId: String) async -> AudioStreamOption? {
-        guard isConfigured else { return nil }
+    /// Ask the PC to resolve, download, and fast-start-remux the next track.
+    /// Playback itself never depends on this call: /stream performs the same
+    /// preparation on demand if the cache is cold.
+    func prepare(videoId: String) async throws {
+        guard isConfigured,
+              let prepareURL = url(path: "/prepare",
+                                   query: [URLQueryItem(name: "v", value: videoId)]) else {
+            throw StreamResolverError.notConfigured
+        }
+
+        let (_, response) = try await session.data(from: prepareURL)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200 ..< 300).contains(status) else {
+            throw StreamResolverError.badResponse(status)
+        }
+        isReachable = true
+    }
+
+    /// A playback candidate for the resolver. Errors remain visible to the
+    /// caller so it cannot silently fall back to a known-truncated direct URL.
+    func playbackOption(for videoId: String) async throws -> AudioStreamOption {
+        guard isConfigured else { throw StreamResolverError.notConfigured }
         do {
             let resolved = try await resolve(videoId: videoId)
             return AudioStreamOption(
@@ -192,12 +233,14 @@ final class StreamResolverService: ObservableObject {
                 audioQuality: resolved.itag.map { "itag \($0)" },
                 contentLength: resolved.filesize,
                 itag: Int(resolved.itag ?? ""),
-                isHLSManifest: false
+                isHLSManifest: false,
+                requiresRemux: !resolved.progressive,
+                duration: resolved.duration
             )
         } catch {
             lastErrorMessage = error.localizedDescription
             isReachable = false
-            return nil
+            throw error
         }
     }
 }

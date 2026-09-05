@@ -100,6 +100,7 @@ def run():
         suite.skip("authenticated premium bitrate", "needs YTM_COOKIE")
         suite.skip("personalised home feed", "needs YTM_COOKIE")
         suite.skip("library playlists", "needs YTM_COOKIE")
+        suite.skip("open a library playlist", "needs YTM_COOKIE")
         return suite.report()
 
     with suite.test("account menu returns the signed-in identity") as t:
@@ -171,7 +172,36 @@ def run():
                                     data_sync_id=data_sync_id)
         t.require(status_code == 200, "HTTP %s: %s" % (status_code, str(body)[:200]))
         items = it.walk(body, "musicTwoRowItemRenderer")
+        t.require(items, "no library playlist entries")
         t.note("%d library playlist entries" % len(items))
+
+    with suite.test("open a library playlist and obtain playable rows") as t:
+        browse_ids = []
+        for endpoint in it.walk(body, "browseEndpoint"):
+            browse_id = endpoint.get("browseId") if isinstance(endpoint, dict) else None
+            if (browse_id and browse_id not in browse_ids
+                    and (browse_id.startswith("VL") or browse_id.startswith("MPREb"))):
+                browse_ids.append(browse_id)
+
+        t.require(browse_ids, "library response contained no playlist browseId")
+        playable_rows = []
+        continuation = False
+        for browse_id in browse_ids[:6]:
+            status_code, playlist_body = it.call(
+                "browse", {"browseId": browse_id}, it.WEB_REMIX,
+                cookie=cookie, visitor_data=visitor, data_sync_id=data_sync_id)
+            if status_code != 200:
+                continue
+            rows = it.walk(playlist_body, "musicResponsiveListItemRenderer")
+            playable_rows = [row for row in rows
+                             if it.walk(row, "videoId")]
+            continuation = bool(it.walk(playlist_body, "continuationItemRenderer"))
+            if playable_rows:
+                break
+
+        t.require(playable_rows, "playlist cards opened but returned no playable video rows")
+        t.note("%d playable rows, continuation=%s"
+               % (len(playable_rows), continuation))
 
     return suite.report()
 

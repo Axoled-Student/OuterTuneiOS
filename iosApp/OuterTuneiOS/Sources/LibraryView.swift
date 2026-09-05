@@ -5,6 +5,7 @@ struct LibraryView: View {
     @EnvironmentObject private var account: AccountStore
 
     @State private var selectedTab: LibrarySection = .youtube
+    @State private var selectedPlaylist: LibraryPlaylist?
 
     enum LibrarySection: String, CaseIterable, Identifiable {
         case youtube = "YouTube"
@@ -50,6 +51,10 @@ struct LibraryView: View {
             }
         }
         .navigationViewStyle(.stack)
+        .sheet(item: $selectedPlaylist) { playlist in
+            PlaylistDetailView(playlist: playlist)
+                .environmentObject(player)
+        }
     }
 
     @ViewBuilder
@@ -99,24 +104,30 @@ struct LibraryView: View {
                 spacing: 16
             ) {
                 ForEach(player.libraryPlaylists) { playlist in
-                    VStack(alignment: .leading, spacing: 6) {
-                        TrackArtworkView(
-                            urlString: playlist.thumbnailURL,
-                            dimension: 160,
-                            cornerRadius: 10
-                        )
-                        .frame(maxWidth: .infinity)
-                        Text(playlist.title)
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                            .lineLimit(2)
-                        if let sub = playlist.subtitle {
-                            Text(sub)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
+                    Button {
+                        selectedPlaylist = playlist
+                    } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            TrackArtworkView(
+                                urlString: playlist.thumbnailURL,
+                                dimension: 160,
+                                cornerRadius: 10
+                            )
+                            .frame(maxWidth: .infinity)
+                            Text(playlist.title)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                                .lineLimit(2)
+                                .foregroundColor(.primary)
+                            if let sub = playlist.subtitle {
+                                Text(sub)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
                         }
                     }
+                    .buttonStyle(.plain)
                 }
             }
             .padding()

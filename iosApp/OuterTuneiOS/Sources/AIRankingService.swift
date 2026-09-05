@@ -92,6 +92,7 @@ final class AIRankingService: ObservableObject {
         candidates: [AppTrack],
         nowPlaying: AppTrack?,
         taste: SpotifyTasteProfile,
+        localFeedback: String?,
         limit: Int
     ) async -> [AppTrack]? {
         guard isConfigured, let apiKey else { return nil }
@@ -101,7 +102,8 @@ final class AIRankingService: ObservableObject {
         // enough that the tail rarely matters.
         let pool = Array(candidates.prefix(60))
         let prompt = buildPrompt(pool: pool, nowPlaying: nowPlaying,
-                                 taste: taste, limit: limit)
+                                 taste: taste, localFeedback: localFeedback,
+                                 limit: limit)
 
         do {
             let content = try await complete(prompt: prompt, apiKey: apiKey)
@@ -160,6 +162,7 @@ final class AIRankingService: ObservableObject {
         pool: [AppTrack],
         nowPlaying: AppTrack?,
         taste: SpotifyTasteProfile,
+        localFeedback: String?,
         limit: Int
     ) -> String {
         let listing = pool.enumerated().map { index, track in
@@ -180,6 +183,9 @@ final class AIRankingService: ObservableObject {
         let genres = taste.dominantGenres.prefix(8)
         if !genres.isEmpty {
             profileLines.append("Genres: " + genres.joined(separator: ", "))
+        }
+        if let localFeedback, !localFeedback.isEmpty {
+            profileLines.append(localFeedback)
         }
         let profileText = profileLines.isEmpty
             ? "(no listening history available)"
@@ -203,6 +209,9 @@ final class AIRankingService: ObservableObject {
         Rules:
         - Only choose ids that appear in the candidate list above.
         - Never invent a track. Never repeat the now-playing track.
+        - Strongly avoid tracks or artists marked as frequently skipped.
+        - Prefer stylistically close tracks from artists the listener has
+          completed or repeatedly listened to over unrelated novelty.
         - Favour a coherent listening flow: keep energy and genre consistent
           with what is playing while matching the listener's taste profile.
         - Prefer variety of artists over stacking one artist back to back.

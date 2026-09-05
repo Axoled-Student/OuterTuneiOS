@@ -41,7 +41,7 @@ struct RecommendationSettingsView: View {
         Section {
             Toggle("佇列播完後自動接續", isOn: Binding(
                 get: { player.isAutoQueueEnabled },
-                set: { player.isAutoQueueEnabled = $0 }
+                set: { player.setAutoQueueEnabled($0) }
             ))
 
             if player.isExtendingQueue {

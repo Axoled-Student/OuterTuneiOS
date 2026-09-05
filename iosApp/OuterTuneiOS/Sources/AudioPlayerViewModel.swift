@@ -74,11 +74,13 @@ final class AudioPlayerViewModel: ObservableObject {
         lines.append("youtube signed in: \(accountStore.isLoggedIn)")
         lines.append("stream resolver: configured=\(StreamResolverService.shared.isConfigured) "
             + "reachable=\(StreamResolverService.shared.isReachable.map(String.init) ?? "unknown")")
+        lines.append("audio session: \(AudioSessionConfigurator.diagnostics)")
         lines.append("spotify linked: \(SpotifyService.shared.isAuthenticated)")
         lines.append("ai ranker configured: \(AIRankingService.shared.isConfigured)")
         lines.append("audio quality preference: \(audioQualityPreference.rawValue)")
         lines.append("repeat: \(repeatMode.rawValue), shuffle: \(isShuffleEnabled), "
             + "auto-queue: \(isAutoQueueEnabled)")
+        lines.append("recommendation learning: \(autoQueueService.diagnostics)")
         lines.append("queue: \(queue.count) items, index: "
             + "\(currentQueueIndex.map(String.init) ?? "nil")")
         lines.append("isPlaying: \(isPlaying), duration: \(duration), time: \(currentTime)")
@@ -151,8 +153,16 @@ final class AudioPlayerViewModel: ObservableObject {
     private let repeatModeStorageKey = "ios.repeatMode.v1"
     private let shuffleStorageKey = "ios.shuffle.v1"
     private let autoQueueStorageKey = "ios.autoQueue.v1"
+    private let resumePositionStorageKey = "ios.playback.resumePosition.v1"
+    private let resumeWasPlayingStorageKey = "ios.playback.wasPlaying.v1"
 
     private var searchHistory: [String] = []
+    private var pendingLaunchResumePosition: Double?
+    private var hasHandledLaunchResume = false
+    private var nextPreloadTask: Task<Void, Never>?
+    private var autoQueueTask: Task<Void, Never>?
+    private var activeRecommendationGeneration: UUID?
+    private var feedbackTrack: AppTrack?
 
     var nowPlayingTrack: AppTrack? {
         guard let currentQueueIndex, currentQueueIndex >= 0, currentQueueIndex < queue.count else {
@@ -172,6 +182,13 @@ final class AudioPlayerViewModel: ObservableObject {
         restoreAudioQualityPreferenceState()
         restorePlaybackModeState()
         restoreSearchHistoryState()
+        autoQueueService.bootstrapHistory(playbackHistory)
+        if UserDefaults.standard.bool(forKey: resumeWasPlayingStorageKey),
+           currentQueueIndex != nil {
+            pendingLaunchResumePosition = UserDefaults.standard.double(
+                forKey: resumePositionStorageKey
+            )
+        }
         autocompleteSuggestions = Array(searchHistory.prefix(6))
         wireYouTubeAuthProvider()
     }
@@ -279,6 +296,8 @@ final class AudioPlayerViewModel: ObservableObject {
         playerItemKeepUpObservationToken?.invalidate()
         autocompleteTask?.cancel()
         nowPlayingArtworkTask?.cancel()
+        nextPreloadTask?.cancel()
+        autoQueueTask?.cancel()
     }
 
     func loadAndPlay() {
@@ -357,6 +376,19 @@ final class AudioPlayerViewModel: ObservableObject {
         }
     }
 
+    /// A home song is a radio seed, not a one-item queue. Start building its
+    /// personalised tail immediately so the queue is visible while the first
+    /// track is still resolving/buffering.
+    func playHomeTrack(_ track: AppTrack) {
+        Task {
+            await replaceQueueAndPlay(
+                tracks: [track],
+                startingAt: 0,
+                generateRecommendationsImmediately: true
+            )
+        }
+    }
+
     func enqueueSearchResult(_ song: YouTubeSearchSong) {
         enqueueTrack(song.asTrack(), status: "已加入佇列")
     }
@@ -377,6 +409,25 @@ final class AudioPlayerViewModel: ObservableObject {
         persistQueueState()
         if let status {
             statusMessage = status
+        }
+    }
+
+    func playPlaylist(_ songs: [YouTubeSearchSong], startingAt index: Int = 0) {
+        let tracks = songs.map { $0.asTrack() }
+        guard tracks.indices.contains(index) else { return }
+        Task {
+            await replaceQueueAndPlay(tracks: tracks, startingAt: index)
+        }
+    }
+
+    func enqueuePlaylist(_ songs: [YouTubeSearchSong]) {
+        let tracks = songs.map { $0.asTrack() }
+        guard !tracks.isEmpty else { return }
+        queue.append(contentsOf: tracks)
+        persistQueueState()
+        statusMessage = "已加入 \(tracks.count) 首歌曲"
+        if let currentQueueIndex {
+            preloadNextTrack(after: currentQueueIndex)
         }
     }
 
@@ -486,7 +537,7 @@ final class AudioPlayerViewModel: ObservableObject {
         }
 
         if isAutoQueueEnabled {
-            Task { await self.extendQueueWithRecommendations(startPlaying: true) }
+            scheduleAutoQueueExtension(startPlaying: true)
         }
     }
 
@@ -542,6 +593,12 @@ final class AudioPlayerViewModel: ObservableObject {
         statusMessage = "隨機播放：開啟"
     }
 
+    func setAutoQueueEnabled(_ enabled: Bool) {
+        isAutoQueueEnabled = enabled
+        persistPlaybackModeState()
+        statusMessage = enabled ? "自動佇列：開啟" : "自動佇列：關閉"
+    }
+
     /// Called when the current item reaches its end and the queue should move on.
     private func advanceAfterPlaybackEnded() {
         guard let index = currentQueueIndex else {
@@ -562,7 +619,7 @@ final class AudioPlayerViewModel: ObservableObject {
         }
 
         if isAutoQueueEnabled {
-            Task { await self.extendQueueWithRecommendations(startPlaying: true) }
+            scheduleAutoQueueExtension(startPlaying: true)
             return
         }
 
@@ -576,45 +633,61 @@ final class AudioPlayerViewModel: ObservableObject {
     /// straight into them. Holds a background assertion because this runs at the
     /// exact moment audio has stopped.
     func extendQueueWithRecommendations(startPlaying: Bool) async {
-        guard !isExtendingQueue else { return }
         guard let seed = nowPlayingTrack ?? queue.last else {
             isPlaying = false
             updateNowPlayingPlaybackState()
             return
         }
 
+        let generation = UUID()
+        activeRecommendationGeneration = generation
         isExtendingQueue = true
-        defer { isExtendingQueue = false }
+        defer {
+            if activeRecommendationGeneration == generation {
+                activeRecommendationGeneration = nil
+                isExtendingQueue = false
+            }
+        }
 
-        let previousCount = queue.count
-        await withBackgroundActivity("auto-queue") {
-            statusMessage = "尋找相似歌曲..."
-            let existing = Set(queue.map(\.stableId))
-            let suggestions = await autoQueueService.recommendations(
+        statusMessage = "尋找相似歌曲..."
+        let existing = Set(queue.map(\.stableId))
+        let suggestions = await withBackgroundActivity("auto-queue") {
+            await autoQueueService.recommendations(
                 seed: seed,
                 excluding: existing,
                 limit: 20
             )
-
-            guard !suggestions.isEmpty else {
-                appendDebugLog("自動佇列：找不到推薦（seed=\(seed.title)）")
-                return
-            }
-
-            queue.append(contentsOf: suggestions)
-            persistQueueState()
-            statusMessage = "已加入 \(suggestions.count) 首推薦歌曲"
         }
 
-        guard queue.count > previousCount else {
-            isPlaying = false
-            statusMessage = "播放完成"
-            updateNowPlayingPlaybackState()
+        guard !Task.isCancelled,
+              activeRecommendationGeneration == generation,
+              nowPlayingTrack?.stableId == seed.stableId else {
+            appendDebugLog("自動佇列：捨棄過期推薦（seed=\(seed.title)）")
             return
         }
 
+        let currentIds = Set(queue.map(\.stableId))
+        let freshSuggestions = suggestions.filter { !currentIds.contains($0.stableId) }
+        guard !freshSuggestions.isEmpty else {
+            appendDebugLog("自動佇列：找不到推薦（seed=\(seed.title)）")
+            if startPlaying {
+                isPlaying = false
+                statusMessage = "播放完成"
+                persistPlaybackResumeState()
+                updateNowPlayingPlaybackState()
+            }
+            return
+        }
+
+        let insertionIndex = queue.count
+        queue.append(contentsOf: freshSuggestions)
+        persistQueueState()
+        statusMessage = "已加入 \(freshSuggestions.count) 首推薦歌曲"
+
         if startPlaying {
-            playQueueItem(at: previousCount)
+            playQueueItem(at: insertionIndex)
+        } else {
+            preloadTrack(at: insertionIndex)
         }
     }
 
@@ -622,6 +695,11 @@ final class AudioPlayerViewModel: ObservableObject {
         UserDefaults.standard.set(repeatMode.rawValue, forKey: repeatModeStorageKey)
         UserDefaults.standard.set(isShuffleEnabled, forKey: shuffleStorageKey)
         UserDefaults.standard.set(isAutoQueueEnabled, forKey: autoQueueStorageKey)
+    }
+
+    private func persistPlaybackResumeState() {
+        UserDefaults.standard.set(max(currentTime, 0), forKey: resumePositionStorageKey)
+        UserDefaults.standard.set(isPlaying, forKey: resumeWasPlayingStorageKey)
     }
 
     private func restorePlaybackModeState() {
@@ -748,6 +826,7 @@ final class AudioPlayerViewModel: ObservableObject {
         player?.play()
         isPlaying = true
         statusMessage = "播放中"
+        persistPlaybackResumeState()
         updateNowPlayingPlaybackState()
     }
 
@@ -755,7 +834,41 @@ final class AudioPlayerViewModel: ObservableObject {
         player?.pause()
         isPlaying = false
         statusMessage = "已暫停"
+        persistPlaybackResumeState()
         updateNowPlayingPlaybackState()
+    }
+
+    /// Keep the playback session alive across ordinary Home-screen/background
+    /// transitions, and restore an item automatically after a process relaunch.
+    /// iOS still terminates audio when the user explicitly force-quits the app;
+    /// the saved item resumes as soon as the app is opened again.
+    func handleScenePhase(_ phase: ScenePhase) {
+        let configured = AudioSessionConfigurator.configureForPlayback()
+        appendDebugLog("場景狀態：\(String(describing: phase)) audioSession=\(configured)")
+
+        switch phase {
+        case .active:
+            if !hasHandledLaunchResume {
+                hasHandledLaunchResume = true
+                if pendingLaunchResumePosition != nil,
+                   let index = currentQueueIndex,
+                   queue.indices.contains(index) {
+                    Task { await self.playTrack(at: index) }
+                    return
+                }
+            }
+            if isPlaying {
+                player?.play()
+                updateNowPlayingPlaybackState()
+            }
+        case .inactive, .background:
+            persistPlaybackResumeState()
+            if isPlaying {
+                player?.play()
+            }
+        @unknown default:
+            break
+        }
     }
 
     func seekBackward15() {
@@ -789,13 +902,30 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     private func replaceQueueAndPlay(track: AppTrack) async {
-        queue = [track]
-        currentQueueIndex = 0
-        persistQueueState()
-        await playTrack(at: 0)
+        await replaceQueueAndPlay(tracks: [track], startingAt: 0)
     }
 
-    private func playTrack(at index: Int) async {
+    private func replaceQueueAndPlay(
+        tracks: [AppTrack],
+        startingAt index: Int,
+        generateRecommendationsImmediately: Bool = false
+    ) async {
+        guard tracks.indices.contains(index) else { return }
+        cancelAutoQueueGeneration()
+        nextPreloadTask?.cancel()
+        queue = tracks
+        currentQueueIndex = index
+        persistQueueState()
+        if generateRecommendationsImmediately {
+            scheduleAutoQueueExtension(startPlaying: false)
+        }
+        await playTrack(
+            at: index,
+            autoQueueAlreadyScheduled: generateRecommendationsImmediately
+        )
+    }
+
+    private func playTrack(at index: Int, autoQueueAlreadyScheduled: Bool = false) async {
         guard index >= 0, index < queue.count else { return }
         // Resolving streams and downloading them happens while nothing is
         // rendering, and the `audio` background mode only protects us while
@@ -806,6 +936,7 @@ final class AudioPlayerViewModel: ObservableObject {
         defer { BackgroundActivityGuard.shared.end() }
 
         let track = queue[index]
+        finishListeningIfChanging(to: track)
         currentQueueIndex = index
         persistQueueState()
 
@@ -834,6 +965,17 @@ final class AudioPlayerViewModel: ObservableObject {
 
             startPlaybackAttempt(track: track)
             trackDidStartPlaying(track)
+
+            // Build the tail while this track is still rendering. Waiting for
+            // DidPlayToEnd leaves a silent network gap where iOS may suspend a
+            // backgrounded app before recommendations finish loading.
+            if isAutoQueueEnabled,
+               !autoQueueAlreadyScheduled,
+               index == queue.count - 1 {
+                scheduleAutoQueueExtension(startPlaying: false)
+            } else {
+                preloadNextTrack(after: index)
+            }
         } catch {
             isPlaying = false
             playbackCandidates = []
@@ -841,6 +983,7 @@ final class AudioPlayerViewModel: ObservableObject {
             nowPlayingStreamInfo = nil
             statusMessage = "播放失敗：\(error.localizedDescription)"
             appendDebugLog("播放失敗[\(track.title)]: \(error)")
+            persistPlaybackResumeState()
         }
     }
 
@@ -871,18 +1014,19 @@ final class AudioPlayerViewModel: ObservableObject {
         case .youtube(let videoId):
             var options: [AudioStreamOption] = []
 
-            // The companion resolver proxies with Range support and is not
-            // subject to googlevideo's 1 MiB cap, so it goes first when set up.
-            // Direct googlevideo playback stays as a fallback: it works for the
-            // first megabyte, which is better than silence if the resolver is
-            // unreachable.
-            if let viaResolver = await resolverService.playbackOption(for: videoId) {
+            // A configured resolver is the only full-track source. Do not hide
+            // an auth/network failure by falling through to a googlevideo URL:
+            // that path is capped or rejected and creates silent, bad-duration
+            // files after remuxing.
+            if resolverService.isConfigured {
+                let viaResolver = try await resolverService.playbackOption(for: videoId)
                 options.append(viaResolver)
                 appendDebugLog("使用串流伺服器：itag=\(viaResolver.itag ?? -1) "
                     + "\(viaResolver.bitrateText)")
+                return options
             }
 
-            let direct = (try? await youtubeService.resolveAudioStreams(videoId: videoId)) ?? []
+            let direct = try await youtubeService.resolveAudioStreams(videoId: videoId)
             options.append(contentsOf: prioritizePlaybackCandidates(direct))
 
             guard !options.isEmpty else {
@@ -935,9 +1079,11 @@ final class AudioPlayerViewModel: ObservableObject {
         print("[Player] startPlaybackAttempt: idx=\(playbackCandidateIndex)/\(playbackCandidates.count), client=\(selectedStream.sourceClientName), HLS=\(selectedStream.isHLSManifest), itag=\(selectedStream.itag ?? 0), container=\(selectedStream.container ?? "?")")
 
         // HLS manifests and local/direct files can be played directly by AVPlayer.
-        // NOTE: RESOLVER proxies YouTube's itag 140 DASH fMP4, which CoreMedia/AVPlayer
-        // cannot stream directly over plain HTTP. It must be downloaded and remuxed first.
+        // NOTE: RESOLVER proxies YouTube's DASH fMP4 (Premium itag 141 when
+        // available, otherwise itag 140). CoreMedia/AVPlayer cannot stream it
+        // directly over plain HTTP, so download and remux it first.
         if selectedStream.isHLSManifest
+            || !selectedStream.requiresRemux
             || selectedStream.sourceClientName == "LOCAL"
             || selectedStream.sourceClientName == "DIRECT" {
             playItemDirectly(url: selectedStream.url, track: track)
@@ -1005,15 +1151,28 @@ final class AudioPlayerViewModel: ObservableObject {
 
         currentTime = 0
         sliderPosition = 0
-        duration = inferredFallbackDuration(for: track, streamURL: url) ?? 0
+        duration = nowPlayingStreamInfo?.duration
+            ?? inferredFallbackDuration(for: track, streamURL: url)
+            ?? 0
         lyricsText = ""
 
         observePlayerItemState(item: item, track: track)
         observePlaybackEnd(item: item)
         player?.isMuted = false
         player?.volume = 1.0
+
+        if let resumePosition = pendingLaunchResumePosition {
+            pendingLaunchResumePosition = nil
+            let bounded = duration > 0 ? min(resumePosition, duration) : resumePosition
+            let target = max(bounded, 0)
+            player?.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+            currentTime = target
+            sliderPosition = target
+        }
+
         player?.play()
         isPlaying = true
+        persistPlaybackResumeState()
         updateNowPlayingInfo(for: track)
 
         if playbackCandidateIndex == 0 {
@@ -1116,6 +1275,17 @@ final class AudioPlayerViewModel: ObservableObject {
                 bodyPreview: String(bodyPreview.prefix(100))
             )
         }
+
+        if let expected = stream.contentLength,
+           expected > 0,
+           Int64(data.count) < expected {
+            appendDebugLog("[DL] TRUNCATED itag=\(stream.itag ?? 0) "
+                + "expected=\(expected) actual=\(data.count)")
+            throw YouTubeMusicServiceError.incompleteStream(
+                expected: expected,
+                actual: Int64(data.count)
+            )
+        }
         appendDebugLog("[DL] OK HTTP \(httpResponse.statusCode) itag=\(stream.itag ?? 0) bytes=\(data.count)")
         print("[Player] downloadAndRemux: downloaded \(data.count) bytes")
 
@@ -1149,6 +1319,48 @@ final class AudioPlayerViewModel: ObservableObject {
         _ = AudioSessionConfigurator.configureForPlayback()
         startPlaybackAttempt(track: track)
         return true
+    }
+
+    /// Warm the PC-side fast-start M4A cache for the next YouTube item. The
+    /// task is deliberately best-effort and never changes visible playback
+    /// state; /stream prepares on demand if this did not finish in time.
+    private func preloadNextTrack(after index: Int) {
+        preloadTrack(at: index + 1)
+    }
+
+    private func scheduleAutoQueueExtension(startPlaying: Bool) {
+        autoQueueTask?.cancel()
+        autoQueueTask = Task { [weak self] in
+            await self?.extendQueueWithRecommendations(startPlaying: startPlaying)
+        }
+    }
+
+    private func cancelAutoQueueGeneration() {
+        autoQueueTask?.cancel()
+        autoQueueTask = nil
+        activeRecommendationGeneration = nil
+        isExtendingQueue = false
+    }
+
+    private func preloadTrack(at index: Int) {
+        guard resolverService.isConfigured, queue.indices.contains(index) else { return }
+        guard case .youtube(let videoId) = queue[index].source else { return }
+
+        let title = queue[index].title
+        nextPreloadTask?.cancel()
+        nextPreloadTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.resolverService.prepare(videoId: videoId)
+                guard !Task.isCancelled else { return }
+                self.appendDebugLog("預載完成：\(title)")
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.appendDebugLog("預載失敗[\(title)]：\(error.localizedDescription)")
+            }
+        }
     }
 
     private func seek(to seconds: Double) {
@@ -1272,6 +1484,15 @@ final class AudioPlayerViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
 
+                if let feedbackTrack = self.feedbackTrack {
+                    self.autoQueueService.recordFinished(
+                        feedbackTrack,
+                        listenedSeconds: self.currentTime,
+                        duration: self.duration,
+                        completed: true
+                    )
+                    self.feedbackTrack = nil
+                }
                 self.currentTime = 0
                 self.sliderPosition = 0
 
@@ -1280,6 +1501,9 @@ final class AudioPlayerViewModel: ObservableObject {
                     self.player?.seek(to: .zero)
                     self.player?.play()
                     self.isPlaying = true
+                    if let track = self.nowPlayingTrack {
+                        self.trackDidStartPlaying(track)
+                    }
                     self.updateNowPlayingPlaybackState()
                     return
                 }
@@ -1432,32 +1656,11 @@ final class AudioPlayerViewModel: ObservableObject {
             return .success
         }
 
-        commandCenter.skipForwardCommand.isEnabled = true
-        commandCenter.skipForwardCommand.preferredIntervals = [15]
-        commandCenter.skipForwardCommand.addTarget { [weak self] event in
-            guard let skip = event as? MPSkipIntervalCommandEvent else {
-                return .commandFailed
-            }
-            Task { @MainActor in
-                guard let self else { return }
-                self.seek(to: min(self.currentTime + skip.interval,
-                                  self.duration > 0 ? self.duration : self.currentTime + skip.interval))
-            }
-            return .success
-        }
-
-        commandCenter.skipBackwardCommand.isEnabled = true
-        commandCenter.skipBackwardCommand.preferredIntervals = [15]
-        commandCenter.skipBackwardCommand.addTarget { [weak self] event in
-            guard let skip = event as? MPSkipIntervalCommandEvent else {
-                return .commandFailed
-            }
-            Task { @MainActor in
-                guard let self else { return }
-                self.seek(to: max(self.currentTime - skip.interval, 0))
-            }
-            return .success
-        }
+        // Music controls should show previous/next track, not podcast-style
+        // 15-second buttons. nextTrackCommand/previousTrackCommand above remain
+        // enabled for Lock Screen, Control Center, headphones, and CarPlay.
+        commandCenter.skipForwardCommand.isEnabled = false
+        commandCenter.skipBackwardCommand.isEnabled = false
 
         // Seeking by scrubbing on some accessories uses the rating/like slot;
         // leave those disabled so they do not appear as dead controls.
@@ -1836,6 +2039,11 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     private func trackDidStartPlaying(_ track: AppTrack) {
+        if feedbackTrack?.stableId != track.stableId {
+            feedbackTrack = track
+            autoQueueService.recordStarted(track)
+        }
+
         if let index = favoriteTracks.firstIndex(where: { $0.stableId == track.stableId }) {
             favoriteTracks[index] = track
             persistFavoritesState()
@@ -1851,6 +2059,21 @@ final class AudioPlayerViewModel: ObservableObject {
             playbackHistory.removeLast(playbackHistory.count - 100)
         }
         persistHistoryState()
+    }
+
+    /// A transition before natural end is a skip signal. Long/near-complete
+    /// listens remain neutral or positive inside recordFinished, while early
+    /// skips lower the track/artist affinity used by auto-queue.
+    private func finishListeningIfChanging(to nextTrack: AppTrack) {
+        guard let previous = feedbackTrack,
+              previous.stableId != nextTrack.stableId else { return }
+        autoQueueService.recordFinished(
+            previous,
+            listenedSeconds: currentTime,
+            duration: duration,
+            completed: false
+        )
+        feedbackTrack = nil
     }
 
     private func localFileURL(relativePath: String) -> URL {
@@ -2036,6 +2259,8 @@ final class AudioPlayerViewModel: ObservableObject {
 }
 
 enum AudioSessionConfigurator {
+    private(set) static var diagnostics = "not configured"
+
     @discardableResult
     static func configureForPlayback() -> Bool {
 #if os(iOS)
@@ -2044,22 +2269,38 @@ enum AudioSessionConfigurator {
             // `.allowBluetooth` opts the session into HFP, a mono voice profile.
             // Requesting it on a playback-only session can drag a Bluetooth route
             // down to call quality, so a music player wants A2DP + AirPlay only.
-            // `.longFormAudio` tells the system this is music rather than a UI
-            // sound, which is also what lets AirPlay 2 and CarPlay treat it as a
-            // long-running now-playing session.
-            try session.setCategory(
-                .playback,
-                mode: .default,
-                policy: .longFormAudio,
-                options: [.allowAirPlay, .allowBluetoothA2DP]
-            )
-            try session.setActive(true)
+            // `.playback` is the category that explicitly ignores the Ring/
+            // Silent switch and remains eligible for the `audio` background
+            // mode. Use the canonical overload here; route-sharing policy is
+            // not required for either behavior and failed on some sideloaded
+            // device/OS combinations.
+            let wantedOptions: AVAudioSession.CategoryOptions = [
+                .allowAirPlay,
+                .allowBluetoothA2DP,
+            ]
+            if session.category != .playback
+                || session.mode != .default
+                || !session.categoryOptions.isSuperset(of: wantedOptions) {
+                try session.setCategory(
+                    .playback,
+                    mode: .default,
+                    options: wantedOptions
+                )
+            }
+            try session.setActive(true, options: [])
+            let outputs = session.currentRoute.outputs
+                .map { "\($0.portType.rawValue):\($0.portName)" }
+                .joined(separator: ",")
+            diagnostics = "ok category=\(session.category.rawValue) "
+                + "mode=\(session.mode.rawValue) route=\(outputs)"
             return true
         } catch {
+            diagnostics = "failed: \(error.localizedDescription)"
             print("Failed to configure audio session: \(error)")
             return false
         }
 #else
+        diagnostics = "not iOS"
         return false
 #endif
     }

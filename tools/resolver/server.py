@@ -13,27 +13,34 @@ resolved them (verified - a URL resolved on a home connection returns 403 from a
 datacenter), and YouTube bot-gates datacenter ranges anyway.
 
 So this runs on the same residential connection as the browser the cookies came
-from. It resolves with yt-dlp and proxies the bytes, forwarding Range headers so
-AVPlayer can stream and seek instead of downloading whole files up front.
+from. It resolves with yt-dlp, verifies the complete source, losslessly remuxes
+it into fast-start M4A, then serves normal byte ranges that AVPlayer can seek.
 
 Usage
 -----
-    python tools/resolver/server.py --token <shared-secret> [--port 8787]
-    python tools/resolver/server.py --token ... --cookies path/to/cookies.txt
+    python tools/resolver/server.py [--port 8787]
+    python tools/resolver/server.py --cookies path/to/cookies.txt
+
+Authentication is optional. Pass ``--token <shared-secret>`` only when wanted.
 
 Expose it with:  cloudflared tunnel --url http://127.0.0.1:8787
 """
 import argparse
+import hashlib
 import http.server
 import json
 import os
+import pathlib
+import shutil
 import socketserver
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 try:
     import yt_dlp
@@ -46,12 +53,16 @@ CHUNK = 256 * 1024
 
 _cache = {}
 _cache_lock = threading.Lock()
+_prepare_locks = {}
 
 
 class Resolver:
-    def __init__(self, cookies_path=None, client_args=None):
+    def __init__(self, cookies_path=None, client_args=None, cache_dir=None):
         self.cookies_path = cookies_path
         self.client_args = client_args
+        default_cache = pathlib.Path(__file__).resolve().parents[2] / "build" / "resolver_cache"
+        self.cache_dir = pathlib.Path(cache_dir or default_cache)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _options(self):
         options = {
@@ -59,8 +70,9 @@ class Resolver:
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": True,
-            # Audio only. `bestaudio` picks the highest-bitrate audio-only
-            # stream, which is itag 251 (opus ~132k) or 140 (m4a ~130k).
+            # Prefer the highest-bitrate AAC/M4A audio-only stream: Premium
+            # sessions expose itag 141 (~258 kbps), with itag 140 (~129 kbps)
+            # as the normal fallback. AAC also keeps the iOS remux path simple.
             "format": "bestaudio[ext=m4a]/bestaudio",
         }
         if self.cookies_path:
@@ -110,10 +122,122 @@ class Resolver:
             _cache[key] = {"data": data, "expires_at": now + CACHE_TTL_SECONDS}
         return data
 
+    def invalidate(self, video_id):
+        """Forget a resolved URL so the next request obtains a fresh one."""
+        with _cache_lock:
+            _cache.pop(video_id, None)
+
+    def _prepared_path(self, video_id, itag):
+        readable = "".join(c if c.isalnum() or c in "-_" else "_" for c in video_id)[:48]
+        digest = hashlib.sha256((video_id + ":" + str(itag)).encode()).hexdigest()[:12]
+        return self.cache_dir / ("%s-%s-%s.m4a" % (readable, itag or "audio", digest))
+
+    def _preparation_lock(self, path):
+        key = str(path)
+        with _cache_lock:
+            return _prepare_locks.setdefault(key, threading.Lock())
+
+    def _download_source(self, video_id, destination):
+        """Download one complete DASH source, refreshing a stale URL once."""
+        for attempt in range(2):
+            data = self.resolve(video_id)
+            request = urllib.request.Request(data["url"])
+            for key, value in (data.get("httpHeaders") or {}).items():
+                request.add_header(key, value)
+            request.add_header("Accept-Encoding", "identity")
+            if data.get("filesize"):
+                request.add_header("Range", "bytes=0-%d" % (int(data["filesize"]) - 1))
+
+            try:
+                with urllib.request.urlopen(request, timeout=90) as response:
+                    with open(destination, "wb") as output:
+                        while True:
+                            block = response.read(CHUNK)
+                            if not block:
+                                break
+                            output.write(block)
+                actual_size = destination.stat().st_size
+                if actual_size == 0:
+                    raise RuntimeError("upstream returned an empty audio file")
+                expected_size = int(data.get("filesize") or 0)
+                if expected_size and actual_size != expected_size:
+                    destination.unlink(missing_ok=True)
+                    if attempt == 0:
+                        self.invalidate(video_id)
+                        continue
+                    raise RuntimeError(
+                        "incomplete upstream audio (%d/%d bytes)"
+                        % (actual_size, expected_size)
+                    )
+                return data
+            except urllib.error.HTTPError as error:
+                if attempt == 0 and error.code in (403, 410):
+                    self.invalidate(video_id)
+                    continue
+                raise RuntimeError("upstream HTTP %d" % error.code) from error
+
+        raise RuntimeError("upstream audio URL remained unavailable")
+
+    def prepare(self, video_id):
+        """Cache a fast-start M4A so iOS can begin with small Range requests."""
+        metadata = self.resolve(video_id)
+        output_path = self._prepared_path(video_id, metadata.get("itag"))
+
+        with self._preparation_lock(output_path):
+            if not output_path.exists() or output_path.stat().st_size < 1024:
+                ffmpeg = shutil.which("ffmpeg")
+                if not ffmpeg:
+                    raise RuntimeError("ffmpeg is required for progressive M4A playback")
+
+                unique = uuid.uuid4().hex
+                source_path = output_path.with_name(output_path.name + "." + unique + ".dash.part")
+                temp_output = output_path.with_name(output_path.name + "." + unique + ".m4a.part")
+                try:
+                    metadata = self._download_source(video_id, source_path)
+                    command = [
+                        ffmpeg,
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        "-nostdin",
+                        "-y",
+                        "-i", str(source_path),
+                        "-map", "0:a:0",
+                        "-vn",
+                        "-c:a", "copy",
+                        "-movflags", "+faststart",
+                        "-f", "mp4",
+                        str(temp_output),
+                    ]
+                    completed = subprocess.run(
+                        command,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                    )
+                    if completed.returncode != 0:
+                        detail = (completed.stderr or "ffmpeg failed").strip()[-500:]
+                        raise RuntimeError("failed to prepare M4A: %s" % detail)
+                    if not temp_output.exists() or temp_output.stat().st_size < 1024:
+                        raise RuntimeError("ffmpeg produced no playable M4A")
+                    os.replace(temp_output, output_path)
+                finally:
+                    source_path.unlink(missing_ok=True)
+                    temp_output.unlink(missing_ok=True)
+
+        prepared = dict(metadata)
+        prepared["preparedPath"] = str(output_path)
+        prepared["filesize"] = output_path.stat().st_size
+        prepared["mime"] = "audio/mp4"
+        prepared["ext"] = "m4a"
+        prepared["progressive"] = True
+        return prepared
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "OuterTuneResolver/1.0"
+    server_version = "OuterTuneResolver/1.1"
     resolver = None
     token = None
 
@@ -138,11 +262,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(parsed.query)
         route = parsed.path.rstrip("/")
 
-        if route == "/health":
-            return self._send_json(200, {"ok": True, "service": "outertune-resolver"})
-
         if not self._authorised(params):
             return self._send_json(401, {"error": "bad or missing token"})
+
+        if route == "/health":
+            return self._send_json(200, {
+                "ok": True,
+                "service": "outertune-resolver",
+                "authRequired": bool(self.token),
+                "progressiveM4A": True,
+                "preload": True,
+            })
 
         video_id = (params.get("v") or params.get("videoId") or [None])[0]
         if route == "/resolve":
@@ -156,13 +286,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # this machine's IP and would 403 there.
             data.pop("url", None)
             data.pop("httpHeaders", None)
+            data["progressive"] = True
+            data["streamPath"] = "/stream?v=%s" % video_id
+            return self._send_json(200, data)
+
+        if route == "/prepare":
+            if not video_id:
+                return self._send_json(400, {"error": "missing v"})
+            try:
+                data = dict(self.resolver.prepare(video_id))
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)[:500]})
+            data.pop("url", None)
+            data.pop("httpHeaders", None)
+            data.pop("preparedPath", None)
+            data["prepared"] = True
             data["streamPath"] = "/stream?v=%s" % video_id
             return self._send_json(200, data)
 
         if route == "/stream":
             if not video_id:
                 return self._send_json(400, {"error": "missing v"})
-            return self._proxy_stream(video_id)
+            return self._serve_prepared(video_id)
 
         return self._send_json(404, {"error": "not found"})
 
@@ -176,81 +321,80 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         video_id = (params.get("v") or [None])[0]
         try:
-            data = self.resolver.resolve(video_id)
+            data = self.resolver.prepare(video_id)
         except Exception:  # noqa: BLE001
             self.send_response(502)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        self.send_response(200)
-        self.send_header("Content-Type", data["mime"])
-        if data.get("filesize"):
-            self.send_header("Content-Length", str(data["filesize"]))
-        self.send_header("Accept-Ranges", "bytes")
-        self.end_headers()
+        self._serve_file(data, send_body=False)
 
-    def _proxy_stream(self, video_id):
-        """Fetch from googlevideo and relay, honouring the client's Range."""
+    def _serve_prepared(self, video_id):
         try:
-            data = self.resolver.resolve(video_id)
+            data = self.resolver.prepare(video_id)
         except Exception as e:  # noqa: BLE001
-            return self._send_json(502, {"error": str(e)[:300]})
+            return self._send_json(502, {"error": str(e)[:500]})
+        return self._serve_file(data, send_body=True)
 
-        upstream = urllib.request.Request(data["url"])
-        for key, value in (data.get("httpHeaders") or {}).items():
-            upstream.add_header(key, value)
-        upstream.add_header("Accept-Encoding", "identity")
+    def _serve_file(self, data, send_body):
+        path = pathlib.Path(data["preparedPath"])
+        size = path.stat().st_size
+        range_header = self.headers.get("Range")
+        start = 0
+        end = size - 1
 
-        client_range = self.headers.get("Range")
-        # An open-ended range is exactly what googlevideo rejects, so give it a
-        # bounded one and let the client see a normal 206.
-        if client_range and client_range.startswith("bytes="):
-            spec = client_range.split("=", 1)[1].split(",")[0].strip()
-            start, _, end = spec.partition("-")
-            start = int(start) if start else 0
-            if end:
-                upstream.add_header("Range", "bytes=%d-%d" % (start, int(end)))
-            else:
-                total = data.get("filesize")
-                if total:
-                    upstream.add_header("Range", "bytes=%d-%d" % (start, int(total) - 1))
+        if range_header:
+            try:
+                if not range_header.startswith("bytes=") or "," in range_header:
+                    raise ValueError("unsupported range")
+                spec = range_header.split("=", 1)[1].strip()
+                start_text, separator, end_text = spec.partition("-")
+                if not separator:
+                    raise ValueError("missing separator")
+                if start_text:
+                    start = int(start_text)
+                    end = int(end_text) if end_text else size - 1
                 else:
-                    upstream.add_header("Range", "bytes=%d-" % start)
-        else:
-            total = data.get("filesize")
-            if total:
-                upstream.add_header("Range", "bytes=0-%d" % (int(total) - 1))
+                    suffix = int(end_text)
+                    if suffix <= 0:
+                        raise ValueError("bad suffix")
+                    start = max(size - suffix, 0)
+                    end = size - 1
+                if start < 0 or start >= size or end < start:
+                    raise ValueError("out of bounds")
+                end = min(end, size - 1)
+            except (TypeError, ValueError):
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
 
-        try:
-            response = urllib.request.urlopen(upstream, timeout=60)
-        except urllib.error.HTTPError as e:
-            # A stale cached url is the usual cause; drop it and resolve again.
-            with _cache_lock:
-                _cache.pop(video_id, None)
-            return self._send_json(502, {"error": "upstream HTTP %d" % e.code})
-        except Exception as e:  # noqa: BLE001
-            return self._send_json(502, {"error": str(e)[:200]})
-
-        status = 206 if response.status == 206 else 200
-        self.send_response(status)
-        self.send_header("Content-Type", data["mime"])
+        length = end - start + 1
+        self.send_response(206 if range_header else 200)
+        self.send_header("Content-Type", "audio/mp4")
         self.send_header("Accept-Ranges", "bytes")
-        for header in ("Content-Length", "Content-Range"):
-            value = response.headers.get(header)
-            if value:
-                self.send_header(header, value)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        if range_header:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self.end_headers()
 
+        if not send_body:
+            return
+
         try:
-            while True:
-                block = response.read(CHUNK)
-                if not block:
-                    break
-                self.wfile.write(block)
+            with open(path, "rb") as source:
+                source.seek(start)
+                remaining = length
+                while remaining > 0:
+                    block = source.read(min(CHUNK, remaining))
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    remaining -= len(block)
         except (BrokenPipeError, ConnectionResetError):
             pass  # the phone seeked or stopped; entirely normal
-        finally:
-            response.close()
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
