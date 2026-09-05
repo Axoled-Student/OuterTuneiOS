@@ -223,6 +223,106 @@ final class StreamResolverService: ObservableObject {
         }
     }
 
+    /// Browse shelves built server side, already split by language.
+    func fetchHomeSections(per: Int = 12) async -> [HomeSection]? {
+        guard isConfigured,
+              let endpoint = url(path: "/home",
+                                 query: [URLQueryItem(name: "per", value: String(per))])
+        else { return nil }
+
+        do {
+            let (data, response) = try await self.session.data(from: endpoint)
+            guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let rawSections = object["sections"] as? [[String: Any]]
+            else { return nil }
+
+            let sections: [HomeSection] = rawSections.compactMap { raw in
+                guard let title = raw["title"] as? String,
+                      let rows = raw["items"] as? [[String: Any]] else { return nil }
+                let items: [HomeItem] = rows.compactMap { row in
+                    guard let videoId = row["videoId"] as? String, !videoId.isEmpty
+                    else { return nil }
+                    return HomeItem(kind: .song,
+                                    primaryId: videoId,
+                                    title: (row["title"] as? String) ?? "Unknown",
+                                    subtitle: row["artist"] as? String,
+                                    thumbnailURL: row["thumbnail"] as? String)
+                }
+                guard !items.isEmpty else { return nil }
+                return HomeSection(title: title,
+                                   strapline: raw["subtitle"] as? String,
+                                   items: items)
+            }
+            return sections.isEmpty ? nil : sections
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// A station described in words. The server resolves every suggestion
+    /// against YouTube Music, so nothing unplayable comes back.
+    func fetchAIRadio(prompt: String, limit: Int = 20) async -> [AppTrack]? {
+        guard isConfigured,
+              let endpoint = url(path: "/airadio", query: [
+                  URLQueryItem(name: "prompt", value: prompt),
+                  URLQueryItem(name: "limit", value: String(limit)),
+              ])
+        else { return nil }
+
+        do {
+            let (data, response) = try await self.session.data(from: endpoint)
+            guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return nil }
+            if let message = object["error"] as? String {
+                lastErrorMessage = message
+                return nil
+            }
+            let rows = (object["tracks"] as? [[String: Any]]) ?? []
+            let tracks: [AppTrack] = rows.compactMap { row in
+                guard let videoId = row["videoId"] as? String, !videoId.isEmpty
+                else { return nil }
+                return AppTrack(
+                    id: UUID().uuidString,
+                    canonicalId: "yt:\(videoId)",
+                    title: (row["title"] as? String) ?? "Unknown",
+                    artist: (row["artist"] as? String) ?? "Unknown",
+                    thumbnailURL: row["thumbnail"] as? String,
+                    durationText: nil,
+                    source: .youtube(videoId: videoId))
+            }
+            return tracks.isEmpty ? nil : tracks
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Report how a track was actually received. Skips are the signal the
+    /// ranker learns from, so this is fire-and-forget on every track change.
+    func reportPlayback(track: AppTrack,
+                        playedSeconds: Double,
+                        duration: Double,
+                        explicit: String? = nil) async {
+        guard isConfigured else { return }
+        var query = [
+            URLQueryItem(name: "artist", value: track.artist),
+            URLQueryItem(name: "title", value: track.title),
+            URLQueryItem(name: "played", value: String(Int(playedSeconds))),
+            URLQueryItem(name: "duration", value: String(Int(duration))),
+        ]
+        if case .youtube(let videoId) = track.source {
+            query.append(URLQueryItem(name: "v", value: videoId))
+        }
+        if let explicit {
+            query.append(URLQueryItem(name: "explicit", value: explicit))
+        }
+        guard let endpoint = url(path: "/feedback", query: query) else { return }
+        _ = try? await self.session.data(from: endpoint)
+    }
+
     func resolve(videoId: String) async throws -> ResolvedStream {
         guard isConfigured,
               let resolveURL = url(path: "/resolve",

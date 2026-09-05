@@ -236,6 +236,15 @@ final class AudioPlayerViewModel: ObservableObject {
         homeErrorMessage = nil
         defer { isLoadingHome = false }
         do {
+            // The resolver builds language-split shelves from the Spotify
+            // profile, and can be retuned without shipping a new build, so it
+            // is preferred when configured.
+            if let remote = await StreamResolverService.shared.fetchHomeSections() {
+                homeFeed = HomeFeed(sections: remote)
+                print("[Home] refreshHomeFeed: \(remote.count) server sections")
+                return
+            }
+
             // Spotify-derived shelves go first: they reflect where the
             // listener's taste actually lives, whereas YouTube's own home feed
             // is personalised to the YouTube account.
@@ -933,6 +942,14 @@ final class AudioPlayerViewModel: ObservableObject {
         return String(format: "%02d:%02d", minutes, seconds)
     }
 
+    /// Play a list that was assembled elsewhere, such as an AI station.
+    func playTracks(_ tracks: [AppTrack], startingAt index: Int = 0) {
+        guard tracks.indices.contains(index) else { return }
+        Task {
+            await replaceQueueAndPlay(tracks: tracks, startingAt: index)
+        }
+    }
+
     private func replaceQueueAndPlay(track: AppTrack) async {
         await replaceQueueAndPlay(tracks: [track], startingAt: 0)
     }
@@ -1522,6 +1539,16 @@ final class AudioPlayerViewModel: ObservableObject {
                         duration: self.duration,
                         completed: true
                     )
+                    let finished = self.feedbackTrack
+                    let played = self.duration
+                    let total = self.duration
+                    if let finished {
+                        Task {
+                            await StreamResolverService.shared.reportPlayback(
+                                track: finished, playedSeconds: played,
+                                duration: total)
+                        }
+                    }
                     self.feedbackTrack = nil
                 }
                 self.currentTime = 0
@@ -2098,12 +2125,20 @@ final class AudioPlayerViewModel: ObservableObject {
     private func finishListeningIfChanging(to nextTrack: AppTrack) {
         guard let previous = feedbackTrack,
               previous.stableId != nextTrack.stableId else { return }
+        let listened = currentTime
+        let total = duration
         autoQueueService.recordFinished(
             previous,
-            listenedSeconds: currentTime,
-            duration: duration,
+            listenedSeconds: listened,
+            duration: total,
             completed: false
         )
+        // The server ranks with the same signal, so it needs to hear about the
+        // skip too; fire-and-forget, playback must not wait on it.
+        Task {
+            await StreamResolverService.shared.reportPlayback(
+                track: previous, playedSeconds: listened, duration: total)
+        }
         feedbackTrack = nil
     }
 

@@ -3,6 +3,7 @@ import SwiftUI
 /// 首頁：登入後顯示 YouTube Music 個人化 feed；未登入顯示登入提示。
 /// 另外保留「目前播放」快速卡片與快速動作。
 struct HomeView: View {
+    @State private var isAIRadioPresented = false
     @EnvironmentObject private var player: AudioPlayerViewModel
     @EnvironmentObject private var account: AccountStore
 
@@ -45,6 +46,18 @@ struct HomeView: View {
                 .padding(.vertical)
             }
             .navigationTitle("首頁")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        isAIRadioPresented = true
+                    } label: {
+                        Label("AI 電台", systemImage: "sparkles")
+                    }
+                }
+            }
+            .sheet(isPresented: $isAIRadioPresented) {
+                AIRadioView()
+            }
             .refreshable {
                 await player.refreshHomeFeed()
                 if account.isLoggedIn {
