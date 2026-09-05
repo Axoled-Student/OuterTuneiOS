@@ -112,6 +112,18 @@ final class AutoQueueService {
 
     /// Normalized titles handed out recently, so alternate uploads with a new
     /// videoId cannot make the same song reappear in successive extensions.
+    /// Stable per-install key so the server can remember what this device has
+    /// already been given across queue extensions.
+    private lazy var queueSessionKey: String = {
+        let key = "ios.recommendations.sessionKey.v1"
+        if let existing = UserDefaults.standard.string(forKey: key) {
+            return existing
+        }
+        let generated = UUID().uuidString
+        UserDefaults.standard.set(generated, forKey: key)
+        return generated
+    }()
+
     private var recentlySuggested: [String] = []
     /// Normalised artist names from recent batches, newest last. Used to keep
     /// one artist from reclaiming its per-batch allowance on every extension.
@@ -267,6 +279,29 @@ final class AutoQueueService {
             where record.skips >= 2 && record.skips > record.completions {
             blocked.insert(id)
             blockedIdentities.insert(record.track.recommendationIdentity)
+        }
+
+        // Prefer the resolver's queue: it runs the same policy but can be
+        // updated without shipping a build, and it already has the Spotify
+        // profile and a signed-in YouTube session to work from.
+        if case .youtube(let seedVideoId) = seed.source,
+           StreamResolverService.shared.isConfigured {
+            if let remote = await StreamResolverService.shared.fetchQueue(
+                videoId: seedVideoId,
+                limit: limit,
+                session: queueSessionKey,
+                seedTitle: seed.title,
+                seedArtist: seed.artist
+            ) {
+                let filtered = remote.filter {
+                    !blocked.contains($0.stableId)
+                        && !blockedIdentities.contains($0.recommendationIdentity)
+                }
+                if !filtered.isEmpty {
+                    remember(filtered)
+                    return filtered
+                }
+            }
         }
 
         let generated = await generateCandidates(seed: seed, limit: limit)

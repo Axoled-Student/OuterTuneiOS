@@ -161,6 +161,68 @@ final class StreamResolverService: ObservableObject {
         url(path: "/stream", query: [URLQueryItem(name: "v", value: videoId)])
     }
 
+    /// Ask the resolver for the next batch of tracks.
+    ///
+    /// Recommendation runs on the server so the algorithm can be changed
+    /// without shipping a new build, and because that machine already holds
+    /// the Spotify tokens and the signed-in YouTube session. Returns nil when
+    /// the resolver is unset or unreachable, and the caller falls back to
+    /// on-device generation.
+    func fetchQueue(videoId: String,
+                    limit: Int,
+                    session: String,
+                    seedTitle: String? = nil,
+                    seedArtist: String? = nil) async -> [AppTrack]? {
+        guard isConfigured else { return nil }
+
+        var query = [
+            URLQueryItem(name: "v", value: videoId),
+            URLQueryItem(name: "limit", value: String(limit)),
+            URLQueryItem(name: "session", value: session),
+        ]
+        if let seedTitle, !seedTitle.isEmpty {
+            query.append(URLQueryItem(name: "title", value: seedTitle))
+        }
+        if let seedArtist, !seedArtist.isEmpty {
+            query.append(URLQueryItem(name: "artist", value: seedArtist))
+        }
+        guard let endpoint = url(path: "/queue", query: query) else { return nil }
+
+        do {
+            let (data, response) = try await self.session.data(from: endpoint)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200 ..< 300).contains(status) else {
+                lastErrorMessage = "queue HTTP \(status)"
+                return nil
+            }
+            guard
+                let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let rows = object["tracks"] as? [[String: Any]]
+            else {
+                return nil
+            }
+
+            let tracks: [AppTrack] = rows.compactMap { row in
+                guard let videoId = row["videoId"] as? String, !videoId.isEmpty else {
+                    return nil
+                }
+                return AppTrack(
+                    id: UUID().uuidString,
+                    canonicalId: "yt:\(videoId)",
+                    title: (row["title"] as? String) ?? "Unknown",
+                    artist: (row["artist"] as? String) ?? "Unknown",
+                    thumbnailURL: row["thumbnail"] as? String,
+                    durationText: nil,
+                    source: .youtube(videoId: videoId)
+                )
+            }
+            return tracks.isEmpty ? nil : tracks
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
     func resolve(videoId: String) async throws -> ResolvedStream {
         guard isConfigured,
               let resolveURL = url(path: "/resolve",
