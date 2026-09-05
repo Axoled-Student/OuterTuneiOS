@@ -12,189 +12,242 @@ struct NowPlayingView: View {
     @State private var isQueuePresented: Bool = false
 
     var body: some View {
-        NavigationView {
-            ZStack {
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.92, green: 0.52, blue: 0.56).opacity(0.28),
-                        Color(red: 0.26, green: 0.43, blue: 0.72).opacity(0.18),
-                        Color(.systemBackground)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
+        ZStack {
+            ArtworkGradient(artworkURL: player.nowPlayingTrack?.displayThumbnailURL)
 
-                ScrollView {
-                    VStack(spacing: 22) {
-                        if let track = player.nowPlayingTrack {
+            if let track = player.nowPlayingTrack {
+                GeometryReader { geometry in
+                    let artSize = min(geometry.size.width - 56,
+                                      geometry.size.height * 0.46)
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 0) {
+                            topBar
+
+                            Spacer(minLength: 18)
+
                             TrackArtworkView(
                                 urlString: track.displayThumbnailURL,
-                                dimension: 300,
-                                cornerRadius: 24
+                                dimension: max(artSize, 200),
+                                cornerRadius: 10
                             )
+                            .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
 
-                            VStack(spacing: 6) {
-                                Text(track.title)
-                                    .font(.title2)
-                                    .fontWeight(.bold)
-                                    .multilineTextAlignment(.center)
-                                    .lineLimit(2)
-                                Text(track.artist)
-                                    .font(.title3)
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(1)
-                            }
+                            Spacer(minLength: 26)
 
-                            Text(player.statusMessage)
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
+                            titleRow(track: track)
+                                .padding(.horizontal, 28)
 
                             progressSlider
+                                .padding(.horizontal, 24)
+                                .padding(.top, 18)
 
                             primaryControls
+                                .padding(.top, 12)
 
-                            secondaryControls(track: track)
+                            bottomBar(track: track)
+                                .padding(.horizontal, 28)
+                                .padding(.top, 22)
 
                             lyricsCard
+                                .padding(.horizontal, 20)
+                                .padding(.top, 26)
 
-                        } else {
-                            VStack(spacing: 8) {
-                                Image(systemName: "music.note.list")
-                                    .font(.system(size: 44))
-                                    .foregroundColor(.secondary)
-                                Text("尚未開始播放")
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding(.top, 60)
+                            advancedSourceBlock
+                                .padding(.horizontal, 20)
+
+                            Color.clear.frame(height: 40)
                         }
-
-                        advancedSourceBlock
-                    }
-                    .padding(20)
-                }
-            }
-            .navigationTitle("正在播放")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button { dismiss() } label: {
-                        Image(systemName: "chevron.down")
+                        .frame(minHeight: geometry.size.height)
                     }
                 }
-            }
-            .fileImporter(
-                isPresented: $isImportPickerPresented,
-                allowedContentTypes: [.audio],
-                allowsMultipleSelection: true
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    player.importLocalAudioFiles(from: urls)
-                case .failure(let error):
-                    player.statusMessage = "匯入失敗：\(error.localizedDescription)"
+            } else {
+                VStack(spacing: 12) {
+                    topBar
+                    Spacer()
+                    Image(systemName: "music.note.list")
+                        .font(.system(size: 44))
+                        .foregroundColor(AppTheme.textSecondary)
+                    Text("尚未開始播放")
+                        .foregroundColor(AppTheme.textSecondary)
+                    Spacer()
                 }
-            }
-            .sheet(isPresented: $isAudioInfoPresented) {
-                AudioSourceInfoSheetView()
-                    .environmentObject(player)
-            }
-            .sheet(isPresented: $isQueuePresented) {
-                PlaybackQueueView()
-                    .environmentObject(player)
             }
         }
-        .navigationViewStyle(.stack)
+        .fileImporter(
+            isPresented: $isImportPickerPresented,
+            allowedContentTypes: [.audio],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls):
+                player.importLocalAudioFiles(from: urls)
+            case .failure(let error):
+                player.statusMessage = "匯入失敗：\(error.localizedDescription)"
+            }
+        }
+        .sheet(isPresented: $isAudioInfoPresented) {
+            AudioSourceInfoSheetView()
+                .environmentObject(player)
+        }
+        .sheet(isPresented: $isQueuePresented) {
+            PlaybackQueueView()
+                .environmentObject(player)
+        }
+    }
+
+    // MARK: - Chrome
+
+    private var topBar: some View {
+        HStack {
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(AppTheme.textPrimary)
+            }
+            Spacer()
+            Text("正在播放")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(AppTheme.textPrimary)
+                .textCase(.uppercase)
+            Spacer()
+            Button { isAudioInfoPresented = true } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(AppTheme.textPrimary)
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 14)
+    }
+
+    private func titleRow(track: AppTrack) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(track.title)
+                    .font(.system(size: 23, weight: .bold))
+                    .foregroundColor(AppTheme.textPrimary)
+                    .lineLimit(1)
+                Text(track.artist)
+                    .font(.system(size: 15))
+                    .foregroundColor(AppTheme.textSecondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Button {
+                player.toggleFavoriteForNowPlaying()
+            } label: {
+                Image(systemName: player.isFavorite(track)
+                      ? "checkmark.circle.fill" : "plus.circle")
+                    .font(.system(size: 24))
+                    .foregroundColor(player.isFavorite(track)
+                                     ? AppTheme.accent : AppTheme.textSecondary)
+            }
+        }
+    }
+
+    private func bottomBar(track _: AppTrack) -> some View {
+        HStack {
+            Button { player.seekBackward15() } label: {
+                Image(systemName: "gobackward.15")
+                    .font(.system(size: 17))
+                    .foregroundColor(AppTheme.textSecondary)
+            }
+            .padding(.trailing, 18)
+            Button { player.seekForward15() } label: {
+                Image(systemName: "goforward.15")
+                    .font(.system(size: 17))
+                    .foregroundColor(AppTheme.textSecondary)
+            }
+            Spacer()
+            Button { player.loadLyricsForCurrentTrack() } label: {
+                Image(systemName: "quote.bubble")
+                    .font(.system(size: 16))
+                    .foregroundColor(AppTheme.textSecondary)
+            }
+            .padding(.trailing, 18)
+            Button { isQueuePresented = true } label: {
+                Image(systemName: "list.bullet")
+                    .font(.system(size: 16))
+                    .foregroundColor(AppTheme.textSecondary)
+            }
+        }
     }
 
     // MARK: - 子區塊
 
     private var progressSlider: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             Slider(
                 value: Binding(
                     get: { player.sliderPosition },
                     set: { player.updateScrubbing(position: $0) }
                 ),
-                in: 0...max(player.duration, 1),
+                in: 0 ... max(player.duration, 1),
                 onEditingChanged: { editing in
-                    if editing { player.beginScrubbing() } else { player.endScrubbing() }
+                    if editing {
+                        player.beginScrubbing()
+                    } else {
+                        player.endScrubbing()
+                    }
                 }
             )
+            .tint(AppTheme.textPrimary)
+
             HStack {
                 Text(player.formattedTime(player.sliderPosition))
                 Spacer()
                 Text(player.formattedTime(player.duration))
             }
-            .font(.caption)
-            .foregroundColor(.secondary)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(AppTheme.textSecondary)
         }
     }
 
     private var primaryControls: some View {
-        HStack(spacing: 42) {
-            Button(action: player.playPrevious) {
+        HStack(spacing: 0) {
+            Button { player.toggleShuffle() } label: {
+                Image(systemName: "shuffle")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(player.isShuffleEnabled
+                                     ? AppTheme.accent : AppTheme.textSecondary)
+            }
+            .frame(maxWidth: .infinity)
+
+            Button { player.playPrevious() } label: {
                 Image(systemName: "backward.fill")
-                    .font(.system(size: 30, weight: .semibold))
+                    .font(.system(size: 30))
+                    .foregroundColor(AppTheme.textPrimary)
             }
-            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
 
-            Button(action: player.togglePlayback) {
-                Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 34, weight: .bold))
-                    .frame(width: 86, height: 86)
-                    .foregroundColor(.white)
-                    .background(Circle().fill(Color.accentColor))
+            Button { player.togglePlayback() } label: {
+                ZStack {
+                    Circle()
+                        .fill(AppTheme.textPrimary)
+                        .frame(width: 66, height: 66)
+                    Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 27))
+                        .foregroundColor(.black)
+                }
             }
-            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
 
-            Button(action: player.playNext) {
+            Button { player.playNext() } label: {
                 Image(systemName: "forward.fill")
-                    .font(.system(size: 30, weight: .semibold))
+                    .font(.system(size: 30))
+                    .foregroundColor(AppTheme.textPrimary)
             }
-            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+
+            Button { player.toggleRepeatMode() } label: {
+                Image(systemName: player.repeatMode.systemImageName)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(player.repeatMode.isEnabled
+                                     ? AppTheme.accent : AppTheme.textSecondary)
+            }
+            .frame(maxWidth: .infinity)
         }
-    }
-
-    private func secondaryControls(track: AppTrack) -> some View {
-        HStack(spacing: 22) {
-            Button {
-                isQueuePresented = true
-            } label: {
-                Image(systemName: "list.bullet")
-            }
-            .buttonStyle(.plain)
-
-            Button(action: player.seekBackward15) {
-                Image(systemName: "gobackward.15")
-            }
-            .buttonStyle(.plain)
-
-            Button(action: player.seekForward15) {
-                Image(systemName: "goforward.15")
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                player.toggleFavorite(track)
-            } label: {
-                Image(systemName: player.isFavorite(track) ? "heart.fill" : "heart")
-            }
-            .buttonStyle(.plain)
-
-            Button(action: player.loadLyricsForCurrentTrack) {
-                Image(systemName: "text.quote")
-            }
-            .buttonStyle(.plain)
-
-            Button {
-                isAudioInfoPresented = true
-            } label: {
-                Image(systemName: "info.circle")
-            }
-            .buttonStyle(.plain)
-        }
-        .font(.system(size: 22, weight: .medium))
+        .padding(.horizontal, 18)
     }
 
     private var lyricsCard: some View {
