@@ -2265,25 +2265,18 @@ enum AudioSessionConfigurator {
 #if os(iOS)
         do {
             let session = AVAudioSession.sharedInstance()
-            // `.allowBluetooth` opts the session into HFP, a mono voice profile.
-            // Requesting it on a playback-only session can drag a Bluetooth route
-            // down to call quality, so a music player wants A2DP + AirPlay only.
             // `.playback` is the category that explicitly ignores the Ring/
             // Silent switch and remains eligible for the `audio` background
-            // mode. Use the canonical overload here; route-sharing policy is
-            // not required for either behavior and failed on some sideloaded
-            // device/OS combinations.
-            let wantedOptions: AVAudioSession.CategoryOptions = [
-                .allowAirPlay,
-                .allowBluetoothA2DP,
-            ]
+            // mode. Playback already supports A2DP and AirPlay. iOS 27 rejects
+            // those route flags when they are explicitly combined with the
+            // playback-only MediaPlayback category (`AVAudioSessionErrorCodeBadParam`).
             if session.category != .playback
                 || session.mode != .default
-                || !session.categoryOptions.isSuperset(of: wantedOptions) {
+                || !session.categoryOptions.isEmpty {
                 try session.setCategory(
                     .playback,
                     mode: .default,
-                    options: wantedOptions
+                    options: []
                 )
             }
             try session.setActive(true, options: [])
