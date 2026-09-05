@@ -25,7 +25,8 @@ struct HomeItem: Identifiable, Equatable {
                 canonicalId: "yt:\(primaryId)",
                 title: title,
                 artist: subtitle ?? "Unknown",
-                thumbnailURL: thumbnailURL,
+                thumbnailURL: thumbnailURL
+                    ?? "https://i.ytimg.com/vi/\(primaryId)/hqdefault.jpg",
                 durationText: nil,
                 source: .youtube(videoId: primaryId)
             )

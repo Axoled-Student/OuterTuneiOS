@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct SearchView: View {
@@ -5,12 +6,26 @@ struct SearchView: View {
 
     var body: some View {
         NavigationView {
-            ZStack {
-                if player.searchResults.isEmpty && !player.isSearching {
-                    placeholder
-                } else {
-                    resultsList
+            VStack(spacing: 0) {
+                Picker("搜尋類型", selection: $player.searchScope) {
+                    ForEach(YouTubeMusicSearchScope.allCases) { scope in
+                        Text(scope.displayName).tag(scope)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+
+                Divider()
+
+                ZStack {
+                    if player.searchResults.isEmpty && !player.isSearching {
+                        placeholder
+                    } else {
+                        resultsList
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .navigationTitle("搜尋")
             .searchable(
@@ -20,6 +35,11 @@ struct SearchView: View {
             )
             .onChange(of: player.searchQuery) { _ in
                 player.scheduleAutocomplete()
+            }
+            .onChange(of: player.searchScope) { _ in
+                guard !player.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty else { return }
+                Task { await player.searchYouTube() }
             }
             .onSubmit(of: .search) {
                 Task { await player.searchYouTube() }
@@ -57,7 +77,9 @@ struct SearchView: View {
                     Image(systemName: "music.note.list")
                         .font(.system(size: 44))
                         .foregroundColor(.secondary)
-                    Text("輸入關鍵字以搜尋歌曲、專輯、歌手")
+                    Text(player.searchScope == .songs
+                         ? "輸入關鍵字以搜尋音樂"
+                         : "輸入關鍵字以搜尋音樂影片")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }

@@ -29,7 +29,7 @@ struct NowPlayingView: View {
                     VStack(spacing: 22) {
                         if let track = player.nowPlayingTrack {
                             TrackArtworkView(
-                                urlString: track.thumbnailURL,
+                                urlString: track.displayThumbnailURL,
                                 dimension: 300,
                                 cornerRadius: 24
                             )
@@ -271,7 +271,7 @@ struct PlaybackQueueView: View {
                         TrackRowView(
                             title: track.title,
                             subtitle: track.artist,
-                            thumbnailURL: track.thumbnailURL,
+                            thumbnailURL: track.displayThumbnailURL,
                             onTap: { player.playQueueItem(at: index) }
                         ) {
                             if player.currentQueueIndex == index {

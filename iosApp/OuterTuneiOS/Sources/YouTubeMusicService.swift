@@ -188,25 +188,21 @@ final class YouTubeMusicService {
         }
     }
 
-    func searchSongs(query: String) async throws -> [YouTubeSearchSong] {
-        let payload: [String: Any] = [
-            "context": [
-                "client": [
-                    "clientName": "WEB_REMIX",
-                    "clientVersion": "1.20250310.01.00",
-                    "hl": "en",
-                    "gl": "US"
-                ]
-            ],
-            "query": query
-        ]
+    func searchSongs(
+        query: String,
+        scope: YouTubeMusicSearchScope = .songs
+    ) async throws -> [YouTubeSearchSong] {
+        var payload = baseContext()
+        payload["query"] = query
+        payload["params"] = scope.apiParams
 
         let data = try await requestJSON(
             endpoint: "https://music.youtube.com/youtubei/v1/search",
             payload: payload,
-            clientName: "67",
-            clientVersion: "1.20250310.01.00",
-            userAgent: "Mozilla/5.0"
+            clientName: webRemixClientId,
+            clientVersion: webRemixClientVersion,
+            userAgent: webRemixUserAgent,
+            useLogin: true
         )
 
         guard
@@ -233,6 +229,7 @@ final class YouTubeMusicService {
             let artist = extractArtistName(from: renderer, subtitleParts: subtitleParts)
             let duration = subtitleParts.reversed().first(where: { isDurationToken($0) })
             let thumbnail = extractThumbnailURL(from: renderer)
+                ?? fallbackThumbnailURL(videoId: videoId)
 
             songs.append(
                 YouTubeSearchSong(
@@ -255,54 +252,36 @@ final class YouTubeMusicService {
             return []
         }
 
-        var components = URLComponents(string: "https://suggestqueries.google.com/complete/search")
-        components?.queryItems = [
-            URLQueryItem(name: "client", value: "firefox"),
-            URLQueryItem(name: "ds", value: "yt"),
-            URLQueryItem(name: "hl", value: "zh-TW"),
-            URLQueryItem(name: "q", value: normalizedQuery)
-        ]
-
-        guard let url = components?.url else {
-            throw YouTubeMusicServiceError.invalidResponse
-        }
-
-        var request = URLRequest(url: url)
-        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
-            throw YouTubeMusicServiceError.invalidResponse
-        }
+        var requestPayload = baseContext()
+        requestPayload["input"] = normalizedQuery
+        let data = try await requestJSON(
+            endpoint: "https://music.youtube.com/youtubei/v1/music/get_search_suggestions",
+            payload: requestPayload,
+            clientName: webRemixClientId,
+            clientVersion: webRemixClientVersion,
+            userAgent: webRemixUserAgent,
+            useLogin: true
+        )
 
         guard
-            let payload = try JSONSerialization.jsonObject(with: data) as? [Any],
-            payload.count > 1,
-            let rawSuggestions = payload[1] as? [Any]
+            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             return []
         }
 
         var suggestions: [String] = []
-        for entry in rawSuggestions {
-            if let suggestion = entry as? String {
-                let normalized = suggestion.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !normalized.isEmpty,
-                   normalized.caseInsensitiveCompare(normalizedQuery) != .orderedSame,
-                   !suggestions.contains(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) {
-                    suggestions.append(normalized)
-                }
+        let renderers = collectDictionaries(forKey: "searchSuggestionRenderer", in: object)
+        for renderer in renderers {
+            guard let suggestion = firstRunText(in: renderer["suggestion"]) else {
                 continue
             }
-
-            if let nested = entry as? [Any],
-               let first = nested.first as? String {
-                let normalized = first.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !normalized.isEmpty,
-                   normalized.caseInsensitiveCompare(normalizedQuery) != .orderedSame,
-                   !suggestions.contains(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) {
-                    suggestions.append(normalized)
-                }
+            let normalized = suggestion.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty,
+               normalized.caseInsensitiveCompare(normalizedQuery) != .orderedSame,
+               !suggestions.contains(where: {
+                   $0.caseInsensitiveCompare(normalized) == .orderedSame
+               }) {
+                suggestions.append(normalized)
             }
         }
 
@@ -814,16 +793,53 @@ final class YouTubeMusicService {
     }
 
     private func extractThumbnailURL(from renderer: [String: Any]) -> String? {
-        guard
-            let thumbnail = renderer["thumbnail"] as? [String: Any],
-            let musicThumb = thumbnail["musicThumbnailRenderer"] as? [String: Any],
-            let container = musicThumb["thumbnail"] as? [String: Any],
-            let thumbs = container["thumbnails"] as? [[String: Any]]
-        else {
+        guard let thumbnailNode = renderer["thumbnail"],
+              let thumbs = firstThumbnailList(in: thumbnailNode),
+              let best = thumbs.max(by: { thumbnailArea($0) < thumbnailArea($1) }),
+              let rawURL = best["url"] as? String else {
             return nil
         }
 
-        return thumbs.last?["url"] as? String
+        if rawURL.hasPrefix("//") {
+            return "https:" + rawURL
+        }
+        if rawURL.hasPrefix("http://") {
+            return "https://" + String(rawURL.dropFirst("http://".count))
+        }
+        return rawURL
+    }
+
+    /// Search rows wrap thumbnails in `musicThumbnailRenderer`, while radio
+    /// rows expose `thumbnail.thumbnails` directly. Traverse only the renderer's
+    /// thumbnail node so both official response shapes are handled without
+    /// accidentally picking an unrelated image elsewhere in the response.
+    private func firstThumbnailList(in object: Any) -> [[String: Any]]? {
+        if let dictionary = object as? [String: Any] {
+            if let thumbnails = dictionary["thumbnails"] as? [[String: Any]],
+               !thumbnails.isEmpty {
+                return thumbnails
+            }
+            for value in dictionary.values {
+                if let thumbnails = firstThumbnailList(in: value) {
+                    return thumbnails
+                }
+            }
+        } else if let array = object as? [Any] {
+            for value in array {
+                if let thumbnails = firstThumbnailList(in: value) {
+                    return thumbnails
+                }
+            }
+        }
+        return nil
+    }
+
+    private func thumbnailArea(_ thumbnail: [String: Any]) -> Int {
+        (thumbnail["width"] as? Int ?? 0) * (thumbnail["height"] as? Int ?? 0)
+    }
+
+    private func fallbackThumbnailURL(videoId: String) -> String {
+        "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg"
     }
 
     private func collectDictionaries(forKey key: String, in object: Any) -> [[String: Any]] {
@@ -1450,60 +1466,140 @@ extension YouTubeMusicService {
     /// entry already has a playable videoId, so nothing downstream has to
     /// guess or resolve a title back into an id.
     func fetchRadioQueue(videoId: String, limit: Int = 40) async throws -> [YouTubeSearchSong] {
-        // requestJSON expects callers to supply the InnerTube context. The old
-        // payload omitted it, so /next returned no usable radio rows in-app
-        // even though the same endpoint produced a full queue in live tests.
-        var payload = baseContext()
-        payload["videoId"] = videoId
-        payload["playlistId"] = "RDAMVM" + videoId
-        payload["isAudioOnly"] = true
-        payload["params"] = "wAEB"
-
-        let data = try await requestJSON(
-            endpoint: "https://music.youtube.com/youtubei/v1/next",
-            payload: payload,
-            clientName: webRemixClientId,
-            clientVersion: webRemixClientVersion,
-            userAgent: webRemixUserAgent,
-            useLogin: true,
-            loginSupported: true
-        )
-
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return []
-        }
-
-        let renderers = collectDictionaries(forKey: "playlistPanelVideoRenderer", in: object)
         var seen = Set<String>()
+        var seenContinuations = Set<String>()
         var songs: [YouTubeSearchSong] = []
+        var continuation: String?
+        var page = 0
 
-        for renderer in renderers {
-            guard let id = renderer["videoId"] as? String, !id.isEmpty else { continue }
-            guard id != videoId, seen.insert(id).inserted else { continue }
-
-            var title = extractTitle(from: renderer)
-            if title.isEmpty {
-                title = firstText(in: renderer["title"]) ?? ""
+        repeat {
+            var payload = baseContext()
+            if let continuation {
+                payload["continuation"] = continuation
+            } else {
+                // requestJSON expects callers to supply the InnerTube context.
+                payload["videoId"] = videoId
+                payload["playlistId"] = "RDAMVM" + videoId
+                payload["isAudioOnly"] = true
+                payload["params"] = "wAEB"
             }
-            guard !title.isEmpty else { continue }
 
-            let byline = firstText(in: renderer["longBylineText"])
-                ?? firstText(in: renderer["shortBylineText"])
-
-            songs.append(
-                YouTubeSearchSong(
-                    videoId: id,
-                    title: title,
-                    artist: byline ?? "Unknown",
-                    thumbnailURL: extractThumbnailURL(from: renderer),
-                    durationText: firstText(in: renderer["lengthText"])
-                )
+            let data = try await requestJSON(
+                endpoint: "https://music.youtube.com/youtubei/v1/next",
+                payload: payload,
+                clientName: webRemixClientId,
+                clientVersion: webRemixClientVersion,
+                userAgent: webRemixUserAgent,
+                useLogin: true,
+                loginSupported: true
             )
 
-            if songs.count >= limit { break }
+            guard let object = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any] else {
+                break
+            }
+
+            let renderers = collectDictionaries(
+                forKey: "playlistPanelVideoRenderer",
+                in: object
+            )
+
+            for renderer in renderers {
+                guard let id = renderer["videoId"] as? String, !id.isEmpty else { continue }
+                guard id != videoId, seen.insert(id).inserted else { continue }
+
+                var title = extractTitle(from: renderer)
+                if title.isEmpty {
+                    title = firstText(in: renderer["title"]) ?? ""
+                }
+                guard !title.isEmpty else { continue }
+
+                let artist = playlistArtist(from: renderer) ?? "Unknown"
+
+                songs.append(
+                    YouTubeSearchSong(
+                        videoId: id,
+                        title: title,
+                        artist: artist,
+                        thumbnailURL: extractThumbnailURL(from: renderer)
+                            ?? fallbackThumbnailURL(videoId: id),
+                        durationText: firstText(in: renderer["lengthText"])
+                    )
+                )
+
+                if songs.count >= limit { break }
+            }
+
+            guard songs.count < limit, page < 2,
+                  let token = collectDictionaries(
+                      forKey: "nextRadioContinuationData",
+                      in: object
+                  ).compactMap({ $0["continuation"] as? String }).first,
+                  seenContinuations.insert(token).inserted else {
+                break
+            }
+            continuation = token
+            page += 1
+        } while !Task.isCancelled
+
+        return Array(songs.prefix(limit))
+    }
+
+    /// A playlist byline contains artist, album, view count and year runs.
+    /// Keep only runs explicitly linked to an artist; falling back to the first
+    /// text run is still safer than joining all metadata into the artist label.
+    private func playlistArtist(from renderer: [String: Any]) -> String? {
+        for key in ["longBylineText", "shortBylineText"] {
+            guard let node = renderer[key] as? [String: Any],
+                  let runs = node["runs"] as? [[String: Any]] else {
+                continue
+            }
+
+            var artists: [String] = []
+            for run in runs where isArtistRun(run) {
+                guard let text = normalizedRunText(run),
+                      !artists.contains(where: {
+                          $0.caseInsensitiveCompare(text) == .orderedSame
+                      }) else {
+                    continue
+                }
+                artists.append(text)
+            }
+            if !artists.isEmpty {
+                return artists.joined(separator: " & ")
+            }
+
+            if let fallback = runs.compactMap(normalizedRunText).first(where: {
+                !isMetadataArtistToken($0)
+            }) {
+                return fallback
+            }
+        }
+        return nil
+    }
+
+    private func isArtistRun(_ run: [String: Any]) -> Bool {
+        guard
+            let navigation = run["navigationEndpoint"] as? [String: Any],
+            let browse = navigation["browseEndpoint"] as? [String: Any]
+        else {
+            return false
         }
 
-        return songs
+        if let configs = browse["browseEndpointContextSupportedConfigs"] as? [String: Any],
+           let musicConfig = configs["browseEndpointContextMusicConfig"] as? [String: Any],
+           musicConfig["pageType"] as? String == "MUSIC_PAGE_TYPE_ARTIST" {
+            return true
+        }
+
+        return (browse["browseId"] as? String)?.hasPrefix("UC") == true
+    }
+
+    private func normalizedRunText(_ run: [String: Any]) -> String? {
+        guard let value = run["text"] as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "•", trimmed != "·" else { return nil }
+        return trimmed
     }
 
     /// First `text` run inside a `{ runs: [...] }` / `{ simpleText: }` node.

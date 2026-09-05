@@ -11,7 +11,7 @@ struct MiniPlayerBarView: View {
                     Button(action: onExpand) {
                         HStack(spacing: 10) {
                             TrackArtworkView(
-                                urlString: track.thumbnailURL,
+                                urlString: track.displayThumbnailURL,
                                 dimension: 42,
                                 cornerRadius: 8
                             )

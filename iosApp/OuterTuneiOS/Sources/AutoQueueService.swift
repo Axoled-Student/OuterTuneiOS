@@ -110,7 +110,8 @@ final class AutoQueueService {
     private let spotify = SpotifyService.shared
     private let ranker = AIRankingService.shared
 
-    /// Tracks handed out recently, so successive extensions do not loop.
+    /// Normalized titles handed out recently, so alternate uploads with a new
+    /// videoId cannot make the same song reappear in successive extensions.
     private var recentlySuggested: [String] = []
     private let recentMemoryLimit = 300
     private var listeningRecords: [String: LocalListeningRecord] = [:]
@@ -122,6 +123,17 @@ final class AutoQueueService {
     /// retained for diagnostics and future scoring, but is not a hard ban.
     private let suggestedCooldownCount = 30
     private let playedCooldownCount = 15
+    private var spotifyCandidateFingerprint = ""
+    private var cachedSpotifyCandidates: [AppTrack] = []
+    private var spotifyArtistAliasFingerprint = ""
+    private var cachedSpotifyArtistAliasWeights: [String: Double] = [:]
+
+    private enum QueueLanguage: Equatable {
+        case chinese
+        case japanese
+        case korean
+        case other
+    }
 
     private init() {
         if let data = UserDefaults.standard.data(forKey: listeningRecordsKey),
@@ -209,51 +221,93 @@ final class AutoQueueService {
 
     func recommendations(
         seed: AppTrack,
-        excluding: Set<String>,
+        excluding: [AppTrack],
         limit: Int
     ) async -> [AppTrack] {
-        var blocked = excluding
-        blocked.insert(seed.stableId)
-        for id in recentlySuggested.suffix(suggestedCooldownCount) {
-            blocked.insert(id)
-        }
-        for id in recentlyPlayedTrackIds(limit: playedCooldownCount) {
-            blocked.insert(id)
-        }
-        // Repeated early skips are a strong dislike signal, not mere novelty.
-        for (id, record) in listeningRecords
-            where record.skips >= 2 && record.skips > record.completions {
-            blocked.insert(id)
-        }
-
-        var pool = await generateCandidates(seed: seed)
-        guard !Task.isCancelled else { return [] }
-        pool = pool.filter { !blocked.contains($0.stableId) }
-        pool = dedupe(pool)
-
-        guard !pool.isEmpty else { return [] }
-
-        // Refresh the taste profile opportunistically; a stale one still works.
+        // Refresh first so candidate generation and scoring use the same live
+        // Spotify top/recent/saved snapshot instead of a stale profile.
         if spotify.isAuthenticated {
             await spotify.refreshTasteProfile()
         }
         guard !Task.isCancelled else { return [] }
 
+        var blocked = Set(excluding.map(\.stableId))
+        var blockedIdentities = Set(excluding.map(\.recommendationIdentity))
+        blocked.insert(seed.stableId)
+        blockedIdentities.insert(seed.recommendationIdentity)
+        for identity in recentlySuggested.suffix(suggestedCooldownCount) {
+            blockedIdentities.insert(identity)
+        }
+        for track in recentlyPlayedTracks(limit: playedCooldownCount) {
+            blocked.insert(track.stableId)
+            blockedIdentities.insert(track.recommendationIdentity)
+        }
+        for recent in spotify.profile.recentlyPlayed.prefix(40) {
+            let identity = AppTrack.normalizedRecommendationTitle(recent.name)
+            if !identity.isEmpty {
+                blockedIdentities.insert(identity)
+            }
+        }
+        // Repeated early skips are a strong dislike signal, not mere novelty.
+        for (id, record) in listeningRecords
+            where record.skips >= 2 && record.skips > record.completions {
+            blocked.insert(id)
+            blockedIdentities.insert(record.track.recommendationIdentity)
+        }
+
+        let generated = await generateCandidates(seed: seed, limit: limit)
+        var pool = generated.tracks
+        guard !Task.isCancelled else { return [] }
+        if preferredQueueLanguage(seed: seed, candidates: pool) == .chinese {
+            pool = pool.filter { trackLanguage($0) == .chinese }
+        }
+        pool = pool.filter {
+            !blocked.contains($0.stableId)
+                && !blockedIdentities.contains($0.recommendationIdentity)
+        }
+        pool = dedupe(pool)
+
+        guard !pool.isEmpty else { return [] }
+
+        // Spotify commonly names CJK artists in Latin script while YouTube
+        // Music uses the native name (Jay Chou vs 周杰倫, JJ Lin vs 林俊傑).
+        // Resolve and cache those aliases before familiarity scoring.
+        await refreshSpotifyArtistAliases()
+        guard !Task.isCancelled else { return [] }
+
         // Ground the shortlist in actual local listens/skips before asking an
         // optional LLM to sequence it.
+        let candidateLimit = generated.isCoherentSeedRadio
+            ? limit
+            : min(pool.count, 40)
         let locallyOrdered = scoredBlend(
             pool: pool,
             taste: spotify.profile,
-            limit: min(pool.count, 60)
+            limit: candidateLimit,
+            preserveSourceOrder: generated.isCoherentSeedRadio,
+            seed: seed
         )
 
         let ordered: [AppTrack]
-        if let ranked = await ranker.rank(candidates: locallyOrdered,
-                                          nowPlaying: seed,
-                                          taste: spotify.profile,
-                                          localFeedback: feedbackSummary(),
-                                          limit: limit) {
-            ordered = ranked
+        if generated.isCoherentSeedRadio {
+            // YouTube Music has already produced a radio tied to the selected
+            // song. Keep that relevance signal dominant; completed/skipped
+            // history still makes small local adjustments in scoredBlend.
+            ordered = Array(locallyOrdered.prefix(limit))
+        } else if let ranked = await ranker.rank(candidates: locallyOrdered,
+                                                 nowPlaying: seed,
+                                                 taste: spotify.profile,
+                                                 localFeedback: feedbackSummary(),
+                                                 limit: limit) {
+            // Treat model output as one signal, then re-apply the hard repeat,
+            // familiarity, variant and artist-diversity policy.
+            ordered = scoredBlend(
+                pool: ranked,
+                taste: spotify.profile,
+                limit: limit,
+                preserveSourceOrder: true,
+                seed: seed
+            )
         } else {
             ordered = Array(locallyOrdered.prefix(limit))
         }
@@ -265,13 +319,16 @@ final class AutoQueueService {
 
     // MARK: Stage 1 - candidates
 
-    private func generateCandidates(seed: AppTrack) async -> [AppTrack] {
+    private func generateCandidates(
+        seed: AppTrack,
+        limit: Int
+    ) async -> (tracks: [AppTrack], isCoherentSeedRadio: Bool) {
         var pool: [AppTrack] = []
 
         // YouTube Music radio for the seed. This is the reliable backbone.
         if case .youtube(let videoId) = seed.source {
             if let radio = try? await youtubeService.fetchRadioQueue(videoId: videoId,
-                                                                     limit: 40) {
+                                                                     limit: 80) {
                 pool.append(contentsOf: radio.map { $0.asTrack() })
             }
         }
@@ -283,16 +340,38 @@ final class AutoQueueService {
             if let found = try? await youtubeService.searchSongs(query: query),
                let first = found.first,
                let radio = try? await youtubeService.fetchRadioQueue(videoId: first.videoId,
-                                                                     limit: 40) {
+                                                                     limit: 80) {
                 pool.append(contentsOf: radio.map { $0.asTrack() })
             }
         }
 
-        pool.append(contentsOf: await spotifyDerivedCandidates())
+        pool = dedupe(pool)
+        if pool.count >= max(limit, 12) {
+            return (pool, true)
+        }
+
+        // Only a sparse/failed radio is enriched with direct favourites. For a
+        // healthy radio, Spotify remains a ranking signal so a Jay Chou seed
+        // cannot jump into unrelated favourites merely because they are known.
+        pool.append(contentsOf: localFavoriteCandidates(limit: 12))
+        pool.append(contentsOf: await spotifyDerivedCandidates(limit: 16))
         pool.append(contentsOf: await listeningHistoryDerivedCandidates())
         pool.append(contentsOf: await similarityDerivedCandidates(seed: seed))
 
-        return pool
+        return (dedupe(pool), false)
+    }
+
+    private func localFavoriteCandidates(limit: Int) -> [AppTrack] {
+        listeningRecords.values
+            .filter { $0.preferenceScore > 0.25 }
+            .sorted {
+                if $0.preferenceScore == $1.preferenceScore {
+                    return $0.lastPlayedAt > $1.lastPlayedAt
+                }
+                return $0.preferenceScore > $1.preferenceScore
+            }
+            .prefix(limit)
+            .map(\.track)
     }
 
     /// Generate candidates from tracks the listener actually completed or
@@ -330,32 +409,89 @@ final class AutoQueueService {
     }
 
     /// Turns the Spotify taste profile into YouTube Music tracks.
-    private func spotifyDerivedCandidates() async -> [AppTrack] {
+    private func spotifyDerivedCandidates(limit: Int) async -> [AppTrack] {
         guard spotify.isAuthenticated else { return [] }
 
-        let seeds = spotify.profile.weightedTracks.prefix(6).map(\.track)
+        let recentIds = Set(spotify.profile.recentlyPlayed.map(\.id))
+        let seeds = spotify.profile.weightedTracks
+            .map(\.track)
+            .filter { !recentIds.contains($0.id) }
+            .prefix(limit)
         guard !seeds.isEmpty else { return [] }
 
-        return await withTaskGroup(of: AppTrack?.self) { group in
-            for seed in seeds {
+        let fingerprint = seeds.map(\.id).joined(separator: "|")
+        if fingerprint == spotifyCandidateFingerprint,
+           !cachedSpotifyCandidates.isEmpty {
+            return cachedSpotifyCandidates
+        }
+
+        let found = await withTaskGroup(of: (Int, AppTrack?).self) { group in
+            for (index, seed) in seeds.enumerated() {
                 group.addTask { [youtubeService] in
                     guard
                         let results = try? await youtubeService.searchSongs(
                             query: seed.searchQuery),
                         let first = results.first
                     else {
-                        return nil
+                        return (index, nil)
                     }
-                    return first.asTrack()
+                    return (index, first.asTrack())
                 }
             }
 
-            var found: [AppTrack] = []
-            for await track in group {
-                if let track { found.append(track) }
+            var indexed: [(Int, AppTrack)] = []
+            for await (index, track) in group {
+                if let track { indexed.append((index, track)) }
             }
-            return found
+            return indexed.sorted { $0.0 < $1.0 }.map(\.1)
         }
+
+        spotifyCandidateFingerprint = fingerprint
+        cachedSpotifyCandidates = found
+        return found
+    }
+
+    private func refreshSpotifyArtistAliases(limit: Int = 16) async {
+        guard spotify.isAuthenticated else {
+            cachedSpotifyArtistAliasWeights = [:]
+            spotifyArtistAliasFingerprint = ""
+            return
+        }
+
+        let artists = Array(spotify.profile.weightedArtists.prefix(limit))
+        let fingerprint = artists.map(\.artist.id).joined(separator: "|")
+        guard !fingerprint.isEmpty,
+              fingerprint != spotifyArtistAliasFingerprint else {
+            return
+        }
+
+        let resolved = await withTaskGroup(of: (String, Double)?.self) { group in
+            for (artist, weight) in artists {
+                group.addTask { [youtubeService] in
+                    guard let results = try? await youtubeService.searchSongs(
+                        query: artist.name
+                    ), let result = results.first else {
+                        return nil
+                    }
+                    return (result.artist, weight)
+                }
+            }
+
+            var values: [(String, Double)] = []
+            for await value in group {
+                if let value { values.append(value) }
+            }
+            return values
+        }
+
+        var aliases: [String: Double] = [:]
+        for (artist, weight) in resolved {
+            let key = normalizedArtistName(artist)
+            guard !key.isEmpty, key != normalizedArtistName("Unknown") else { continue }
+            aliases[key] = max(aliases[key] ?? 0, weight)
+        }
+        cachedSpotifyArtistAliasWeights = aliases
+        spotifyArtistAliasFingerprint = fingerprint
     }
 
     /// Deezer similarity, anchored on the strongest taste artist available.
@@ -398,44 +534,112 @@ final class AutoQueueService {
     private func scoredBlend(
         pool: [AppTrack],
         taste: SpotifyTasteProfile,
-        limit: Int
+        limit: Int,
+        preserveSourceOrder: Bool,
+        seed: AppTrack
     ) -> [AppTrack] {
         var artistWeights: [String: Double] = [:]
         for (artist, weight) in taste.weightedArtists {
-            artistWeights[artist.name.lowercased()] = weight
+            let key = normalizedArtistName(artist.name)
+            guard !key.isEmpty else { continue }
+            artistWeights[key] = max(artistWeights[key] ?? 0, weight)
         }
         for (track, weight) in taste.weightedTracks {
-            let key = track.artistName.lowercased()
+            let key = normalizedArtistName(track.artistName)
+            guard !key.isEmpty else { continue }
             artistWeights[key] = max(artistWeights[key] ?? 0, weight * 0.8)
         }
+        for (alias, weight) in cachedSpotifyArtistAliasWeights {
+            artistWeights[alias] = max(artistWeights[alias] ?? 0, weight)
+        }
 
-        let scored = pool.enumerated().map { index, track -> (AppTrack, Double) in
-            // Radio order is meaningful, so position is the base score.
-            var score = 1.0 / (1.0 + Double(index) * 0.05)
-            let artistKey = track.artist.lowercased()
-            if let weight = artistWeights[artistKey] {
-                score += weight
-            } else if artistWeights.keys.contains(where: { artistKey.contains($0) }) {
-                score += 0.3
+        let knownTrackKeys = Set(taste.weightedTracks.map {
+            normalizedTrackKey(title: $0.track.name, artist: $0.track.artistName)
+        })
+        let seedArtist = normalizedArtistName(seed.artist)
+        let hasTasteSignals = !taste.isEmpty
+            || listeningRecords.values.contains(where: { $0.preferenceScore > 0.25 })
+
+        let scored: [(track: AppTrack, score: Double, familiar: Bool)] = pool.enumerated()
+            .compactMap { index, track in
+            let artistKey = normalizedArtistName(track.artist)
+            let tasteWeight = tasteArtistWeight(for: artistKey, weights: artistWeights)
+            let localAffinity = localArtistAffinity(for: artistKey)
+            let isSeedArtist = !seedArtist.isEmpty && artistKey == seedArtist
+            let isKnownTrack = knownTrackKeys.contains(
+                normalizedTrackKey(title: track.title, artist: track.artist)
+            )
+            let isFamiliar = !hasTasteSignals || isSeedArtist || isKnownTrack
+                || tasteWeight > 0 || localAffinity > 0.15
+
+            // Do not let low-quality alternate uploads crowd out an available
+            // official/familiar recording. A variant the listener actually has
+            // in Spotify remains eligible through isKnownTrack.
+            if isUndesiredVariant(track), !isKnownTrack {
+                return nil
             }
-            score += localArtistAffinity(for: artistKey)
+
+            // Source radio position remains a relevance signal, but unlike the
+            // old linear score it cannot bury every Spotify-known artist merely
+            // because those reference tracks were appended after the radio.
+            var score = preserveSourceOrder
+                ? 4.0 / (1.0 + Double(index) * 0.08)
+                : 1.0 / (1.0 + Double(index) * 0.05)
+            score += min(tasteWeight, 3.0) * 2.4
+            score += localAffinity * 1.4
+            if isSeedArtist { score += 2.5 }
+            if isKnownTrack { score += 3.0 }
+            if hasTasteSignals, !isFamiliar { score -= 2.5 }
             if let local = listeningRecords[track.stableId] {
                 score += max(-3.0, min(local.preferenceScore, 3.0))
             }
-            return (track, score)
+            return (track: track, score: score, familiar: isFamiliar)
         }
 
-        var seenArtists: [String: Int] = [:]
+        let ranked = scored.sorted { $0.score > $1.score }
+        var familiar = ranked.filter { $0.familiar }
+        var discovery = ranked.filter { !$0.familiar }
         var result: [AppTrack] = []
+        var artistCounts: [String: Int] = [:]
 
-        for (track, _) in scored.sorted(by: { $0.1 > $1.1 }) {
-            // Avoid stacking one artist back to back.
-            let key = track.artist.lowercased()
-            let count = seenArtists[key] ?? 0
-            if count >= 2 { continue }
-            seenArtists[key] = count + 1
-            result.append(track)
-            if result.count >= limit { break }
+        func appendBest(from candidates: inout [(track: AppTrack, score: Double, familiar: Bool)],
+                        upTo maximum: Int) {
+            while !candidates.isEmpty, result.count < maximum {
+                let previousArtist = result.last.map { normalizedArtistName($0.artist) }
+                let preferred = candidates.firstIndex { candidate in
+                    let artist = normalizedArtistName(candidate.track.artist)
+                    let artistLimit = artist == seedArtist ? 5 : 3
+                    return (artistCounts[artist] ?? 0) < artistLimit
+                        && (previousArtist == nil || artist != previousArtist)
+                }
+                let fallback = candidates.firstIndex { candidate in
+                    let artist = normalizedArtistName(candidate.track.artist)
+                    let artistLimit = artist == seedArtist ? 5 : 3
+                    return (artistCounts[artist] ?? 0) < artistLimit
+                }
+                guard let nextIndex = preferred ?? fallback else { break }
+                let candidate = candidates.remove(at: nextIndex)
+                let artist = normalizedArtistName(candidate.track.artist)
+                artistCounts[artist, default: 0] += 1
+                result.append(candidate.track)
+            }
+        }
+
+        // Keep batches compact enough to rotate when the same seed is chosen
+        // again. Reserve a few slots for contextual discovery instead of
+        // exhausting every familiar candidate in the first generation.
+        let targetCount = min(limit, 12)
+        let reservedDiscovery = hasTasteSignals ? min(3, targetCount / 4) : 0
+        let familiarTarget = targetCount - reservedDiscovery
+        appendBest(from: &familiar, upTo: familiarTarget)
+        if result.count < targetCount {
+            let discoveryAllowance = hasTasteSignals
+                ? min(max(2, targetCount - result.count), 4)
+                : targetCount
+            appendBest(
+                from: &discovery,
+                upTo: min(targetCount, result.count + discoveryAllowance)
+            )
         }
 
         return result
@@ -444,18 +648,25 @@ final class AutoQueueService {
     // MARK: Helpers
 
     private func dedupe(_ tracks: [AppTrack]) -> [AppTrack] {
-        var seen = Set<String>()
+        var seenIds = Set<String>()
+        var seenIdentities = Set<String>()
         var result: [AppTrack] = []
-        for track in tracks where seen.insert(track.stableId).inserted {
+        for track in tracks {
+            guard !seenIds.contains(track.stableId),
+                  !seenIdentities.contains(track.recommendationIdentity) else {
+                continue
+            }
+            seenIds.insert(track.stableId)
+            seenIdentities.insert(track.recommendationIdentity)
             result.append(track)
         }
         return result
     }
 
     private func remember(_ tracks: [AppTrack]) {
-        for id in tracks.map(\.stableId) {
-            recentlySuggested.removeAll { $0 == id }
-            recentlySuggested.append(id)
+        for identity in tracks.map(\.recommendationIdentity) {
+            recentlySuggested.removeAll { $0 == identity }
+            recentlySuggested.append(identity)
         }
         if recentlySuggested.count > recentMemoryLimit {
             recentlySuggested.removeFirst(recentlySuggested.count - recentMemoryLimit)
@@ -465,18 +676,97 @@ final class AutoQueueService {
         }
     }
 
-    private func recentlyPlayedTrackIds(limit: Int) -> [String] {
+    private func recentlyPlayedTracks(limit: Int) -> [AppTrack] {
         listeningRecords
             .sorted { $0.value.lastPlayedAt > $1.value.lastPlayedAt }
             .prefix(limit)
-            .map(\.key)
+            .map(\.value.track)
+    }
+
+    private func normalizedArtistName(_ value: String) -> String {
+        let folded = value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        return folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .joined()
+    }
+
+    private func preferredQueueLanguage(
+        seed: AppTrack,
+        candidates: [AppTrack]
+    ) -> QueueLanguage {
+        let seedLanguage = trackLanguage(seed)
+        if seedLanguage == .chinese {
+            return .chinese
+        }
+
+        let sample = candidates.prefix(30).map { recommendationLanguage(for: $0.title) }
+        let chineseCount = sample.filter { $0 == .chinese }.count
+        let explicitCount = sample.filter { $0 != .other }.count
+        if chineseCount >= 5, chineseCount * 2 >= max(explicitCount, 1) {
+            return .chinese
+        }
+        return seedLanguage
+    }
+
+    private func trackLanguage(_ track: AppTrack) -> QueueLanguage {
+        recommendationLanguage(for: "\(track.title) \(track.artist)")
+    }
+
+    private func recommendationLanguage(for text: String) -> QueueLanguage {
+        var hasHan = false
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x3040 ... 0x30FF:
+                return .japanese
+            case 0xAC00 ... 0xD7AF:
+                return .korean
+            case 0x3400 ... 0x4DBF, 0x4E00 ... 0x9FFF:
+                hasHan = true
+            default:
+                continue
+            }
+        }
+        return hasHan ? .chinese : .other
+    }
+
+    private func normalizedTrackKey(title: String, artist: String) -> String {
+        normalizedArtistName(artist) + "|" + AppTrack.normalizedRecommendationTitle(title)
+    }
+
+    private func tasteArtistWeight(
+        for artist: String,
+        weights: [String: Double]
+    ) -> Double {
+        guard !artist.isEmpty else { return 0 }
+        if let exact = weights[artist] { return exact }
+        return weights.compactMap { candidate, weight in
+            guard candidate.count >= 2,
+                  artist.contains(candidate) || candidate.contains(artist) else {
+                return nil
+            }
+            return weight * 0.8
+        }.max() ?? 0
+    }
+
+    private func isUndesiredVariant(_ track: AppTrack) -> Bool {
+        let normalized = normalizedArtistName(track.title)
+        let markers = [
+            "cover", "coveredby", "karaoke", "instrumental", "acoustic",
+            "spedup", "slowed", "nightcore", "remix", "tvsize", "テレビサイズ",
+            "翻唱", "伴奏", "純音樂", "纯音乐", "カバー", "歌ってみた"
+        ]
+        return markers.contains { normalized.contains($0) }
     }
 
     private func localArtistAffinity(for normalizedArtist: String) -> Double {
         guard !normalizedArtist.isEmpty else { return 0 }
         var score = 0.0
         for record in listeningRecords.values {
-            let candidate = record.track.artist.lowercased()
+            let candidate = normalizedArtistName(record.track.artist)
+            guard !candidate.isEmpty else { continue }
             guard candidate == normalizedArtist
                     || candidate.contains(normalizedArtist)
                     || normalizedArtist.contains(candidate) else { continue }

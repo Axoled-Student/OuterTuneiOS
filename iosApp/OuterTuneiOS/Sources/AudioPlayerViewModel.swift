@@ -11,6 +11,7 @@ import UIKit
 final class AudioPlayerViewModel: ObservableObject {
     @Published var streamURL: String = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
     @Published var searchQuery: String = ""
+    @Published var searchScope: YouTubeMusicSearchScope = .songs
     @Published var searchResults: [YouTubeSearchSong] = []
     @Published var autocompleteSuggestions: [String] = []
     @Published var isLoadingAutocomplete: Bool = false
@@ -132,6 +133,7 @@ final class AudioPlayerViewModel: ObservableObject {
     private var playbackCandidateIndex: Int = 0
     private var activePlaybackTrackStableId: String?
     private var autocompleteTask: Task<Void, Never>?
+    private var activeSearchGeneration: UUID?
 
     private var hasConfiguredRemoteCommands: Bool = false
     private var nowPlayingArtworkSourceURL: String?
@@ -326,20 +328,38 @@ final class AudioPlayerViewModel: ObservableObject {
     func searchYouTube() async {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
+            activeSearchGeneration = nil
             searchResults = []
+            isSearching = false
             return
         }
 
+        let scope = searchScope
+        let generation = UUID()
+        activeSearchGeneration = generation
         saveSearchHistoryQuery(query)
         autocompleteSuggestions = []
+        searchResults = []
 
         isSearching = true
-        defer { isSearching = false }
+        defer {
+            if activeSearchGeneration == generation {
+                activeSearchGeneration = nil
+                isSearching = false
+            }
+        }
 
         do {
-            searchResults = try await youtubeService.searchSongs(query: query)
-            statusMessage = "搜尋完成：\(searchResults.count) 筆"
+            let results = try await youtubeService.searchSongs(query: query, scope: scope)
+            guard activeSearchGeneration == generation,
+                  searchScope == scope,
+                  searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == query else {
+                return
+            }
+            searchResults = results
+            statusMessage = "\(scope.displayName)搜尋完成：\(results.count) 筆"
         } catch {
+            guard activeSearchGeneration == generation else { return }
             searchResults = []
             statusMessage = "搜尋失敗：\(error.localizedDescription)"
         }
@@ -650,11 +670,11 @@ final class AudioPlayerViewModel: ObservableObject {
         }
 
         statusMessage = "尋找相似歌曲..."
-        let existing = Set(queue.map(\.stableId))
+        let existingQueue = queue
         let suggestions = await withBackgroundActivity("auto-queue") {
             await autoQueueService.recommendations(
                 seed: seed,
-                excluding: existing,
+                excluding: existingQueue,
                 limit: 20
             )
         }
@@ -666,8 +686,18 @@ final class AudioPlayerViewModel: ObservableObject {
             return
         }
 
-        let currentIds = Set(queue.map(\.stableId))
-        let freshSuggestions = suggestions.filter { !currentIds.contains($0.stableId) }
+        var currentIds = Set(queue.map(\.stableId))
+        var currentIdentities = Set(queue.map(\.recommendationIdentity))
+        var freshSuggestions: [AppTrack] = []
+        for suggestion in suggestions {
+            guard !currentIds.contains(suggestion.stableId),
+                  !currentIdentities.contains(suggestion.recommendationIdentity) else {
+                continue
+            }
+            currentIds.insert(suggestion.stableId)
+            currentIdentities.insert(suggestion.recommendationIdentity)
+            freshSuggestions.append(suggestion)
+        }
         guard !freshSuggestions.isEmpty else {
             appendDebugLog("自動佇列：找不到推薦（seed=\(seed.title)）")
             if startPlaying {
@@ -1714,7 +1744,7 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func updateNowPlayingArtworkIfNeeded(for track: AppTrack) {
 #if os(iOS)
-        guard let rawURL = track.thumbnailURL, !rawURL.isEmpty else {
+        guard let rawURL = track.displayThumbnailURL, !rawURL.isEmpty else {
             return
         }
 
@@ -1993,7 +2023,7 @@ final class AudioPlayerViewModel: ObservableObject {
             canonicalId: originalTrack.stableId,
             title: originalTrack.title,
             artist: originalTrack.artist,
-            thumbnailURL: originalTrack.thumbnailURL,
+            thumbnailURL: originalTrack.displayThumbnailURL,
             durationText: originalTrack.durationText,
             source: .localFile(path: "Downloads/\(destinationFileName)")
         )

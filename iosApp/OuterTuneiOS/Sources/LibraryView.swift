@@ -146,7 +146,7 @@ struct LibraryView: View {
                         TrackRowView(
                             title: track.title,
                             subtitle: track.artist,
-                            thumbnailURL: track.thumbnailURL,
+                            thumbnailURL: track.displayThumbnailURL,
                             onTap: { player.playDownloadedTrack(track) }
                         ) {
                             Menu {
@@ -179,7 +179,7 @@ struct LibraryView: View {
                         TrackRowView(
                             title: track.title,
                             subtitle: track.artist,
-                            thumbnailURL: track.thumbnailURL,
+                            thumbnailURL: track.displayThumbnailURL,
                             onTap: { player.playDownloadedTrack(track) }
                         ) {
                             Button {
@@ -207,7 +207,7 @@ struct LibraryView: View {
                         TrackRowView(
                             title: track.title,
                             subtitle: track.artist,
-                            thumbnailURL: track.thumbnailURL,
+                            thumbnailURL: track.displayThumbnailURL,
                             onTap: { player.playDownloadedTrack(track) }
                         ) {
                             EmptyView()

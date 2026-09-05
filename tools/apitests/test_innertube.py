@@ -17,7 +17,8 @@ VIDEO_ID = "dQw4w9WgXcQ"  # stable, always-available reference track
 # itags a YouTube Music Premium session is offered that a free session is not.
 PREMIUM_ITAGS = {141, 774}  # 141 = 256kbps AAC, 774 = ~256kbps opus
 
-SEARCH_SONGS_PARAMS = "EgWKAQIIAWoKEAoQCRADEAQQBQ%3D%3D"
+SEARCH_SONGS_PARAMS = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"
+SEARCH_VIDEOS_PARAMS = "EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D"
 
 
 def describe_formats(formats):
@@ -73,7 +74,33 @@ def run():
         t.require(status_code == 200, "HTTP %s: %s" % (status_code, str(body)[:160]))
         items = it.walk(body, "musicResponsiveListItemRenderer")
         t.require(len(items) >= 5, "only %d results" % len(items))
-        t.note("%d song rows" % len(items))
+        types = {kind for item in items for kind in it.walk(item, "musicVideoType")
+                 if isinstance(kind, str)}
+        t.require("MUSIC_VIDEO_TYPE_ATV" in types,
+                  "song filter did not return official audio rows: %s" % sorted(types))
+        t.note("%d song rows, types=%s" % (len(items), sorted(types)))
+
+    with suite.test("search music videos returns video results") as t:
+        status_code, body = it.call(
+            "search", {"query": "daft punk one more time", "params": SEARCH_VIDEOS_PARAMS},
+            it.WEB_REMIX, visitor_data=visitor)
+        t.require(status_code == 200, "HTTP %s: %s" % (status_code, str(body)[:160]))
+        items = it.walk(body, "musicResponsiveListItemRenderer")
+        t.require(len(items) >= 5, "only %d results" % len(items))
+        types = {kind for item in items for kind in it.walk(item, "musicVideoType")
+                 if isinstance(kind, str)}
+        t.require(types & {"MUSIC_VIDEO_TYPE_OMV", "MUSIC_VIDEO_TYPE_UGC"},
+                  "video filter did not return video rows: %s" % sorted(types))
+        t.note("%d music-video rows, types=%s" % (len(items), sorted(types)))
+
+    with suite.test("YouTube Music search suggestions return renderers") as t:
+        status_code, body = it.call(
+            "music/get_search_suggestions", {"input": "Sunny"},
+            it.WEB_REMIX, visitor_data=visitor)
+        t.require(status_code == 200, "HTTP %s: %s" % (status_code, str(body)[:160]))
+        suggestions = it.walk(body, "searchSuggestionRenderer")
+        t.require(len(suggestions) >= 3, "only %d suggestions" % len(suggestions))
+        t.note("%d YouTube Music suggestions" % len(suggestions))
 
     with suite.test("browse FEmusic_home (anonymous) returns shelves") as t:
         status_code, body = it.call("browse", {"browseId": "FEmusic_home"},
@@ -91,9 +118,18 @@ def run():
         t.require(status_code == 200, "HTTP %s: %s" % (status_code, str(body)[:160]))
         items = it.walk(body, "playlistPanelVideoRenderer")
         t.require(len(items) >= 20, "only %d radio tracks" % len(items))
+        artwork_rows = sum(
+            bool((item.get("thumbnail") or {}).get("thumbnails")) for item in items)
+        byline_rows = sum(
+            bool(((item.get("longBylineText") or {}).get("runs"))) for item in items)
+        t.require(artwork_rows >= min(20, len(items)),
+                  "only %d/%d radio rows have direct thumbnails" % (artwork_rows, len(items)))
+        t.require(byline_rows >= min(20, len(items)),
+                  "only %d/%d radio rows have artist bylines" % (byline_rows, len(items)))
         continuation = (it.walk(body, "nextRadioContinuationData")
                         or it.walk(body, "nextContinuationData"))
-        t.note("%d radio tracks, continuation=%s" % (len(items), bool(continuation)))
+        t.note("%d radio tracks, artwork=%d, bylines=%d, continuation=%s"
+               % (len(items), artwork_rows, byline_rows, bool(continuation)))
 
     if not cookie:
         suite.skip("account menu", "needs YTM_COOKIE")

@@ -209,7 +209,13 @@ final class AIRankingService: ObservableObject {
         Rules:
         - Only choose ids that appear in the candidate list above.
         - Never invent a track. Never repeat the now-playing track.
+        - Never choose two uploads or language variants of the same song title.
         - Strongly avoid tracks or artists marked as frequently skipped.
+        - Prefer artists already present in the listener profile. Unknown-artist
+          discovery must be at most 20% of the result, never the opening track.
+        - Avoid cover, karaoke, acoustic, sped-up, slowed, nightcore and remix
+          uploads unless that exact version appears in the listener profile.
+        - Choose no more than three tracks by one artist.
         - Prefer stylistically close tracks from artists the listener has
           completed or repeatedly listened to over unrelated novelty.
         - Favour a coherent listening flow: keep energy and genre consistent

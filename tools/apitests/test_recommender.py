@@ -13,7 +13,9 @@ This test asserts exactly that.
 """
 import json
 import os
+import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +28,12 @@ from harness import Suite, load_env  # noqa: E402
 
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+SEARCH_SONGS_PARAMS = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"
+VARIANT_MARKERS = (
+    "cover", "coveredby", "karaoke", "instrumental", "acoustic",
+    "spedup", "slowed", "nightcore", "remix", "tvsize", "テレビサイズ",
+    "翻唱", "伴奏", "純音樂", "纯音乐", "カバー", "歌ってみた",
+)
 
 
 def load_ai_config():
@@ -77,20 +85,31 @@ def deezer_related_artists(name, limit=12):
     return [a["name"] for a in body.get("data", [])][:limit]
 
 
-def ytm_radio(video_id, visitor, limit=40):
-    st, body = it.call("next", {"videoId": video_id, "playlistId": "RDAMVM" + video_id,
-                                "isAudioOnly": True, "params": "wAEB"},
-                       it.WEB_REMIX, visitor_data=visitor)
-    if st != 200 or not isinstance(body, dict):
-        return []
+def ytm_radio(video_id, visitor, limit=80):
     out = []
-    for r in it.walk(body, "playlistPanelVideoRenderer"):
-        vid = r.get("videoId")
-        titles = it.walk(r.get("title", {}), "text")
-        subs = it.walk(r.get("longBylineText", {}), "text")
-        if vid and titles:
-            out.append({"videoId": vid, "title": titles[0],
-                        "artist": subs[0] if subs else "Unknown"})
+    continuation = None
+    for _ in range(3):
+        payload = ({"continuation": continuation} if continuation else
+                   {"videoId": video_id, "playlistId": "RDAMVM" + video_id,
+                    "isAudioOnly": True, "params": "wAEB"})
+        st, body = it.call("next", payload, it.WEB_REMIX, visitor_data=visitor)
+        if st != 200 or not isinstance(body, dict):
+            break
+        for r in it.walk(body, "playlistPanelVideoRenderer"):
+            vid = r.get("videoId")
+            titles = it.walk(r.get("title", {}), "text")
+            if vid and titles:
+                out.append({"videoId": vid, "title": titles[0],
+                            "artist": artist_from_renderer(r),
+                            "thumbnail": radio_thumbnail(r),
+                            "musicVideoType": first_string(it.walk(r, "musicVideoType"))})
+        if len(out) >= limit:
+            break
+        continuations = it.walk(body, "nextRadioContinuationData")
+        continuation = (continuations[0].get("continuation")
+                        if continuations else None)
+        if not continuation:
+            break
     # de-dupe, preserving order
     seen, uniq = set(), []
     for row in out:
@@ -102,7 +121,7 @@ def ytm_radio(video_id, visitor, limit=40):
 
 def ytm_search_track(query, visitor):
     st, body = it.call("search", {"query": query,
-                                  "params": "EgWKAQIIAWoKEAoQCRADEAQQBQ%3D%3D"},
+                                  "params": SEARCH_SONGS_PARAMS},
                        it.WEB_REMIX, visitor_data=visitor)
     if st != 200 or not isinstance(body, dict):
         return None
@@ -114,8 +133,196 @@ def ytm_search_track(query, visitor):
                 texts = [t for t in it.walk(r, "text") if isinstance(t, str)]
                 return {"videoId": pid["videoId"],
                         "title": texts[0] if texts else query,
-                        "artist": texts[2] if len(texts) > 2 else "Unknown"}
+                        "artist": artist_from_search_renderer(r),
+                        "thumbnail": search_thumbnail(r, pid["videoId"]),
+                        "musicVideoType": first_string(it.walk(r, "musicVideoType"))}
     return None
+
+
+def first_string(values):
+    return next((value for value in values if isinstance(value, str)), None)
+
+
+def artist_from_runs(node):
+    runs = node.get("runs", []) if isinstance(node, dict) else []
+    artists = []
+    for run in runs:
+        browse = (run.get("navigationEndpoint", {}).get("browseEndpoint", {}))
+        config = (browse.get("browseEndpointContextSupportedConfigs", {})
+                  .get("browseEndpointContextMusicConfig", {}))
+        if config.get("pageType") == "MUSIC_PAGE_TYPE_ARTIST" or \
+                str(browse.get("browseId", "")).startswith("UC"):
+            value = str(run.get("text", "")).strip()
+            if value and value not in artists:
+                artists.append(value)
+    if artists:
+        return " & ".join(artists)
+    return next((str(run.get("text", "")).strip() for run in runs
+                 if str(run.get("text", "")).strip() not in ("", "•", "·")),
+                "Unknown")
+
+
+def artist_from_renderer(renderer):
+    for key in ("longBylineText", "shortBylineText"):
+        artist = artist_from_runs(renderer.get(key, {}))
+        if artist != "Unknown":
+            return artist
+    return "Unknown"
+
+
+def artist_from_search_renderer(renderer):
+    columns = renderer.get("flexColumns", [])
+    if len(columns) > 1:
+        node = (columns[1].get("musicResponsiveListItemFlexColumnRenderer", {})
+                .get("text", {}))
+        return artist_from_runs(node)
+    return artist_from_renderer(renderer)
+
+
+def radio_thumbnail(renderer):
+    thumbs = (renderer.get("thumbnail") or {}).get("thumbnails") or []
+    return thumbs[-1].get("url") if thumbs else None
+
+
+def search_thumbnail(renderer, video_id):
+    thumbs = it.walk(renderer.get("thumbnail", {}), "thumbnails")
+    for group in thumbs:
+        if isinstance(group, list) and group:
+            return group[-1].get("url")
+    return "https://i.ytimg.com/vi/%s/hqdefault.jpg" % video_id
+
+
+def normalized(value):
+    folded = unicodedata.normalize("NFKD", value).casefold()
+    return "".join(ch for ch in folded if ch.isalnum())
+
+
+def normalized_title(value):
+    return normalized(re.sub(r"\s*[\(（\[【].*$", "", value))
+
+
+def track_key(track):
+    return "%s|%s" % (normalized(track["artist"]), normalized_title(track["title"]))
+
+
+def is_variant(track):
+    title = normalized(track["title"])
+    return any(normalized(marker) in title for marker in VARIANT_MARKERS)
+
+
+def recommendation_language(value):
+    for char in value:
+        code = ord(char)
+        if 0x3040 <= code <= 0x30FF:
+            return "japanese"
+        if 0xAC00 <= code <= 0xD7AF:
+            return "korean"
+    if any(0x3400 <= ord(char) <= 0x4DBF or 0x4E00 <= ord(char) <= 0x9FFF
+           for char in value):
+        return "chinese"
+    return "other"
+
+
+def preferred_language(seed, candidates):
+    seed_language = recommendation_language(seed["title"])
+    if seed_language == "chinese":
+        return "chinese"
+    sample = [recommendation_language(row["title"]) for row in candidates[:30]]
+    chinese = sample.count("chinese")
+    explicit = len([kind for kind in sample if kind != "other"])
+    if chinese >= 5 and chinese * 2 >= max(explicit, 1):
+        return "chinese"
+    return seed_language
+
+
+def select_like_app(seed, radio, spotify_references, top_artists,
+                    top_tracks, recent_titles, want=20,
+                    recently_suggested=()):
+    """Mirror the app's deterministic familiarity/repeat policy for live QA."""
+    candidates = []
+    seen_ids, seen_titles = set(), set()
+    blocked_titles = {normalized_title(seed["title"])} | {
+        normalized_title(title) for title in recent_titles
+    } | {
+        normalized_title(title) for title in recently_suggested
+    }
+    if len(radio) >= max(want, 12):
+        source = radio
+    else:
+        source = radio + spotify_references
+    language = preferred_language(seed, source)
+    if language == "chinese":
+        source = [row for row in source
+                  if recommendation_language(row["title"]) == "chinese"]
+    for index, track in enumerate(source):
+        identity = normalized_title(track["title"])
+        if (not identity or identity in blocked_titles or
+                track["videoId"] in seen_ids or identity in seen_titles):
+            continue
+        seen_ids.add(track["videoId"])
+        seen_titles.add(identity)
+        row = dict(track)
+        row["sourceIndex"] = index
+        candidates.append(row)
+
+    known_artists = {normalized(name) for name in top_artists}
+    known_artists.update(normalized(artist) for _, artist in top_tracks)
+    known_track_keys = {
+        "%s|%s" % (normalized(artist), normalized_title(title))
+        for title, artist in top_tracks
+    }
+    has_taste = bool(known_artists or known_track_keys)
+    seed_artist = normalized(seed["artist"])
+    artist_rank = {normalized(name): index for index, name in enumerate(top_artists)}
+
+    scored = []
+    for row in candidates:
+        artist = normalized(row["artist"])
+        exact_known = track_key(row) in known_track_keys
+        familiar = (not has_taste or artist == seed_artist
+                    or artist in known_artists or exact_known)
+        if is_variant(row) and not exact_known:
+            continue
+        source_score = 4.0 / (1.0 + row["sourceIndex"] * 0.08)
+        rank = artist_rank.get(artist)
+        taste_score = (2.4 / (1.0 + rank * 0.08)) if rank is not None else 0
+        score = source_score + taste_score + (3.0 if exact_known else 0)
+        score += 2.5 if artist == seed_artist else 0
+        score -= 2.5 if not familiar else 0
+        scored.append((score, familiar, row))
+    scored.sort(key=lambda entry: -entry[0])
+
+    familiar = [entry for entry in scored if entry[1]]
+    discovery = [entry for entry in scored if not entry[1]]
+    result, artist_counts = [], {}
+
+    def append_best(rows, maximum):
+        while rows and len(result) < maximum:
+            previous = normalized(result[-1]["artist"]) if result else None
+            chosen = next((i for i, entry in enumerate(rows)
+                           if artist_counts.get(normalized(entry[2]["artist"]), 0) <
+                           (5 if normalized(entry[2]["artist"]) == seed_artist else 3)
+                           and normalized(entry[2]["artist"]) != previous), None)
+            if chosen is None:
+                chosen = next((i for i, entry in enumerate(rows)
+                               if artist_counts.get(normalized(entry[2]["artist"]), 0) <
+                               (5 if normalized(entry[2]["artist"]) == seed_artist else 3)),
+                              None)
+            if chosen is None:
+                break
+            _, _, row = rows.pop(chosen)
+            artist = normalized(row["artist"])
+            artist_counts[artist] = artist_counts.get(artist, 0) + 1
+            result.append(row)
+
+    target = min(want, 12)
+    reserved_discovery = min(3, target // 4) if has_taste else 0
+    append_best(familiar, target - reserved_discovery)
+    if len(result) < target:
+        allowance = (min(max(2, target - len(result)), 4)
+                     if has_taste else target)
+        append_best(discovery, min(target, len(result) + allowance))
+    return result, known_artists, known_track_keys
 
 
 def rerank_with_llm(cfg, model, profile_summary, now_playing, candidates, want=10):
@@ -171,7 +378,7 @@ def run():
     model = env.get("AI_MODEL", "gemini-3.8-flash-high")
 
     # --- 1. Spotify taste profile -----------------------------------------
-    top_artists, top_tracks = [], []
+    top_artists, top_tracks, recent_titles = [], [], []
     tokens = sp.load_tokens()
     token = env.get("SPOTIFY_ACCESS_TOKEN")
     if not token and tokens:
@@ -188,18 +395,40 @@ def run():
         suite.skip("Spotify taste profile", "no token")
     else:
         with suite.test("Spotify taste profile is usable as seed material") as t:
-            status, body = sp.get("/me/top/artists", token,
-                                  {"limit": 20, "time_range": "medium_term"})
-            t.require(status == 200, "top artists HTTP %s" % status)
-            top_artists = [a["name"] for a in body.get("items", [])]
-            status, body = sp.get("/me/top/tracks", token,
-                                  {"limit": 20, "time_range": "medium_term"})
-            t.require(status == 200, "top tracks HTTP %s" % status)
-            top_tracks = [(x["name"], x["artists"][0]["name"]) for x in body.get("items", [])]
+            for time_range in ("short_term", "medium_term"):
+                status, body = sp.get("/me/top/artists", token,
+                                      {"limit": 30, "time_range": time_range})
+                t.require(status == 200, "top artists HTTP %s" % status)
+                for artist in body.get("items", []):
+                    if artist["name"] not in top_artists:
+                        top_artists.append(artist["name"])
+
+                status, body = sp.get("/me/top/tracks", token,
+                                      {"limit": 40, "time_range": time_range})
+                t.require(status == 200, "top tracks HTTP %s" % status)
+                for track in body.get("items", []):
+                    pair = (track["name"], track["artists"][0]["name"])
+                    if pair not in top_tracks:
+                        top_tracks.append(pair)
+
+            status, body = sp.get("/me/player/recently-played", token, {"limit": 40})
+            t.require(status == 200, "recent history HTTP %s" % status)
+            recent_titles = [item["track"]["name"] for item in body.get("items", [])]
+
+            status, body = sp.get("/me/tracks", token, {"limit": 40})
+            t.require(status == 200, "saved tracks HTTP %s" % status)
+            for item in body.get("items", []):
+                track = item.get("track") or {}
+                if track.get("artists"):
+                    pair = (track["name"], track["artists"][0]["name"])
+                    if pair not in top_tracks:
+                        top_tracks.append(pair)
+
             t.require(top_artists or top_tracks, "profile is empty")
             t.note("top artists: %s" % ", ".join(top_artists[:6]))
             t.note("top tracks: %s" % ", ".join("%s - %s" % (n, a)
                                                 for n, a in top_tracks[:4]))
+            t.note("%d recent tracks are hard repeat blocks" % len(recent_titles))
 
     # --- 2. seed resolution ------------------------------------------------
     seed = None
@@ -233,7 +462,132 @@ def run():
                 added += 1
         t.note("added %d cross-source candidates (total %d)" % (added, len(candidates)))
 
-    # --- 4. LLM re-rank ----------------------------------------------------
+    spotify_references = []
+    spotify_artist_aliases = []
+    if top_tracks:
+        with suite.test("resolve non-recent Spotify favourites as familiar candidates") as t:
+            recent_set = {normalized_title(title) for title in recent_titles}
+            for name, artist in top_tracks:
+                if normalized_title(name) in recent_set:
+                    continue
+                found = ytm_search_track("%s %s" % (artist, name), visitor)
+                if found and all(normalized_title(row["title"]) !=
+                                 normalized_title(found["title"])
+                                 for row in spotify_references):
+                    spotify_references.append(found)
+                if len(spotify_references) >= 16:
+                    break
+            t.require(len(spotify_references) >= 8,
+                      "only %d non-recent familiar candidates resolved"
+                      % len(spotify_references))
+            t.note("%d Spotify-history tracks resolved on YouTube Music"
+                   % len(spotify_references))
+            candidates.extend(spotify_references)
+    else:
+        suite.skip("resolve non-recent Spotify favourites", "no Spotify profile")
+
+    if top_artists:
+        with suite.test("resolve Spotify artist aliases used by YouTube Music") as t:
+            for artist in top_artists[:16]:
+                found = ytm_search_track(artist, visitor)
+                if found and found["artist"] not in spotify_artist_aliases:
+                    spotify_artist_aliases.append(found["artist"])
+            t.require(len(spotify_artist_aliases) >= 8,
+                      "only %d artist aliases resolved" % len(spotify_artist_aliases))
+            t.note("%d native-name artist aliases resolved" % len(spotify_artist_aliases))
+    else:
+        suite.skip("resolve Spotify artist aliases", "no Spotify profile")
+
+    # --- 4. quality policy -------------------------------------------------
+    def audit_policy(test, scenario_seed, scenario_radio):
+        queue, known_artists, known_tracks = select_like_app(
+            scenario_seed, scenario_radio, spotify_references,
+            top_artists + spotify_artist_aliases,
+            top_tracks, recent_titles, want=20)
+        test.require(len(queue) >= 8, "queue is too short: %d" % len(queue))
+
+        identities = [normalized_title(row["title"]) for row in queue]
+        test.require(len(identities) == len(set(identities)),
+                     "duplicate song titles survived selection")
+        test.require(normalized_title(scenario_seed["title"]) not in identities,
+                     "seed song was recommended again")
+        recent_set = {normalized_title(title) for title in recent_titles}
+        test.require(not (set(identities) & recent_set),
+                     "recent Spotify songs were recommended again")
+
+        artist_counts = {}
+        unfamiliar = []
+        seed_artist = normalized(scenario_seed["artist"])
+        for row in queue:
+            artist = normalized(row["artist"])
+            artist_counts[artist] = artist_counts.get(artist, 0) + 1
+            if not (artist == seed_artist or artist in known_artists
+                    or track_key(row) in known_tracks):
+                unfamiliar.append(row)
+            test.require(row.get("thumbnail"),
+                         "missing thumbnail for %s" % row["title"])
+            test.require("•" not in row["artist"],
+                         "metadata leaked into artist: %s" % row["artist"])
+            test.require(not is_variant(row) or track_key(row) in known_tracks,
+                         "unfamiliar alternate upload survived: %s" % row["title"])
+
+        for artist, count in artist_counts.items():
+            allowed = 5 if artist == seed_artist else 3
+            test.require(count <= allowed,
+                         "one artist occupies too many queue slots")
+        if top_artists or top_tracks:
+            familiar_count = len(queue) - len(unfamiliar)
+            discovery_limit = min(max(2, familiar_count), 4)
+            test.require(len(unfamiliar) <= discovery_limit,
+                         "%d/%d tracks are unfamiliar" % (len(unfamiliar), len(queue)))
+            first = queue[0]
+            test.require(normalized(first["artist"]) in known_artists
+                         or normalized(first["artist"]) == seed_artist
+                         or track_key(first) in known_tracks,
+                         "queue opens with an unfamiliar artist")
+
+        test.note("selected %d tracks; familiar=%d, discovery=%d, max/artist=%d"
+                  % (len(queue), len(queue) - len(unfamiliar), len(unfamiliar),
+                     max(artist_counts.values())))
+        for index, row in enumerate(queue[:10], 1):
+            label = "known" if row not in unfamiliar else "discovery"
+            test.note("  %2d. [%s] %s - %s"
+                      % (index, label, row["artist"], row["title"]))
+        return queue
+
+    first_queue = []
+    with suite.test("queue policy fits the real Spotify seed without repeats") as t:
+        first_queue = audit_policy(t, seed, radio)
+
+    with suite.test("same seed rotates to a non-overlapping second queue") as t:
+        second_queue, _, _ = select_like_app(
+            seed, radio, spotify_references,
+            top_artists + spotify_artist_aliases, top_tracks, recent_titles,
+            want=20, recently_suggested=[row["title"] for row in first_queue])
+        first_titles = {normalized_title(row["title"]) for row in first_queue}
+        second_titles = {normalized_title(row["title"]) for row in second_queue}
+        t.require(len(second_queue) >= 6,
+                  "rotated queue is too short: %d" % len(second_queue))
+        t.require(not (first_titles & second_titles),
+                  "same songs returned after the cooldown")
+        t.note("first=%d, second=%d, overlap=0"
+               % (len(first_queue), len(second_queue)))
+
+    for label, query in (("Jay Chou screenshot seed", "周杰倫 晴天"),
+                         ("anime screenshot seed", "椎名真昼 小さな恋のうた")):
+        with suite.test("queue policy: " + label) as t:
+            scenario_seed = ytm_search_track(query, visitor)
+            t.require(scenario_seed, "could not resolve seed: " + query)
+            scenario_radio = ytm_radio(scenario_seed["videoId"], visitor)
+            t.require(len(scenario_radio) >= 20,
+                      "only %d radio candidates" % len(scenario_radio))
+            scenario_queue = audit_policy(t, scenario_seed, scenario_radio)
+            if label.startswith("Jay Chou"):
+                t.require(all(recommendation_language(row["title"]) == "chinese"
+                              for row in scenario_queue),
+                          "Chinese seed produced a non-Chinese queue item")
+
+    # --- 5. LLM safety probe ----------------------------------------------
     if not cfg:
         suite.skip("LLM re-rank", "ai.env not found")
         return suite.report()

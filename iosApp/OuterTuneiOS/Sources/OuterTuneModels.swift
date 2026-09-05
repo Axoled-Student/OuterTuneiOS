@@ -41,6 +41,32 @@ enum AudioQualityPreference: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum YouTubeMusicSearchScope: String, CaseIterable, Identifiable, Equatable {
+    case songs
+    case videos
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .songs:
+            return "音樂"
+        case .videos:
+            return "音樂影片"
+        }
+    }
+
+    /// Official WEB_REMIX search chips used by YouTube Music.
+    var apiParams: String {
+        switch self {
+        case .songs:
+            return "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"
+        case .videos:
+            return "EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D"
+        }
+    }
+}
+
 struct AppTrack: Codable, Identifiable, Equatable {
     var id: String
     var canonicalId: String? = nil
@@ -64,6 +90,45 @@ struct AppTrack: Codable, Identifiable, Equatable {
             return "file:\(path)"
         }
     }
+
+    /// YouTube always exposes a deterministic video thumbnail even when a
+    /// particular InnerTube renderer omits its artwork object. This also heals
+    /// queue rows persisted by older builds with a nil thumbnail URL.
+    var displayThumbnailURL: String? {
+        if let thumbnailURL,
+           !thumbnailURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return thumbnailURL
+        }
+        if case .youtube(let videoId) = source, !videoId.isEmpty {
+            return "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg"
+        }
+        return nil
+    }
+
+    /// Alternate uploads and music-video variants often have different
+    /// videoIds for the same recording. Auto-queue de-duplicates on this
+    /// normalized title as well as on stableId so the user does not get two
+    /// copies of the same song in one batch.
+    var recommendationIdentity: String {
+        let normalized = Self.normalizedRecommendationTitle(title)
+        return normalized.isEmpty ? stableId : normalized
+    }
+
+    static func normalizedRecommendationTitle(_ title: String) -> String {
+        let baseTitle = title.replacingOccurrences(
+            of: #"\s*[\(（\[【].*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        let folded = baseTitle.folding(
+            options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        let normalized = folded
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .joined()
+        return normalized
+    }
 }
 
 struct YouTubeSearchSong: Identifiable, Equatable {
@@ -80,7 +145,8 @@ struct YouTubeSearchSong: Identifiable, Equatable {
             canonicalId: "yt:\(videoId)",
             title: title,
             artist: artist,
-            thumbnailURL: thumbnailURL,
+            thumbnailURL: thumbnailURL
+                ?? "https://i.ytimg.com/vi/\(videoId)/hqdefault.jpg",
             durationText: durationText,
             source: .youtube(videoId: videoId)
         )

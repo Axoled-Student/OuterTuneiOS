@@ -74,7 +74,7 @@ struct HomeView: View {
             if let track = player.nowPlayingTrack {
                 Button(action: openNowPlaying) {
                     HStack(spacing: 12) {
-                        TrackArtworkView(urlString: track.thumbnailURL, dimension: 72, cornerRadius: 10)
+                        TrackArtworkView(urlString: track.displayThumbnailURL, dimension: 72, cornerRadius: 10)
                         VStack(alignment: .leading, spacing: 4) {
                             Text("正在播放")
                                 .font(.caption)
