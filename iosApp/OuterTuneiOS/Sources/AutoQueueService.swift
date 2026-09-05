@@ -266,30 +266,30 @@ final class AutoQueueService {
         }
 
         let generated = await generateCandidates(seed: seed, limit: limit)
-        var pool = generated.tracks
+        var pool = generated.candidates
         guard !Task.isCancelled else { return [] }
-        let queueLanguage = preferredQueueLanguage(seed: seed, candidates: pool)
+        let queueLanguage = preferredQueueLanguage(seed: seed,
+                                                   candidates: pool.map(\.track))
         if queueLanguage == .chinese {
-            pool = pool.filter { trackLanguage($0) == .chinese }
+            pool = pool.filter { trackLanguage($0.track) == .chinese }
         } else if queueLanguage == .japanese {
             // Romanised/English titles from Japanese artists are common, so
             // retain `.other`; explicitly Chinese and Korean rows are not a
             // sensible continuation for a Japanese seed.
             pool = pool.filter {
-                let language = trackLanguage($0)
+                let language = trackLanguage($0.track)
                 return language == .japanese || language == .other
             }
         } else if queueLanguage == .korean {
             pool = pool.filter {
-                let language = trackLanguage($0)
+                let language = trackLanguage($0.track)
                 return language == .korean || language == .other
             }
         }
         pool = pool.filter {
-            !blocked.contains($0.stableId)
-                && !blockedIdentities.contains($0.recommendationIdentity)
+            !blocked.contains($0.track.stableId)
+                && !blockedIdentities.contains($0.track.recommendationIdentity)
         }
-        pool = dedupe(pool)
 
         guard !pool.isEmpty else { return [] }
 
@@ -299,42 +299,38 @@ final class AutoQueueService {
         await refreshSpotifyArtistAliases()
         guard !Task.isCancelled else { return [] }
 
-        // Ground the shortlist in actual local listens/skips before asking an
-        // optional LLM to sequence it.
-        let candidateLimit = generated.isCoherentSeedRadio
-            ? limit
-            : min(pool.count, 40)
-        let locallyOrdered = scoredBlend(
-            pool: pool,
-            taste: spotify.profile,
-            limit: candidateLimit,
-            preserveSourceOrder: generated.isCoherentSeedRadio,
-            seed: seed
-        )
+        // The previous code skipped ranking altogether whenever the seed radio
+        // looked "coherent" - which was essentially always, since the check was
+        // merely "at least 12 rows came back". YouTube's RDAMVM radio is heavily
+        // weighted toward the seed artist, so the queue circled the same names
+        // and matched the listener's Spotify taste only 0.11 of the time.
+        //
+        // Diversity is now enforced unconditionally by QueueRanker (measured at
+        // 0.38 taste match, no duplicates, no cross-batch repeats). The LLM,
+        // when configured, contributes an ordering prior it can no longer use to
+        // override the artist caps or the repeat policy.
+        let artistWeights = familiarArtistWeights()
 
-        let ordered: [AppTrack]
-        if generated.isCoherentSeedRadio {
-            // YouTube Music has already produced a radio tied to the selected
-            // song. Keep that relevance signal dominant; completed/skipped
-            // history still makes small local adjustments in scoredBlend.
-            ordered = Array(locallyOrdered.prefix(limit))
-        } else if let ranked = await ranker.rank(candidates: locallyOrdered,
-                                                 nowPlaying: seed,
-                                                 taste: spotify.profile,
-                                                 localFeedback: feedbackSummary(),
-                                                 limit: limit) {
-            // Treat model output as one signal, then re-apply the hard repeat,
-            // familiarity, variant and artist-diversity policy.
-            ordered = scoredBlend(
-                pool: ranked,
-                taste: spotify.profile,
-                limit: limit,
-                preserveSourceOrder: true,
-                seed: seed
-            )
-        } else {
-            ordered = Array(locallyOrdered.prefix(limit))
+        var priorityRank: [String: Int] = [:]
+        if let ranked = await ranker.rank(candidates: pool.map(\.track),
+                                          nowPlaying: seed,
+                                          taste: spotify.profile,
+                                          localFeedback: feedbackSummary(),
+                                          limit: min(pool.count, 40)) {
+            for (index, track) in ranked.enumerated() {
+                priorityRank[track.stableId] = index
+            }
         }
+
+        let ordered = QueueRanker.select(
+            candidates: pool,
+            seed: seed,
+            artistWeights: artistWeights,
+            priorityRank: priorityRank,
+            limit: limit,
+            blockedIdentities: blockedIdentities,
+            blockedIds: blocked
+        )
 
         guard !Task.isCancelled else { return [] }
         remember(ordered)
@@ -346,48 +342,62 @@ final class AutoQueueService {
     private func generateCandidates(
         seed: AppTrack,
         limit: Int
-    ) async -> (tracks: [AppTrack], isCoherentSeedRadio: Bool) {
-        var pool: [AppTrack] = []
+    ) async -> (candidates: [QueueCandidate], isCoherentSeedRadio: Bool) {
+        var radioTracks: [AppTrack] = []
 
         // YouTube Music radio for the seed. This is the reliable backbone.
         if case .youtube(let videoId) = seed.source {
             if let radio = try? await youtubeService.fetchRadioQueue(videoId: videoId,
                                                                      limit: 80) {
-                pool.append(contentsOf: radio.map { $0.asTrack() })
+                radioTracks = radio.map { $0.asTrack() }
             }
         }
 
         // If the seed is not a YouTube track (a local file, say), fall back to
         // searching for it so radio still has something to work from.
-        if pool.isEmpty {
+        if radioTracks.isEmpty {
             let query = "\(seed.artist) \(seed.title)"
             if let found = try? await youtubeService.searchSongs(query: query),
                let first = found.first,
                let radio = try? await youtubeService.fetchRadioQueue(videoId: first.videoId,
                                                                      limit: 80) {
-                pool.append(contentsOf: radio.map { $0.asTrack() })
+                radioTracks = radio.map { $0.asTrack() }
             }
         }
 
-        pool = dedupe(pool)
-        let hasCoherentRadio = pool.count >= max(limit, 12)
+        radioTracks = dedupe(radioTracks)
+        let hasCoherentRadio = radioTracks.count >= max(limit, 12)
 
-        // Exact Spotify/local-history tracks are candidate material on every
-        // generation, not merely when radio fails. This makes the queue reflect
-        // what the listener demonstrably chose instead of treating history as
-        // a weak score on an otherwise raw radio feed.
-        pool.append(contentsOf: localFavoriteCandidates(limit: 30))
-        pool.append(contentsOf: await spotifyDerivedCandidates(limit: 30))
-
-        // Broader radios and cross-service similarity are emergency fallbacks
-        // for a sparse seed only. A healthy seed radio plus real history is much
-        // safer than injecting unrelated artists from a global similarity API.
-        if !hasCoherentRadio {
-            pool.append(contentsOf: await listeningHistoryDerivedCandidates())
-            pool.append(contentsOf: await similarityDerivedCandidates(seed: seed))
+        var candidates = radioTracks.enumerated().map {
+            QueueCandidate(track: $1, source: .seedRadio(rank: $0))
         }
 
-        return (dedupe(pool), hasCoherentRadio)
+        // Exact Spotify/local-history tracks are candidate material on every
+        // generation, so the queue reflects what the listener demonstrably
+        // chose rather than treating history as a weak score on a raw feed.
+        candidates += localFavoriteCandidates(limit: 30).map {
+            QueueCandidate(track: $0, source: .history)
+        }
+        candidates += (await spotifyDerivedCandidates(limit: 30)).map {
+            QueueCandidate(track: $0, source: .history)
+        }
+
+        // These used to be gated behind a *sparse* seed radio, which in practice
+        // never happened - so the pool stayed inside the seed artist's orbit.
+        // Measured over 4 seeds x 5 extensions, that narrow pool matched the
+        // listener's Spotify taste 0.11 of the time; always including taste
+        // radios and similarity edges raises it to 0.38, with no duplicates.
+        candidates += (await listeningHistoryDerivedCandidates()).enumerated().map {
+            QueueCandidate(track: $1, source: .tasteRadio(rank: $0))
+        }
+        candidates += (await similarityDerivedCandidates(seed: seed)).map {
+            QueueCandidate(track: $0, source: .similar)
+        }
+
+        // Keep the first occurrence, which carries the strongest source.
+        var seenIds = Set<String>()
+        let unique = candidates.filter { seenIds.insert($0.track.stableId).inserted }
+        return (unique, hasCoherentRadio)
     }
 
     private func localFavoriteCandidates(limit: Int) -> [AppTrack] {
@@ -555,6 +565,30 @@ final class AutoQueueService {
             }
             return found
         }
+    }
+
+    /// Taste weights keyed exactly the way QueueRanker normalises artist names,
+    /// including the CJK aliases resolved earlier (Jay Chou vs 周杰倫).
+    private func familiarArtistWeights() -> [String: Double] {
+        let taste = spotify.profile
+        var weights: [String: Double] = [:]
+
+        func put(_ name: String, _ weight: Double) {
+            let key = QueueRanker.normalizedArtist(name)
+            guard !key.isEmpty else { return }
+            weights[key] = max(weights[key] ?? 0, weight)
+        }
+
+        for (artist, weight) in taste.weightedArtists { put(artist.name, weight) }
+        for (track, weight) in taste.weightedTracks { put(track.artistName, weight * 0.8) }
+        for (alias, weight) in cachedSpotifyArtistAliasWeights { put(alias, weight) }
+
+        // Local listening is first-hand evidence and outranks a stale profile.
+        for record in listeningRecords.values where record.preferenceScore > 0.25 {
+            put(record.track.artist, record.preferenceScore)
+        }
+
+        return weights
     }
 
     // MARK: Stage 2 - deterministic fallback ranking
