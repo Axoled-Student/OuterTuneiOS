@@ -10,6 +10,7 @@ Run:  python tools/resolver/test_djset.py
 """
 import os
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -21,9 +22,17 @@ import djset  # noqa: E402
 
 
 class FakeTaste:
-    artists = {"MIMI": 9, "YOASOBI": 7, "RADWIMPS": 4}
-    tracks = [{"artist": "MIMI", "name": "ハナタバ"},
-              {"artist": "YOASOBI", "name": "アイドル"}]
+    """Artists they already play and songs they already own.
+
+    `known` holds identities in the same shape the stubbed rec.identity below
+    produces, because it is compared against resolved tracks, not against these
+    rows.
+    """
+    def __init__(self):
+        self.artists = {"mimi": 9, "yoasobi": 7, "radwimps": 4}
+        self.tracks = [{"artist": "MIMI", "name": "ハナタバ"},
+                       {"artist": "YOASOBI", "name": "アイドル"}]
+        self.known = set()
 
     def refresh(self):
         pass
@@ -48,11 +57,17 @@ class FakeEngine:
         return "visitor"
 
 
-def reply(theme, songs, say=True, script="Here we go."):
-    return ('{"theme": "%s", "say": %s, "script": "%s", "songs": [%s]}'
-            % (theme, "true" if say else "false", script,
+def reply(theme, songs, say=True):
+    """A planning reply. The script is a second call now, not part of this."""
+    return ('{"theme": "%s", "say": %s, "songs": [%s]}'
+            % (theme, "true" if say else "false",
                ", ".join('{"artist": "%s", "title": "%s"}' % s
                          for s in songs)))
+
+
+def track(artist, title):
+    return {"videoId": "id-" + title, "artist": artist, "title": title,
+            "thumbnail": None}
 
 
 class LoopTest(unittest.TestCase):
@@ -75,16 +90,33 @@ class LoopTest(unittest.TestCase):
                                         + t.get("title", "").lower())
         self.addCleanup(setattr, djset.rec, "identity", self._identity)
 
+        self._radio = djset.rec.radio
+        self.addCleanup(setattr, djset.rec, "radio", self._radio)
+
         self._voice = dj.voice_over
         self.addCleanup(setattr, dj, "voice_over", self._voice)
 
-        self.prompts = []
+        self.prompts = []          # planning prompts only
+        self.scripts = []          # the second call, once the set is real
         self.spoken = []
         self.replies = []
+        self.script_replies = []
         self.missing = set()
+        self.radio_pool = []
+        self.radio_calls = []
 
         def ask(cfg, prompt, model=None, timeout=90, max_tokens=2000,
                 temperature=0.7):
+            # A turn is two calls now. Only the planning one is counted, so
+            # the tests that count model calls per set still read straight.
+            if "Reply with ONLY this JSON" not in prompt:
+                self.scripts.append(prompt)
+                if not self.script_replies:
+                    return "Here we go."
+                nxt = self.script_replies.pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt
             self.prompts.append(prompt)
             if not self.replies:
                 return reply("filler %d" % len(self.prompts),
@@ -95,6 +127,11 @@ class LoopTest(unittest.TestCase):
                 raise nxt
             return nxt
         discovery._ask_model = ask
+
+        def radio(video_id, visitor, cookie=None, limit=60):
+            self.radio_calls.append(video_id)
+            return list(self.radio_pool)
+        djset.rec.radio = radio
 
         # Same shape as the real one: "artist title" in, a track row out.
         def search(query, visitor, cookie=None):
@@ -110,12 +147,34 @@ class LoopTest(unittest.TestCase):
             return "aud" + str(len(self.spoken))
         dj.voice_over = voice_over
 
+        djset._ready.clear()
+        self.addCleanup(djset._ready.clear)
+        djset._wanted.clear()
+        self.addCleanup(djset._wanted.clear)
+
+        # The ledger of what has gone out is deliberately persistent, so each
+        # test gets its own file and its own empty memory of it.
+        self._served_state = djset.SERVED_STATE
+        djset.SERVED_STATE = os.path.join(tempfile.mkdtemp(), "served.json")
+        self.addCleanup(setattr, djset, "SERVED_STATE", self._served_state)
+        djset._served.clear()
+        djset._served_loaded = False
+        self.addCleanup(self.forget_served)
+        self._langs = djset.LANGS_STATE
+        djset.LANGS_STATE = os.path.join(tempfile.gettempdir(),
+                                         "djset_langs_test.json")
+        self.addCleanup(setattr, djset, "LANGS_STATE", self._langs)
+
         # Registered last so it runs first: a set still building in the
         # background would otherwise reach for stubs that have been put back,
         # and record itself against the next test's expectations.
         self.addCleanup(self.quiesce)
         discovery._lookup_cache.clear()
         self.addCleanup(discovery._lookup_cache.clear)
+
+    def forget_served(self):
+        djset._served.clear()
+        djset._served_loaded = False
 
     def quiesce(self):
         for state in list(djset._sessions.values()):
@@ -387,6 +446,256 @@ class LoopTest(unittest.TestCase):
 
         titles = [t["title"] for out in seen for t in out["tracks"]]
         self.assertEqual(len(titles), len(set(titles)))
+
+    # -- the set is real before the DJ talks about it
+
+    def test_the_line_is_written_about_the_songs_that_survived(self):
+        self.missing.add("Two")
+        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three")])]
+        out = self.turn()
+        self.assertEqual([t["title"] for t in out["tracks"]],
+                         ["One", "Three"])
+        # The song that turned out not to exist must not reach the words
+        # being spoken over the set.
+        prompt = self.scripts[0]
+        self.assertIn("A - One", prompt)
+        self.assertIn("C - Three", prompt)
+        self.assertNotIn("Two", prompt)
+
+    def test_the_planning_call_does_not_ask_for_a_script(self):
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn()
+        self.assertNotIn("script", self.prompts[0])
+        self.assertEqual(len(self.scripts), 1)
+
+    def test_the_spoken_line_is_the_one_the_model_wrote(self):
+        fence = chr(96) * 3
+        self.script_replies = [fence + '\n"Let us begin."\n' + fence]
+        self.replies = [reply("one", [("A", "One")])]
+        out = self.turn()
+        self.assertEqual(out["script"], "Let us begin.")
+        self.assertEqual(self.spoken[0][0], "Let us begin.")
+
+    def test_a_script_the_model_will_not_write_still_leaves_a_set(self):
+        self.script_replies = [RuntimeError("upstream fell over")]
+        self.replies = [reply("one", [("A", "One")])]
+        out = self.turn()
+        self.assertTrue(out["tracks"])
+        self.assertFalse(out["say"])
+        self.assertEqual(out["script"], "")
+        self.assertIsNone(out["audio"])
+        self.assertIn("could not write", out["error"])
+
+    def test_an_unspoken_set_costs_no_second_call(self):
+        self.replies = [reply("quiet", [("A", "One")], say=False)]
+        self.turn()
+        self.assertEqual(self.scripts, [])
+
+    # -- keeping the set full
+
+    def test_a_short_set_is_topped_up_from_the_radio_of_what_survived(self):
+        self.missing.update({"Two", "Three", "Four"})
+        self.radio_pool = [track("D", "N1"), track("E", "N2"),
+                           track("F", "N3"), track("G", "N4")]
+        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three"), ("Z", "Four")])]
+        out = self.turn()
+        self.assertEqual([t["title"] for t in out["tracks"]],
+                         ["One", "N1", "N2", "N3"])
+        self.assertEqual(self.radio_calls, ["id-One"])
+
+    def test_the_top_up_skips_songs_this_session_already_played(self):
+        self.replies = [reply("one", [("A", "One")]),
+                        reply("two", [("B", "Two")])]
+        first = self.turn()
+        self.drain(first["session"])
+        second = self.turn(session=first["session"])
+        self.assertEqual([t["title"] for t in second["tracks"]], ["Two"])
+        # Now offer the radio a song this session has already played.
+        self.radio_pool = [track("A", "One"), track("N", "N1")]
+        self.drain(first["session"])
+        third = self.turn(session=first["session"])
+        self.assertNotIn("One", [t["title"] for t in third["tracks"]])
+
+    def test_a_full_set_is_never_topped_up(self):
+        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three"), ("D", "Four"),
+                                      ("E", "Five")])]
+        out = self.turn()
+        self.assertEqual(len(out["tracks"]), djset.SET_SIZE)
+        self.assertEqual(self.radio_calls, [])
+
+    def test_a_spare_that_was_not_needed_is_still_playable_later(self):
+        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three"), ("D", "Four"),
+                                      ("E", "Five")]),
+                        reply("two", [("E", "Five")])]
+        first = self.turn()
+        self.drain(first["session"])
+        second = self.turn(session=first["session"])
+        self.assertEqual([t["title"] for t in second["tracks"]], ["Five"])
+
+    def test_two_songs_by_one_artist_only_get_one_slot(self):
+        self.replies = [reply("one", [("A", "One"), ("A", "Two"),
+                                      ("B", "Three")])]
+        out = self.turn()
+        self.assertEqual([t["title"] for t in out["tracks"]],
+                         ["One", "Three"])
+
+    # -- the opening set standing by
+
+    def test_a_standing_opening_set_is_served_without_a_model_call(self):
+        lang = dj.normalise_language("zh-TW")
+        self.replies = [reply("prewarmed", [("A", "One")])]
+        self.assertTrue(djset._prewarm(self.engine, lang))
+        before = len(self.prompts)
+        out = self.turn()
+        self.assertEqual(out["theme"], "prewarmed")
+        self.assertEqual(out["set"], 1)
+        self.drain(out["session"])
+        # One call, and it is for the set after this one.
+        self.assertEqual(len(self.prompts), before + 1)
+
+    def test_a_standing_set_is_not_given_to_a_session_already_running(self):
+        self.replies = [reply("one", [("A", "One")])]
+        first = self.turn()
+        self.drain(first["session"])
+        self.replies = [reply("prewarmed", [("Z", "Nine")])]
+        self.assertTrue(djset._prewarm(self.engine,
+                                       dj.normalise_language("zh-TW")))
+        second = self.turn(session=first["session"])
+        self.assertNotEqual(second["theme"], "prewarmed")
+
+    def test_a_stale_standing_set_is_ignored(self):
+        lang = dj.normalise_language("zh-TW")
+        self.replies = [reply("prewarmed", [("A", "One")])]
+        self.assertTrue(djset._prewarm(self.engine, lang))
+        djset._ready[lang]["at"] -= djset.READY_TTL + 10
+        self.replies = [reply("fresh", [("B", "Two")])]
+        out = self.turn()
+        self.assertEqual(out["theme"], "fresh")
+
+    def test_a_standing_set_brings_its_no_repeat_memory_with_it(self):
+        lang = dj.normalise_language("zh-TW")
+        self.replies = [reply("prewarmed", [("A", "One")]),
+                        reply("second", [("A", "One"), ("B", "Two")])]
+        self.assertTrue(djset._prewarm(self.engine, lang))
+        first = self.turn()
+        self.drain(first["session"])
+        second = self.turn(session=first["session"])
+        self.assertEqual(second["set"], 2)
+        self.assertEqual([t["title"] for t in second["tracks"]], ["Two"])
+
+    def test_a_prewarm_that_fails_leaves_nothing_standing(self):
+        self.replies = [RuntimeError("upstream fell over")]
+        self.assertFalse(djset._prewarm(self.engine,
+                                        dj.normalise_language("zh-TW")))
+        self.assertEqual(djset._ready, {})
+
+    def test_the_language_asked_for_is_remembered_for_warming(self):
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn(language="ja-JP")
+        self.assertIn(dj.normalise_language("ja-JP"), djset._wanted)
+
+    def test_the_model_is_asked_for_more_songs_than_the_set_needs(self):
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn()
+        self.assertIn("list %d real" % djset.ASK_SIZE, self.prompts[0])
+
+    # ------------------------------------------------- out of the comfort zone
+
+    def test_a_song_the_listener_already_owns_is_never_served(self):
+        self.engine.taste.known = {"mimi|hanataba"}
+        self.replies = [reply("one", [("MIMI", "Hanataba"), ("A", "One"),
+                                      ("B", "Two"), ("C", "Three"),
+                                      ("D", "Four")])]
+        out = self.turn()
+        self.assertEqual([t["title"] for t in out["tracks"]],
+                         ["One", "Two", "Three", "Four"])
+
+    def test_only_one_song_comes_from_an_artist_they_already_play(self):
+        # Three of the five proposals are artists in the taste profile. One
+        # gets a slot; the rest of the set goes to names they have not played.
+        self.replies = [reply("one", [("MIMI", "One"), ("YOASOBI", "Two"),
+                                      ("RADWIMPS", "Three"), ("A", "Four"),
+                                      ("B", "Five"), ("C", "Six")])]
+        out = self.turn()
+        titles = [t["title"] for t in out["tracks"]]
+        self.assertEqual(titles, ["One", "Four", "Five", "Six"])
+
+    def test_the_familiar_cap_gives_way_rather_than_hand_over_a_short_set(self):
+        # Nothing but artists they already play. A set of one is worse than a
+        # set that leans familiar, so the second pass takes them.
+        self.replies = [reply("one", [("MIMI", "One"), ("YOASOBI", "Two"),
+                                      ("RADWIMPS", "Three")])]
+        out = self.turn()
+        self.assertEqual([t["title"] for t in out["tracks"]],
+                         ["One", "Two", "Three"])
+
+    def test_the_top_up_prefers_a_stranger_to_a_familiar_name(self):
+        self.missing.update({"Two", "Three", "Four"})
+        self.radio_pool = [track("YOASOBI", "Near"), track("D", "N1"),
+                           track("E", "N2")]
+        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three"), ("Z", "Four")])]
+        out = self.turn()
+        titles = [t["title"] for t in out["tracks"]]
+        self.assertEqual(titles[:3], ["One", "N1", "N2"])
+        # Only once the strangers run out does the familiar one get a slot.
+        self.assertEqual(titles[3], "Near")
+
+    def test_the_model_is_told_not_to_replay_what_they_already_own(self):
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn()
+        prompt = self.prompts[0]
+        self.assertIn("Songs they already have on repeat", prompt)
+        self.assertIn("at most ONE of", prompt)
+        self.assertNotIn("Songs they love", prompt)
+
+    # ------------------------------------------------------- across stations
+
+    def test_a_song_played_by_one_station_is_not_replayed_by_the_next(self):
+        self.replies = [reply("one", [("A", "One"), ("B", "Two")])]
+        first = self.turn()
+        self.drain(first["session"])
+
+        self.replies = [reply("two", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three"), ("D", "Four"),
+                                      ("E", "Five")])]
+        second = self.turn()
+        self.assertEqual([t["title"] for t in second["tracks"]],
+                         ["Three", "Four", "Five"])
+
+    def test_the_ledger_outlives_the_process(self):
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn()
+
+        # Same file, fresh memory - what a restart looks like.
+        djset._served.clear()
+        djset._served_loaded = False
+        self.assertIn("a|one", djset._served_keys())
+
+    def test_a_set_built_but_never_taken_is_not_marked_as_played(self):
+        self.replies = [reply("standby", [("A", "One"), ("B", "Two")])]
+        djset._prewarm(self.engine, dj.normalise_language("zh-TW"))
+        self.assertEqual(djset._served_keys(), set())
+
+    def test_the_ledger_forgets_after_a_few_days(self):
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn()
+        for row in djset._served.values():
+            row["at"] -= djset.SERVED_TTL + 60
+        self.assertEqual(djset._served_keys(), set())
+
+    def test_the_model_is_shown_what_the_station_played_before(self):
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn()
+        self.replies = [reply("two", [("B", "Two")])]
+        self.turn()
+        self.assertIn("already played these for them in the last few days",
+                      self.prompts[-1])
+        self.assertIn("A - One", self.prompts[-1])
 
 
 if __name__ == "__main__":

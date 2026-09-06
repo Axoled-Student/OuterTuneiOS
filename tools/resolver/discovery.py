@@ -464,7 +464,9 @@ def auto_theme(engine, cfg, model=None):
            "Their favourite artists: %s\n"
            "Recently enjoyed: %s\n\n"
            "Describe, in one short sentence, the station you would put on for "
-           "them right now. Be specific about mood and genre. Reply with the "
+           "them right now: not the artists above played back to them, but "
+           "the music next door to those - one step out from what they "
+           "already own. Be specific about mood and genre. Reply with the "
            "sentence only."
            % (part, ", ".join(top_artists) or "unknown",
               "; ".join(recent) or "unknown"))
@@ -539,10 +541,13 @@ def _sprint_ask(prompt, engine, auto):
     # 6.2s to 13.2s measured. A plain list of what not to play buys the same
     # freshness at half the wait, and the wait is all the listener sees.
     return (
-        "A listener's favourite artists: %s.\n"
-        "They already play these a lot: %s.\n"
-        "Name %d real, existing songs they would enjoy right now. Do not name "
-        "any song in that second list. At most one song per artist.\n"
+        "A listener already listens to these artists: %s.\n"
+        "They already play these songs a lot: %s.\n"
+        "Name %d real, existing songs they have not found yet but would "
+        "enjoy right now. Do not name any song in that second list, and at "
+        "most one of your choices may be by an artist in the first list - "
+        "the rest must be artists they do not already play. At most one song "
+        "per artist.\n"
         "Respond with ONLY a JSON array of objects, each {\"artist\": ..., "
         "\"title\": ...}, and no other text."
         % (", ".join(top_artists) or "unknown",

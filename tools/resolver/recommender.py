@@ -80,23 +80,67 @@ def identity(track):
 
 
 def script_of(text):
-    """Rough writing-system bucket for a title/artist string."""
-    kana = hangul = han = False
+    """Rough writing-system bucket for a title/artist string.
+
+    Cyrillic gets its own bucket rather than falling through to latin, which is
+    what let Russian rap into a Mandarin queue: nothing in it hits the CJK
+    ranges, so it read as English and every rule that permits an English track
+    permitted it too.
+
+    It is also checked before CJK rather than after, because the bucket is built
+    from title and artist together and the artist can be in a different script
+    from the song. A Russian track uploaded under a Chinese artist name read as
+    Mandarin on that basis and walked into a Mandarin queue. But only a real
+    run of Cyrillic counts: a single stylised letter in an otherwise Japanese
+    title is decoration, not a language.
+    """
+    kana = hangul = han = cyrillic = 0
     for ch in text or "":
         code = ord(ch)
         if 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
-            kana = True
+            kana += 1
         elif 0xAC00 <= code <= 0xD7AF or 0x1100 <= code <= 0x11FF:
-            hangul = True
+            hangul += 1
         elif 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF:
-            han = True
+            han += 1
+        elif 0x0400 <= code <= 0x052F:
+            cyrillic += 1
+    if cyrillic >= 3 and cyrillic >= kana + hangul + han:
+        return "cyrl"
     if kana:
         return "jp"
     if hangul:
         return "kr"
     if han:
         return "han"
+    if cyrillic:
+        return "cyrl"
     return "latin"
+
+
+# The markers of something that is not the release: a lyric-video rip, a
+# pitched edit, a karaoke backing. YouTube Music's radio serves these next to
+# the real recordings, and a queue that plays one has played the wrong thing.
+_REUPLOAD = re.compile(
+    r"【\s*(歌詞|中文歌詞|lyrics?)\s*】"
+    r"|動態歌詞"
+    r"|\blyrics?\s*video\b"
+    r"|\bslowed\b|\bsped\s*up\b|\bnightcore\b|\b8d\s*audio\b"
+    r"|\bkaraoke\b|\boff\s*vocal\b"
+    # Word-bounded so "Undercover Martyn" and "Discover" are left alone.
+    r"|\bcover\s*(by|/)|\bcover\)"
+    r"|\bfan\s*made\b|\bai\s*cover\b"
+    # A cover that never says "cover": credits whoever actually wrote it, which
+    # a release of your own song has no reason to do. Caught a BTS-credited
+    # upload of a Harry Styles track sitting in an English queue.
+    r"|\boriginal\s*(song|artist)\s*[:：]|原曲", re.I)
+
+
+def is_reupload(track):
+    """Whether a candidate looks like somebody's upload of a song rather than
+    the song. Deliberately narrow: only markers that are wrong on any release,
+    so a legitimately titled remix or live version still gets through."""
+    return bool(_REUPLOAD.search(track.get("title") or ""))
 
 
 def track_script(track):
@@ -121,6 +165,8 @@ def language_compatible(seed_script, candidate_script):
         return candidate_script in ("kr", "latin")
     if seed_script == "han":
         return candidate_script in ("han", "latin")
+    if seed_script == "cyrl":
+        return candidate_script in ("cyrl", "latin")
     return True
 
 
@@ -410,9 +456,78 @@ def similarity(a, b):
     return 0.0
 
 
+# ------------------------------------------------------------ recency
+
+# `relevance` is deterministic, so the highest-scoring track in the taste
+# profile leads every queue no matter what was tapped: probes on a Mandarin, an
+# English and a Japanese seed all put the same Vocaloid track in slot two.
+# Blocking repeats within a session did nothing about it, because each of those
+# was a new session. So the ledger outlives the session and the process, and it
+# demotes rather than bans - a thin pool still fills, it just fills with
+# something else first.
+RECENT_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            ".queue_recent.json")
+RECENT_TTL = 60 * 60 * 6
+# Sized against the affinity bonus in `relevance`, which is worth up to 1.6
+# before LAMBDA. A demotion smaller than that loses to any strong favourite,
+# which is exactly the track being demoted - at 0.9 a Japanese seed still opened
+# with the same song twice running.
+RECENT_PENALTY = 1.5
+
+
+class RecentlyServed:
+    """What recent queues handed out, across sessions and across restarts."""
+
+    def __init__(self, path=RECENT_STATE, ttl=RECENT_TTL):
+        self.path = path
+        self.ttl = ttl
+        self._at = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except Exception:
+            return
+        if isinstance(raw, dict):
+            cutoff = time.time() - self.ttl
+            self._at = dict((key, at) for key, at in raw.items()
+                            if isinstance(at, (int, float)) and at > cutoff)
+
+    def _write(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as handle:
+                json.dump(self._at, handle)
+        except Exception:
+            # A queue that played is worth more than a ledger that saved.
+            pass
+
+    def note(self, tracks):
+        now = time.time()
+        cutoff = now - self.ttl
+        with self._lock:
+            for track in tracks or []:
+                self._at[identity(track)] = now
+            self._at = dict((key, at) for key, at in self._at.items()
+                            if at > cutoff)
+            self._write()
+
+    def penalty(self, key):
+        """Full strength just after it played, nothing once the TTL is up."""
+        at = self._at.get(key)
+        if not at:
+            return 0.0
+        age = time.time() - at
+        if age < 0 or age >= self.ttl:
+            return 0.0
+        return RECENT_PENALTY * (1.0 - age / self.ttl)
+
+
 def select(pool, taste, limit, blocked_ids, blocked_identities,
            session_artists, seed_script=None, min_seed_share=0.5,
-           learned=None):
+           learned=None, recent=None):
     """Maximal Marginal Relevance with hard artist caps and spacing.
 
     `min_seed_share` reserves part of the batch for the seed's own radio. Taste
@@ -435,6 +550,14 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
         if len(survivors) >= max(limit, 6):
             remaining = survivors
 
+    # Lyric-video rips, pitched edits, karaoke backings. Same shape of guard as
+    # the one above: applied only while it leaves enough to build a queue from,
+    # so a thin pool degrades to a queue with a reupload in it rather than a
+    # short one.
+    real = [c for c in remaining if not is_reupload(c)]
+    if len(real) >= max(limit, 6):
+        remaining = real
+
     if seed_script:
         coherent = [c for c in remaining
                     if language_compatible(seed_script, track_script(c))]
@@ -451,11 +574,27 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
     familiar_cap = max(1, int(limit * 0.2))
     familiar_taken = 0
 
+    # A Mandarin or Japanese seed may take the odd English track, and
+    # language_compatible lets it - but the taste profile is full of
+    # latin-scripted names, romanised Vocaloid producers and EDM, and that rule
+    # waves every one of them through. Measured on a Mandarin seed: ten of
+    # twenty picks came back latin, none of them Mandarin. So the allowance is
+    # a quarter of the batch rather than all of it.
+    native_seed = bool(seed_script) and seed_script != "latin"
+    foreign_cap = max(1, int(limit * 0.25)) if native_seed else limit
+    foreign_taken = 0
+    relaxed = False
+
     while remaining and len(chosen) < limit:
-        # Once the remaining slots are exactly what the seed quota still needs,
-        # stop considering anything else.
         slots_left = limit - len(chosen)
-        radio_only = (seed_quota - radio_taken) >= slots_left
+        # The reservation is spread across the batch rather than spent at the
+        # end of it. Leaving it to the tail let the profile's favourites take
+        # the front of every queue: three different seeds - Mandarin, English,
+        # Japanese - all opened with the same two tracks, neither of which had
+        # anything to do with the song that was tapped.
+        pace = -(-seed_quota * (len(chosen) + 1) // limit)
+        radio_only = (radio_taken < pace
+                      or (seed_quota - radio_taken) >= slots_left)
 
         best, best_value = None, None
         for candidate in remaining:
@@ -465,6 +604,9 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
                 continue
             if identity(candidate) in taste.known and familiar_taken >= familiar_cap:
                 continue
+            if (native_seed and foreign_taken >= foreign_cap
+                    and track_script(candidate) == "latin"):
+                continue
             artist = primary_artist(candidate.get("artist"))
             if batch_artists.get(artist, 0) >= ARTIST_CAP:
                 continue
@@ -472,12 +614,15 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
                     >= SESSION_ARTIST_CAP:
                 continue
             if spacing > 0:
-                recent = [primary_artist(x.get("artist")) for x in chosen[-spacing:]]
-                if artist in recent:
+                just_played = [primary_artist(x.get("artist"))
+                               for x in chosen[-spacing:]]
+                if artist in just_played:
                     continue
             penalty = max((similarity(candidate, x) for x in chosen), default=0.0)
             value = (LAMBDA * relevance(candidate, taste, learned)
                      - (1 - LAMBDA) * penalty)
+            if recent is not None:
+                value -= recent.penalty(identity(candidate))
             if best_value is None or value > best_value:
                 best, best_value = candidate, value
 
@@ -485,11 +630,21 @@ def select(pool, taste, limit, blocked_ids, blocked_identities,
             if spacing > 0:
                 spacing -= 1
                 continue
+            if not relaxed:
+                # Nothing left that fits. A short queue is worse than a mixed
+                # one, so the language allowance and the seed reservation both
+                # give way before the queue does.
+                relaxed = True
+                foreign_cap = limit
+                seed_quota = radio_taken
+                continue
             break
 
         chosen.append(best)
         if identity(best) in taste.known:
             familiar_taken += 1
+        if native_seed and track_script(best) == "latin":
+            foreign_taken += 1
         if best.get("source") == "radio":
             radio_taken += 1
         artist = primary_artist(best.get("artist"))
@@ -514,6 +669,7 @@ class QueueEngine:
         self.cookie = cookie
         self.taste = TasteProfile()
         self.learned = feedback_module.FeedbackStore()
+        self.recent = RecentlyServed()
         self._visitor = None
         self._visitor_at = 0
         self._sessions = {}
@@ -618,7 +774,9 @@ class QueueEngine:
                                            seed.get("artist") or ""))
         picks = select(pool, self.taste, limit, blocked_ids,
                        blocked_identities, state["artists"],
-                       seed_script=seed_script, learned=self.learned)
+                       seed_script=seed_script, learned=self.learned,
+                       recent=self.recent)
+        self.recent.note(picks)
 
         with self._lock:
             for pick in picks:

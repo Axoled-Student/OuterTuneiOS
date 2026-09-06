@@ -128,3 +128,6 @@ build/ytm_cookies.txt
 tools/resolver/.feedback.json
 
 tools/resolver/.home_cache.json
+tools/resolver/.djset_langs.json
+tools/resolver/.djset_served.json
+tools/resolver/.queue_recent.json

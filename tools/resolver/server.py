@@ -747,6 +747,15 @@ def main():
               % (discovery.HOME_TTL // 60))
     except Exception as e:  # noqa: BLE001
         print("  home warmup skipped: %s" % e)
+
+    # And the same for the DJ: an opening set costs half a minute to build, so
+    # one stands by rather than being built while somebody waits for it.
+    try:
+        import djset
+        djset.start_auto_warm(Handler.queue_engine)
+        print("  dj keeps an opening set ready per language in use")
+    except Exception as e:  # noqa: BLE001
+        print("  dj warmup skipped: %s" % e)
     Handler.token = args.token
 
     server = ThreadedServer((args.host, args.port), Handler)
