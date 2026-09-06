@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Network
 
@@ -53,6 +54,31 @@ final class NetworkConditions: ObservableObject {
     var forwardBufferSeconds: Double {
         if isConstrained { return 45 }
         return isExpensive ? 90 : 0
+    }
+
+    /// Pixels to request per point of artwork.
+    ///
+    /// Covers are re-encoded server-side, so this is a real data lever rather
+    /// than a cosmetic one: the same cover measured 3KB at 60px, 14KB at 226px,
+    /// 58KB at 544px and 142KB at 1080px. Wi-Fi gets the display's full native
+    /// resolution. Cellular gets 2x, which is very hard to tell from 3x at
+    /// tile size and roughly halves the bytes across a hundred-cover home
+    /// screen. Low Data Mode drops to 1x.
+    var artworkScale: CGFloat {
+        let native = ArtworkURL.displayScale
+        if isConstrained { return 1 }
+        return isExpensive ? min(native, 2) : native
+    }
+
+    /// Ceiling on any single cover, whatever the view asks for.
+    ///
+    /// The now-playing screen is one image rather than a hundred, so it keeps a
+    /// generous allowance even on cellular; the cap mostly exists to stop a
+    /// full-screen request from becoming a half-megabyte download in Low Data
+    /// Mode.
+    var artworkPixelCap: Int {
+        if isConstrained { return 320 }
+        return isExpensive ? 1080 : 1440
     }
 
     /// Human-readable label for the settings screen.

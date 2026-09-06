@@ -16,13 +16,27 @@ struct TrackArtworkView: View {
             // screen shows about a hundred covers, so artwork was most of the
             // app's network traffic. ImageCache holds them in memory and on disk.
             if let urlString, !urlString.isEmpty {
-                if let image = cache.cached(urlString) {
+                // Ask for the size this view actually draws. Taking whatever
+                // InnerTube offered meant a 120px cover stretched over a 148pt
+                // tile; the same cover re-encoded at 544px costs 58KB and is
+                // the difference between soft and sharp.
+                let sized = ArtworkURL.sized(urlString, forPoints: dimension)
+                    ?? urlString
+                if let image = cache.cached(sized) {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFill()
+                } else if let stale = cache.cached(urlString) {
+                    // A smaller copy is already on disk from an earlier visit.
+                    // Showing it beats showing a grey box while the sharp one
+                    // arrives, and it swaps in place with no layout change.
+                    Image(uiImage: stale)
+                        .resizable()
+                        .scaledToFill()
+                        .onAppear { cache.load(sized) }
                 } else {
                     artworkPlaceholder
-                        .onAppear { cache.load(urlString) }
+                        .onAppear { cache.load(sized) }
                 }
             } else {
                 artworkPlaceholder

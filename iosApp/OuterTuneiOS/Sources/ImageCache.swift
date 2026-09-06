@@ -14,14 +14,19 @@ import UIKit
 final class ImageCache: ObservableObject {
     static let shared = ImageCache()
 
-    /// Disk budget. Thumbnails are a few KB each, so this holds many thousands.
-    private static let diskBudget: UInt64 = 96 << 20
+    /// Disk budget. Covers are now requested at the size they are drawn -
+    /// tens of KB rather than a few - so the old 96MB would have held far less
+    /// of the listener's library than it used to.
+    private static let diskBudget: UInt64 = 256 << 20
 
 #if os(iOS)
     private let memory: NSCache<NSString, UIImage> = {
         let cache = NSCache<NSString, UIImage>()
-        cache.countLimit = 400
-        cache.totalCostLimit = 48 << 20
+        cache.countLimit = 300
+        // Costs are decoded bytes, not file bytes: a 1080px cover is 142KB on
+        // disk but 4.6MB in memory, and budgeting by the former would let a
+        // few full-screen images quietly blow past the limit.
+        cache.totalCostLimit = 96 << 20
         return cache
     }()
 #endif
@@ -61,7 +66,7 @@ final class ImageCache: ObservableObject {
             return nil
         }
         memory.setObject(image, forKey: urlString as NSString,
-                         cost: data.count)
+                         cost: Self.decodedBytes(image))
         return image
     }
 
@@ -73,19 +78,38 @@ final class ImageCache: ObservableObject {
 
         inFlight[urlString] = Task { [weak self] in
             defer { self?.inFlight[urlString] = nil }
-            guard let (data, _) = try? await URLSession.shared.data(from: url),
-                  let image = UIImage(data: data) else {
+            var payload = try? await URLSession.shared.data(from: url)
+            if Self.isMissing(payload?.1),
+               let alternative = ArtworkURL.fallback(for: urlString),
+               let retryURL = URL(string: alternative) {
+                // i.ytimg does not publish every named size for every video,
+                // so a 404 here means "ask for the one that always exists".
+                payload = try? await URLSession.shared.data(from: retryURL)
+            }
+            guard let data = payload?.0, let image = UIImage(data: data) else {
                 return
             }
             guard let self else { return }
             self.memory.setObject(image, forKey: urlString as NSString,
-                                  cost: data.count)
+                                  cost: Self.decodedBytes(image))
             try? data.write(to: self.path(for: urlString), options: .atomic)
             // Nudge observers so views holding a placeholder redraw.
             self.version &+= 1
         }
     }
+
+    /// What an image costs in memory once decoded: 4 bytes a pixel.
+    private static func decodedBytes(_ image: UIImage) -> Int {
+        let size = image.size
+        let scale = image.scale
+        return max(1, Int(size.width * scale * size.height * scale * 4))
+    }
 #endif
+
+    private static func isMissing(_ response: URLResponse?) -> Bool {
+        guard let http = response as? HTTPURLResponse else { return false }
+        return http.statusCode == 404
+    }
 
     /// Drop the oldest files once the directory outgrows its budget.
     private func pruneIfNeeded() async {
