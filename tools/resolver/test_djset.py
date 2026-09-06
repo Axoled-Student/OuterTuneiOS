@@ -74,6 +74,10 @@ class LoopTest(unittest.TestCase):
     def setUp(self):
         self.engine = FakeEngine()
         djset._sessions.clear()
+        # Which slice of the old favourites a new station opens on. It only
+        # ever climbs in service; here it starts over, so a test that reads
+        # the prompt does not depend on how many stations ran before it.
+        djset._rotation = 0
 
         self._cfg = discovery._ai_config
         discovery._ai_config = lambda: {"endpoint": "x", "key": "y"}
@@ -519,7 +523,10 @@ class LoopTest(unittest.TestCase):
         self.assertNotIn("One", [t["title"] for t in third["tracks"]])
 
     def test_a_full_set_is_never_topped_up(self):
-        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+        # Balanced proposals: enough of their own artists to meet the floor and
+        # strangers for the rest. Nothing is missing and nothing is held back,
+        # so there is no reason to go to the radio at all.
+        self.replies = [reply("one", [("MIMI", "One"), ("YOASOBI", "Two"),
                                       ("C", "Three"), ("D", "Four"),
                                       ("E", "Five")])]
         out = self.turn()
@@ -587,6 +594,38 @@ class LoopTest(unittest.TestCase):
         self.assertEqual(second["set"], 2)
         self.assertEqual([t["title"] for t in second["tracks"]], ["Two"])
 
+    def test_a_standing_set_a_station_has_overtaken_is_not_served(self):
+        # The set standing by was chosen before this evening's station ran.
+        # Both had first pick of the same profile and reached for the same
+        # name, so by the time anybody could be given it, its songs had
+        # already played.
+        lang = dj.normalise_language("zh-TW")
+        self.replies = [reply("prewarmed", [("A", "One"), ("B", "Two")])]
+        self.assertTrue(djset._prewarm(self.engine, lang))
+
+        djset._note_served([track("A", "One")])
+
+        self.replies = [reply("fresh", [("D", "Four")])]
+        self.assertEqual(self.turn()["theme"], "fresh")
+
+    def test_an_overtaken_standing_set_is_thrown_away_rather_than_held(self):
+        # And it goes at once, so the warm loop builds another. Left there it
+        # would be refused by every station opened until its rebuild came
+        # round, each of them waiting out a build from scratch instead.
+        lang = dj.normalise_language("zh-TW")
+        self.replies = [reply("prewarmed", [("A", "One")])]
+        self.assertTrue(djset._prewarm(self.engine, lang))
+        djset._note_served([track("A", "One")])
+        djset._retire_overtaken(lang)
+        self.assertEqual(djset._ready, {})
+
+    def test_a_standing_set_the_station_did_not_touch_is_still_served(self):
+        lang = dj.normalise_language("zh-TW")
+        self.replies = [reply("prewarmed", [("A", "One")])]
+        self.assertTrue(djset._prewarm(self.engine, lang))
+        djset._note_served([track("B", "Two")])
+        self.assertEqual(self.turn()["theme"], "prewarmed")
+
     def test_a_prewarm_that_fails_leaves_nothing_standing(self):
         self.replies = [RuntimeError("upstream fell over")]
         self.assertFalse(djset._prewarm(self.engine,
@@ -605,24 +644,62 @@ class LoopTest(unittest.TestCase):
 
     # ------------------------------------------------- out of the comfort zone
 
-    def test_a_song_the_listener_already_owns_is_never_served(self):
-        self.engine.taste.known = {"mimi|hanataba"}
-        self.replies = [reply("one", [("MIMI", "Hanataba"), ("A", "One"),
-                                      ("B", "Two"), ("C", "Three"),
-                                      ("D", "Four")])]
-        out = self.turn()
-        self.assertEqual([t["title"] for t in out["tracks"]],
-                         ["One", "Two", "Three", "Four"])
+    def test_songs_from_their_own_library_do_get_played(self):
+        # A DJ that never plays anything you own is a stranger reading out a
+        # list. Two of these are already in the library and both get a slot.
+        self.engine.taste.known = {"mimi|hanataba", "yoasobi|yoru"}
+        self.replies = [reply("one", [("MIMI", "Hanataba"), ("YOASOBI", "Yoru"),
+                                      ("A", "One"), ("B", "Two"),
+                                      ("C", "Three")])]
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertIn("Hanataba", titles)
+        self.assertIn("Yoru", titles)
 
-    def test_only_one_song_comes_from_an_artist_they_already_play(self):
-        # Three of the five proposals are artists in the taste profile. One
-        # gets a slot; the rest of the set goes to names they have not played.
+    def test_their_own_library_still_does_not_fill_the_set(self):
+        # Three owned songs offered, and the set is four long. Two is the cap,
+        # so the rest of it has to come from somewhere else.
+        self.engine.taste.known = {"mimi|hanataba", "yoasobi|yoru",
+                                   "radwimps|sparkle"}
+        self.replies = [reply("one", [("MIMI", "Hanataba"), ("YOASOBI", "Yoru"),
+                                      ("RADWIMPS", "Sparkle"), ("A", "One"),
+                                      ("B", "Two")])]
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        owned = [t for t in titles if t in ("Hanataba", "Yoru", "Sparkle")]
+        self.assertEqual(len(owned), djset.OWNED_PER_SET)
+
+    def test_a_set_is_mostly_artists_they_already_love(self):
+        # Spotify's DJ runs about two thirds familiar. Three of these six are
+        # artists in the profile, and they take three of the four slots.
         self.replies = [reply("one", [("MIMI", "One"), ("YOASOBI", "Two"),
                                       ("RADWIMPS", "Three"), ("A", "Four"),
                                       ("B", "Five"), ("C", "Six")])]
-        out = self.turn()
-        titles = [t["title"] for t in out["tracks"]]
-        self.assertEqual(titles, ["One", "Four", "Five", "Six"])
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertEqual(titles, ["One", "Two", "Three", "Four"])
+
+    def test_one_slot_is_always_held_for_somebody_new(self):
+        # Five of the six proposals are artists they already play, and they are
+        # the five the model put first. The set still ends up with a stranger.
+        self.engine.taste.artists = {"mimi": 9, "yoasobi": 7, "radwimps": 4,
+                                     "eve": 3, "ado": 2}
+        self.replies = [reply("one", [("MIMI", "One"), ("YOASOBI", "Two"),
+                                      ("RADWIMPS", "Three"), ("Eve", "Four"),
+                                      ("Ado", "Five"), ("Stranger", "Six")])]
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertEqual(titles, ["One", "Two", "Three", "Six"])
+
+    def test_the_last_slot_is_held_open_when_the_cap_alone_would_not(self):
+        # With the familiar cap as high as the set is long, nothing but the
+        # reservation stops four familiar names taking all four slots.
+        self.engine.taste.artists = {"mimi": 9, "yoasobi": 7, "radwimps": 4,
+                                     "eve": 3}
+        was = djset.FAMILIAR_PER_SET
+        djset.FAMILIAR_PER_SET = 4
+        self.addCleanup(setattr, djset, "FAMILIAR_PER_SET", was)
+        self.replies = [reply("one", [("MIMI", "One"), ("YOASOBI", "Two"),
+                                      ("RADWIMPS", "Three"), ("Eve", "Four"),
+                                      ("Stranger", "Five")])]
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertEqual(titles, ["One", "Two", "Three", "Five"])
 
     def test_the_familiar_cap_gives_way_rather_than_hand_over_a_short_set(self):
         # Nothing but artists they already play. A set of one is worse than a
@@ -633,25 +710,113 @@ class LoopTest(unittest.TestCase):
         self.assertEqual([t["title"] for t in out["tracks"]],
                          ["One", "Two", "Three"])
 
-    def test_the_top_up_prefers_a_stranger_to_a_familiar_name(self):
+    def test_the_top_up_takes_a_familiar_name_the_set_has_room_for(self):
+        # A radio is ranked by closeness to its seed, so the artists this
+        # listener already plays come out at the top of it. That used to be a
+        # reason to skip past them; now it is only a reason not to take all of
+        # them.
         self.missing.update({"Two", "Three", "Four"})
         self.radio_pool = [track("YOASOBI", "Near"), track("D", "N1"),
                            track("E", "N2")]
         self.replies = [reply("one", [("A", "One"), ("B", "Two"),
                                       ("C", "Three"), ("Z", "Four")])]
-        out = self.turn()
-        titles = [t["title"] for t in out["tracks"]]
-        self.assertEqual(titles[:3], ["One", "N1", "N2"])
-        # Only once the strangers run out does the familiar one get a slot.
-        self.assertEqual(titles[3], "Near")
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertEqual(titles, ["One", "Near", "N1", "N2"])
 
-    def test_the_model_is_told_not_to_replay_what_they_already_own(self):
+    def test_the_top_up_fills_toward_the_balance_and_not_past_it(self):
+        # The whole top of the radio is artists they already play. The set
+        # takes its share of them and then reaches past the rest.
+        self.missing.update({"Two", "Three", "Four"})
+        self.radio_pool = [track("Eve", "Near1"), track("Ado", "Near2"),
+                           track("YOASOBI", "Near3"), track("D", "N1")]
+        self.engine.taste.artists = {"mimi": 9, "yoasobi": 7, "radwimps": 4,
+                                     "eve": 3, "ado": 2}
+        self.replies = [reply("one", [("MIMI", "One"), ("YOASOBI", "Two"),
+                                      ("RADWIMPS", "Three"), ("Z", "Four")])]
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertEqual(titles, ["One", "Near1", "Near2", "N1"])
+        self.assertNotIn("Near3", titles)
+
+    def test_the_radio_gets_the_slots_held_for_artists_they_love(self):
+        # Four strangers, all real, all ahead of anything else. Two of them
+        # get in and the other two slots are held - and it is the radio, not
+        # the rest of the model's list, that is offered them, because that is
+        # where a name they already play is certain to be found.
+        self.radio_pool = [track("MIMI", "Near1"), track("YOASOBI", "Near2"),
+                           track("Q", "N1")]
+        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three"), ("D", "Four")])]
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertEqual(titles, ["One", "Two", "Near1", "Near2"])
+
+    def test_the_floor_gives_way_rather_than_hand_over_a_short_set(self):
+        # Nobody they have ever played anywhere - not in the model's list and
+        # not in the radio behind it. A set of two is worse than a set of
+        # strangers, so the held slots are let go.
+        self.replies = [reply("one", [("A", "One"), ("B", "Two"),
+                                      ("C", "Three"), ("D", "Four")])]
+        titles = [t["title"] for t in self.turn()["tracks"]]
+        self.assertEqual(titles, ["One", "Two", "Three", "Four"])
+
+    def test_the_model_is_asked_for_mostly_music_they_love(self):
         self.replies = [reply("one", [("A", "One")])]
         self.turn()
         prompt = self.prompts[0]
-        self.assertIn("Songs they already have on repeat", prompt)
-        self.assertIn("at most ONE of", prompt)
-        self.assertNotIn("Songs they love", prompt)
+        self.assertIn("mostly music they already love", prompt)
+        self.assertIn("must be artists from the lists above", prompt)
+        self.assertIn("must be artists they have never played", prompt)
+
+    def test_the_model_is_shown_the_favourites_it_would_otherwise_forget(self):
+        # The buckets are named apart so the rule can point at one of them.
+        # Handed a single list of songs somebody loves, the model hands that
+        # list straight back.
+        self.engine.taste.tracks = [
+            {"name": "Hit %d" % n, "artist": "Fav%d" % n, "weight": 20 - n}
+            for n in range(20)]
+        self.replies = [reply("one", [("A", "One")])]
+        self.turn()
+        lines = {}
+        for line in self.prompts[0].splitlines():
+            head, _, rest = line.partition(": ")
+            if head in ("On heavy rotation right now",
+                        "Loved once, not played in a while"):
+                lines[head] = rest.rstrip(".").split("; ")
+        self.assertIn("Hit 0", "; ".join(lines["On heavy rotation right now"]))
+        buried = lines["Loved once, not played in a while"]
+        self.assertEqual(len(buried), djset.DEEP_CUTS)
+        # Whatever slice it lands on, it is not the one they are already
+        # playing - that bucket is the heading above.
+        self.assertFalse(set(buried)
+                         & {"Fav%d - Hit %d" % (n, n) for n in range(8)})
+
+    def test_two_stations_do_not_open_on_the_same_old_favourites(self):
+        # Both are set one. Without a rotation of their own they would be
+        # handed the same slice of the profile, and once most of a set is
+        # meant to be music they already love, the same slice is the same
+        # three songs.
+        self.engine.taste.tracks = [
+            {"name": "Hit %d" % n, "artist": "Fav%d" % n, "weight": 40 - n}
+            for n in range(40)]
+        self.replies = [reply("one", [("A", "One")]),
+                        reply("two", [("B", "Two")])]
+        self.turn()
+        self.turn()
+        buried = []
+        for prompt in self.prompts[:2]:
+            line = [l for l in prompt.splitlines()
+                    if l.startswith("Loved once")]
+            self.assertTrue(line)
+            buried.append(line[0])
+        self.assertNotEqual(buried[0], buried[1])
+
+    def test_consecutive_sets_are_shown_different_old_favourites(self):
+        self.engine.taste.tracks = [
+            {"name": "Hit %d" % n, "artist": "Fav%d" % n, "weight": 40 - n}
+            for n in range(40)]
+        _, _, first = djset._profile(self.engine, 0)
+        _, _, second = djset._profile(self.engine, 1)
+        self.assertTrue(first)
+        self.assertFalse(set(first) & set(second))
 
     # ------------------------------------------------------- across stations
 

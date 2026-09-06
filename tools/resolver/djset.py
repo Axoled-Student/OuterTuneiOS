@@ -23,16 +23,18 @@ listener never waits for the DJ: the answer is already sitting in memory when
 the last song of the current set ends, and how many round trips it took to get
 there stopped mattering.
 
-The songs are chosen to sit outside what the listener already plays. A
-model handed a list of somebody's favourites and asked what to play next will
-hand the favourites back, which is a station that only ever confirms what you
-already knew. So the profile is given to it as a boundary rather than a menu:
-these are the songs they have on repeat, do not choose them, and at most one
-song per set may be by an artist they already listen to. What the DJ is for is
-the third and fourth artist along - the same scene, the same feeling, a name
-they have not heard. The rule is enforced twice, once in the asking and once in
-the picking, because a model told not to reach for the obvious still reaches
-for it perhaps a third of the time.
+Most of a set is music the listener already loves, and some of it is not, and
+both halves have to be forced. A model handed a list of somebody's favourites
+and asked what to play next hands the favourites straight back, so discovery
+needs a slot held open for it. A model told to stay off the favourites returns
+a set of strangers, which is not a station either - it is a stranger reading
+out a list. So the profile arrives as three lists rather than one: who they
+love, what they have on right now, and what they loved once and have not put
+on in months. Roughly two thirds of what plays is theirs, drawn from further
+down that profile than the songs they are already playing on their own, and at
+least one name per set is somebody they have never heard. The balance is
+enforced twice, once in the asking and once in the picking, because a model
+given a ratio keeps to it about as well as it keeps to anything else.
 
 That only stops the same songs coming back within one station. Coming back
 every station is a different problem, and needs a ledger that outlives the
@@ -65,17 +67,43 @@ SET_SIZE = 4
 # same recording, a list of exactly four routinely resolved to one.
 ASK_SIZE = SET_SIZE + 4
 SESSION_TTL = 60 * 90
-# How much of a set may be by an artist the listener already plays. Three of
-# four songs by somebody new is what "out of my comfort zone" has to mean if it
-# is going to mean anything; one familiar name keeps the set from feeling like
-# a stranger's playlist.
-FAMILIAR_PER_SET = 1
+# A DJ plays you music you love. Spotify's aims for roughly two thirds already
+# familiar and one third new, and draws the familiar part from across your
+# history rather than off the top of it - "old favourites you may have
+# forgotten" is how they put it. Holding discovery to one name per set was the
+# first mistake; holding it to three was the opposite one, and a station of
+# strangers is not a station. So most of a set is theirs, at least one slot is
+# always somebody new, and the familiar part comes from further down the
+# profile than the five songs they are already playing on their own.
+FAMILIAR_PER_SET = 3
+STRANGERS_PER_SET = 1
+# A cap only stops the set going too far one way. With a cap and a slot held
+# for discovery and nothing else, six live sets came back 54% familiar: inside
+# the letter of the rule and outside the point of it, because nothing ever
+# obliged the model's strangers to give a slot back. So the familiar side is
+# reserved the same way the discovery slot is - under the floor, a stranger is
+# passed over and the gap is filled from their own artists instead.
+FAMILIAR_MIN = 2
+# Songs already in their library, as opposed to other songs by artists they
+# play. Worth hearing - a DJ that never plays anything you own is a stranger
+# reading out a list - but they can put these on themselves, so they stay a
+# minority of the set.
+OWNED_PER_SET = 2
+# How many older favourites the prompt surfaces per set, rotating, so the
+# familiar half is familiar without being the same four titles every time.
+DEEP_CUTS = 10
 # How much history the prompt carries. Everything played is blocked from
 # repeating regardless; this is only what the model is shown.
 RECENT_SHOWN = 24
 
 _sessions = {}
 _sessions_guard = threading.Lock()
+# Which slice of the old favourites the next new station opens on. Every
+# station starts at set one, so without this every station opens on the same
+# slice of the profile - and once most of a set is meant to be music they
+# already love, that means two stations opened minutes apart open with the
+# same three names.
+_rotation = 0
 
 _pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=3, thread_name_prefix="djset")
@@ -94,9 +122,12 @@ _lookup_pool = concurrent.futures.ThreadPoolExecutor(
 # favourites again - which is the complaint this exists to answer.
 SERVED_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             ".djset_served.json")
-# Long enough that a song does not come back the same evening or the next one,
-# short enough that the well does not run dry.
-SERVED_TTL = 60 * 60 * 72
+# Long enough that stations opened minutes or hours apart never repeat, which
+# is what this was for. Not longer: most of a set is now meant to be music they
+# already love, and a three-day block eats through the familiar half of the
+# profile faster than it refills, which quietly forces the station back to
+# strangers. A favourite should be able to come round again tomorrow.
+SERVED_TTL = 60 * 60 * 24
 # How many of them the model is shown. Everything in the ledger is blocked in
 # code regardless; this is only the reminder in the prompt.
 SERVED_SHOWN = 30
@@ -201,11 +232,16 @@ def _new_state(language, register=True):
     An unregistered one is a scratch session used to build a set before there
     is a listener for it; it joins the real ones when somebody adopts it.
     """
+    global _rotation
     now = time.time()
+    with _sessions_guard:
+        _rotation += 1
+        rotation = _rotation
     state = {
         "id": uuid.uuid4().hex[:12],
         "language": language,
         "index": 0,              # sets handed over so far
+        "rotation": rotation,    # where in the old favourites this one opens
         "history": [],           # (theme, [descriptions]) for the prompt
         "played": [],            # descriptions, newest last
         "seen_keys": set(),      # identities, so nothing repeats in a session
@@ -234,17 +270,32 @@ def _adopt(state):
 # -------------------------------------------------------------------- asking
 
 
-def _profile(engine):
+def _profile(engine, offset=0):
+    """The three things a DJ knows about you: who you love, what you have on
+    right now, and what you loved once and have not put on in months.
+
+    Split up because a model shown only the top of a profile picks off the top
+    of a profile, which is how a station ends up handing somebody their own
+    five favourite songs back. The third bucket rotates on `offset`, so the
+    familiar part of consecutive sets is drawn from different places in it.
+    """
     top = [a for a, _ in sorted(engine.taste.artists.items(),
                                 key=lambda kv: -kv[1])[:12]]
-    loved = ["%s - %s" % (t["artist"], t["name"])
-             for t in engine.taste.tracks[:10]]
-    return top, loved
+    tracks = list(engine.taste.tracks)
+    loved = ["%s - %s" % (t["artist"], t["name"]) for t in tracks[:8]]
+    deep, buried = tracks[8:], []
+    if deep:
+        start = (offset * DEEP_CUTS) % len(deep)
+        rows = [deep[(start + n) % len(deep)]
+                for n in range(min(DEEP_CUTS, len(deep)))]
+        buried = ["%s - %s" % (t["artist"], t["name"]) for t in rows]
+    return top, loved, buried
 
 
 def _ask(engine, state, language):
     """One prompt for the whole turn: theme, songs, and whether to speak."""
-    top, loved = _profile(engine)
+    top, loved, buried = _profile(
+        engine, state["index"] + state.get("rotation", 0))
     hour = time.localtime().tm_hour
     part = ("late at night" if hour >= 22 or hour < 5 else
             "in the morning" if hour < 11 else
@@ -257,15 +308,17 @@ def _ask(engine, state, language):
         "It is %s for them." % part,
     ]
 
-    # Handed over as the edge of what they have already heard, not as a list to
-    # choose from. Worded that way in the heading as well as the rule below,
-    # because a heading that reads "songs they love" is an invitation however
-    # the instruction underneath is phrased.
+    # Three headings rather than one. Handed a single list of songs somebody
+    # loves, the model hands that list straight back - which is what "it keeps
+    # picking the same songs I like" was. Naming the buckets apart lets the
+    # rule below point at one of them in particular.
     if top:
-        lines.append("Artists they already listen to: %s." % ", ".join(top))
+        lines.append("Artists they love: %s." % ", ".join(top))
     if loved:
-        lines.append("Songs they already have on repeat: %s."
-                     % "; ".join(loved))
+        lines.append("On heavy rotation right now: %s." % "; ".join(loved))
+    if buried:
+        lines.append("Loved once, not played in a while: %s."
+                     % "; ".join(buried))
     if not top and not loved:
         lines.append("Nothing is known about their taste yet, so play them "
                      "something good.")
@@ -302,12 +355,14 @@ def _ask(engine, state, language):
         "Pick ONE theme for the next short set: a mood, a thread, a time of "
         "day, a sound. It should follow on from what just happened rather "
         "than repeat it, and it must not be a theme you already played.",
-        "The point of this station is the music they have not found yet. "
-        "Never choose a song they already have on repeat, and at most ONE of "
-        "your choices may be by an artist they already listen to - the rest "
-        "must be artists they have never played. Reach one step out from "
-        "their taste rather than into the middle of it: the same scene, the "
-        "same feeling, names they do not own yet.",
+        "Build it the way a radio DJ would rather than the way a "
+        "recommender would: mostly music they already love, with room for "
+        "something new. Most of your list - five or six of them - must be "
+        "artists from the lists above, and reach for what they loved once and "
+        "have not played in a while before what is already on heavy rotation, "
+        "because they can put that on themselves. The rest must be artists "
+        "they have never played, standing right next to their taste rather "
+        "than far from it.",
         "Then list %d real, existing songs that fit it, best first. Only the "
         "first few get played - the rest are spares, for the ones that turn "
         "out not to be on YouTube Music - so put your strongest choices at "
@@ -400,6 +455,14 @@ def _lookup(engine, visitor, song):
                                                    engine.cookie))
 
 
+def _floor(want):
+    """How many of a set must be theirs - never so many that the slot held for
+    discovery has nowhere left to go. That matters for the short sets the
+    top-up asks about, where two of theirs plus one stranger is already more
+    than the set has room for."""
+    return min(FAMILIAR_MIN, max(0, want - STRANGERS_PER_SET))
+
+
 def _comfort(engine):
     """What counts as already-theirs: artists they play, songs they own.
 
@@ -414,21 +477,140 @@ def _comfort(engine):
     return familiar, known
 
 
+class _Balance:
+    """The shape a set is meant to end up in, kept as it fills.
+
+    Mostly artists they already love, never all of them, some of it from their
+    own library, and always at least one name they have never played.
+
+    It is an object because the same balance has to survive two different
+    pools - the model's proposals and the radio standing behind them - filling
+    the same set. Counting each pool on its own was how the top-up used to
+    undo the balance the first pass had just struck.
+    """
+
+    def __init__(self, want, familiar, known):
+        self.want = want
+        self.familiar = familiar
+        self.known = known
+        self.floor = _floor(want)
+        self.near = self.owned = self.strangers = 0
+
+    def _near(self, track):
+        return rec.primary_artist(track.get("artist")) in self.familiar
+
+    def fits(self, track, taken, strict):
+        """Whether this track can have the next slot.
+
+        Slots are held open at both ends. Without a floor a run of strangers
+        fills the set and the station stops being theirs - six live sets came
+        back 54% familiar that way. Without the reservation at the other end a
+        good run of favourites fills it before discovery reaches a single
+        slot, which is how "mostly what you love" quietly becomes "only what
+        you love".
+
+        The relaxed pass gives all of it up, because a set of two songs is
+        worse than a set weighted wrong. What makes that safe is the order the
+        pools are worked in: by the time anything is asked with `strict` off,
+        the radio has already had its chance at the slots being held.
+        """
+        if not strict:
+            return True
+        near = self._near(track)
+        left = self.want - taken
+        if not near and left <= self.floor - self.near:
+            return False
+        if near and self.near >= FAMILIAR_PER_SET:
+            return False
+        if rec.identity(track) in self.known and self.owned >= OWNED_PER_SET:
+            return False
+        if near and left <= STRANGERS_PER_SET - self.strangers:
+            return False
+        return True
+
+    def add(self, track):
+        if self._near(track):
+            self.near += 1
+        else:
+            self.strangers += 1
+        if rec.identity(track) in self.known:
+            self.owned += 1
+
+
+def _take(engine, state, candidates, tracks, balance, strict):
+    """Move candidates into the set, in order, for as long as they fit.
+
+    Only what is taken is marked as seen. A song passed over today - because
+    the set was full, or because it was the wrong side of the balance - should
+    still be there to play tomorrow.
+    """
+    served = _served_keys()
+    artists = {rec.primary_artist(t.get("artist")) for t in tracks}
+    with state["lock"]:
+        for track in candidates or []:
+            if len(tracks) >= balance.want:
+                break
+            key = rec.identity(track)
+            artist = rec.primary_artist(track.get("artist"))
+            if (track["videoId"] in state["seen_ids"]
+                    or key in state["seen_keys"]
+                    or artist in artists
+                    or key in served
+                    or engine.learned.is_rejected(key)):
+                continue
+            if not balance.fits(track, len(tracks), strict):
+                continue
+            state["seen_ids"].add(track["videoId"])
+            state["seen_keys"].add(key)
+            artists.add(artist)
+            balance.add(track)
+            tracks.append(track)
+    return tracks
+
+
+def _nearby(engine, tracks, cache):
+    """YouTube Music's own station for the first song that survived.
+
+    The model cannot always name four songs that all exist, are all new to
+    this listener and are all by different artists - especially deep into a
+    session, where most of what fits the taste profile has already been
+    played. This is where the rest comes from: demonstrably adjacent to
+    something the set already contains, rather than invented.
+
+    It is also where the familiar half is found when the model has not
+    supplied one. A radio is ranked by how close each track sits to its seed,
+    so the artists this listener already plays come out at the top of it.
+    """
+    if not tracks:
+        return []
+    if "rows" not in cache:
+        seed = tracks[0]["videoId"]
+        try:
+            cache["rows"] = discovery._memo(
+                "r:" + seed,
+                lambda: rec.radio(seed, engine.visitor(), engine.cookie,
+                                  limit=20)) or []
+        except Exception:  # noqa: BLE001
+            cache["rows"] = []
+    return cache["rows"]
+
+
 def _resolve(engine, state, songs, want):
-    """Look the proposals up together and take the first few that survive.
+    """Look the proposals up together and build the set out of what survives.
 
-    Order matters: the model was told to put its strongest choices first, so
-    the spares behind them are only reached for when something ahead of them
-    was fictional, already played, or the same recording under another name.
-    Nothing past the ones taken is marked as seen - a song not needed today
-    should still be available tomorrow.
+    Order matters twice over. Within a pool it is the model's: it was told to
+    put its strongest choices first, so the spares behind them are only
+    reached for when something ahead of them was fictional, already played, or
+    the same recording under another name.
 
-    Two passes over the same candidates. The first holds the line on how much
-    of a set may come from artists the listener already plays, which is where
-    the model drifts back to whatever it can see in the profile. The second
-    gives that line up, because a set of two songs is worse than a set with one
-    familiar name too many - and only reaches for it when the first pass came
-    up short.
+    Across pools it is the balance's. The proposals get first refusal under
+    the full rules; then the radio behind them, still under the full rules,
+    because that is where a familiar name is certain to be found when the
+    model did not offer one; and only then does either pool get to fill what
+    is left with the rules off. Putting the radio after both relaxed passes -
+    which is what a separate top-up function amounted to - meant the slots
+    being held for artists they love were handed to the strangers that had
+    just been passed over for them.
     """
     visitor = engine.visitor()
     futures = [_lookup_pool.submit(_lookup, engine, visitor, q) for q in songs]
@@ -442,88 +624,18 @@ def _resolve(engine, state, songs, want):
             found.append(track)
 
     familiar, known = _comfort(engine)
-    served = _served_keys()
-    out, artists, close_to_home = [], set(), 0
-    with state["lock"]:
-        for strict in (True, False):
-            for track in found:
-                if len(out) >= want:
-                    break
-                key = rec.identity(track)
-                artist = rec.primary_artist(track.get("artist"))
-                if (track["videoId"] in state["seen_ids"]
-                        or key in state["seen_keys"]
-                        or artist in artists
-                        or key in known
-                        or key in served
-                        or engine.learned.is_rejected(key)):
-                    continue
-                near = artist in familiar
-                if strict and near and close_to_home >= FAMILIAR_PER_SET:
-                    continue
-                state["seen_ids"].add(track["videoId"])
-                state["seen_keys"].add(key)
-                artists.add(artist)
-                if near:
-                    close_to_home += 1
-                out.append(track)
-            if len(out) >= want:
-                break
-    return out
-
-
-def _backfill(engine, state, tracks, want):
-    """Top a short set up from the station of the song that did survive.
-
-    The model cannot always name four songs that all exist, are all new to this
-    listener and are all by different artists - especially deep into a session,
-    where most of what fits the taste profile has already been played. Rather
-    than hand over a one-song set, the rest comes from YouTube Music's own
-    radio for the first track, which is at least demonstrably adjacent to it.
-    The theme is honest about the songs it chose; the tail is a neighbour.
-    """
-    if not tracks or len(tracks) >= want:
-        return tracks
-
-    seed = tracks[0]["videoId"]
-    visitor = engine.visitor()
-    try:
-        nearby = discovery._memo(
-            "r:" + seed,
-            lambda: rec.radio(seed, visitor, engine.cookie, limit=20))
-    except Exception:  # noqa: BLE001
-        return tracks
-
-    familiar, known = _comfort(engine)
-    served = _served_keys()
-    artists = {rec.primary_artist(t.get("artist")) for t in tracks}
-    with state["lock"]:
-        # Two passes, strangers first. A radio is ranked by how close each
-        # track sits to its seed, so the artists this listener already plays
-        # come out at the top of it - taking them in the order offered would
-        # quietly undo the set. They are still better than a short set, so the
-        # second pass has them; it just does not reach for them first.
-        for strict in (True, False):
-            for track in nearby or []:
-                if len(tracks) >= want:
-                    break
-                key = rec.identity(track)
-                artist = rec.primary_artist(track.get("artist"))
-                if (track["videoId"] in state["seen_ids"]
-                        or key in state["seen_keys"]
-                        or artist in artists
-                        or key in known
-                        or key in served
-                        or engine.learned.is_rejected(key)):
-                    continue
-                if strict and artist in familiar:
-                    continue
-                state["seen_ids"].add(track["videoId"])
-                state["seen_keys"].add(key)
-                artists.add(artist)
-                tracks.append(track)
-            if len(tracks) >= want:
-                break
+    balance = _Balance(want, familiar, known)
+    tracks, radio = [], {}
+    for strict in (True, False):
+        _take(engine, state, found, tracks, balance, strict)
+        if len(tracks) >= want:
+            break
+        # No radio is fetched at all when the model delivered a balanced set,
+        # which is the common case and the one worth keeping cheap.
+        _take(engine, state, _nearby(engine, tracks, radio), tracks, balance,
+              strict)
+        if len(tracks) >= want:
+            break
     return tracks
 
 
@@ -543,7 +655,6 @@ def _build(engine, state, language, model):
         return {"error": "could not plan the set: %s" % str(e)[:200]}
 
     tracks = _resolve(engine, state, plan["songs"], SET_SIZE)
-    tracks = _backfill(engine, state, tracks, SET_SIZE)
     if not tracks:
         return {"error": "none of the songs could be found"}
 
@@ -672,12 +783,45 @@ def _prewarm(engine, language, model=None):
             _warming.discard(language)
 
 
+def _overtaken(entry):
+    """Whether a station has played this standby set out from under it.
+
+    A set standing by was built against the ledger as it stood at the time. If
+    a station has run since - and one usually has, because that is what the
+    listener was doing while this was being built - the songs it chose may
+    have gone out already. Handing it over then opens the new station with
+    what the last one just finished, which is the one thing the ledger exists
+    to prevent.
+    """
+    served = _served_keys()
+    return any(rec.identity(t) in served
+               for t in entry["built"].get("tracks") or ())
+
+
+def _retire_overtaken(language):
+    """Drop an overtaken standby set so the warm loop replaces it.
+
+    Left in place it would sit there until its rebuild came round, and every
+    station opened in the meantime would find it, reject it, and wait out a
+    build from scratch.
+    """
+    with _ready_guard:
+        entry = _ready.get(language)
+    if entry and _overtaken(entry):
+        with _ready_guard:
+            if _ready.get(language) is entry:
+                _ready.pop(language, None)
+
+
 def _take_ready(language):
-    """The opening set standing by for this language, if it is still fresh."""
+    """The opening set standing by for this language, if it is still fresh -
+    and if no station has played its songs while it stood there."""
     now = time.time()
     with _ready_guard:
         entry = _ready.pop(language, None)
     if not entry or now - entry["at"] > READY_TTL:
+        return None
+    if _overtaken(entry):
         return None
     return entry
 
@@ -766,6 +910,7 @@ def next_set(engine, session_id=None, language=None, skipped=(), liked=(),
                 "tracks": [], "error": built["error"]}
 
     _commit(state, built)
+    _retire_overtaken(language)
 
     # The next turn starts now rather than when it is asked for. This is what
     # makes every set after the first arrive instantly.
