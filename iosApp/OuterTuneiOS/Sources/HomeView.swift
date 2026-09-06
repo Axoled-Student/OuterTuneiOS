@@ -103,6 +103,9 @@ struct HomeView: View {
 
     private var djSubtitle: String {
         if let djMessage { return djMessage }
+        // An automatic station names itself only once its long wave lands,
+        // so the theme arrives here after playback has already begun.
+        if let theme = resolver.lastAIRadioTheme, !theme.isEmpty { return theme }
         if isDJBuilding { return "正在為你挑選歌曲…" }
         return "一鍵播放，長按可自訂主題"
     }
@@ -227,10 +230,14 @@ struct HomeView: View {
         djMessage = nil
         defer { isDJBuilding = false }
 
-        if let tracks = await resolver.fetchAIRadio(prompt: "", limit: 30),
-           !tracks.isEmpty {
-            djMessage = resolver.lastAIRadioTheme
-            player.playTracks(tracks)
+        // The station starts on the first few songs the server resolves; the
+        // rest arrive in the queue while these are playing. An automatic
+        // station is not named until the long wave runs, so the theme shown
+        // here fills in from the resolver a moment later.
+        if let batch = await resolver.openAIRadio(prompt: "", limit: 30),
+           !batch.tracks.isEmpty {
+            djMessage = batch.theme
+            player.startAIRadio(batch)
             openNowPlaying()
         } else {
             djMessage = resolver.lastErrorMessage ?? "無法建立電台，請稍後再試"

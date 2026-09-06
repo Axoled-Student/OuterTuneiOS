@@ -425,10 +425,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 limit = max(1, min(int((params.get("limit") or ["20"])[0]), 40))
             except ValueError:
                 limit = 20
+            # A station id turns this into "what else have you found?", which
+            # is how the client keeps playing while the rest is still coming.
+            station = (params.get("station") or [""])[0].strip() or None
+            try:
+                after = max(0, int((params.get("after") or ["0"])[0]))
+            except ValueError:
+                after = 0
             try:
                 import discovery
                 payload = discovery.ai_radio(self.__class__.queue_engine,
-                                             prompt.strip(), limit=limit)
+                                             prompt.strip(), limit=limit,
+                                             station=station, after=after)
             except Exception as e:  # noqa: BLE001
                 return self._send_json(502, {"error": str(e)[:300]})
             return self._send_json(200, payload)

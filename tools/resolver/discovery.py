@@ -11,6 +11,7 @@ import random
 import re
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 
@@ -476,32 +477,33 @@ def auto_theme(engine, cfg, model=None):
     return theme[:200] or "a mix of what this listener usually enjoys"
 
 
-def ai_radio(engine, prompt, limit=20, model=None):
-    """Build a station from a free-text description.
+# A station is built in two waves so playback can start while the rest is
+# still being found. Measured on this machine: asking for 40 songs takes the
+# model ~11s and resolving them one at a time another ~9s, so the old
+# single-shot path left the listener staring at a spinner for twenty seconds.
+# A six-song ask answers in ~4.4s and resolves in ~0.5s when the lookups run
+# together, so the first tracks play at about five seconds and the station
+# keeps growing underneath them - which is how Spotify's stations feel.
+SPRINT = 6
+_stations = {}
+_stations_guard = threading.Lock()
+STATION_TTL = 60 * 45
 
-    The model proposes songs; every proposal is then looked up on YouTube Music
-    and only real matches survive. That keeps the useful part of an LLM - taste
-    and theme - while making it impossible for an invented title to reach the
-    queue as an unplayable row.
-    """
-    cfg = _ai_config()
-    if not cfg:
-        return {"error": "no AI endpoint configured (ai.env missing)",
-                "prompt": prompt, "tracks": []}
+_radio_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=3, thread_name_prefix="airadio")
+# Separate from the pool above: the whole point is that a station's lookups
+# run together, which they cannot do if they are queued behind the jobs that
+# spawned them.
+_radio_search_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="airadiosearch")
 
-    engine.taste.refresh()
 
-    # No prompt means "just play something" - pick a theme first.
-    auto = not (prompt or "").strip()
-    if auto:
-        prompt = auto_theme(engine, cfg, model)
-
+def _radio_prompt(prompt, engine, count):
     top_artists = [a for a, _ in sorted(engine.taste.artists.items(),
                                         key=lambda kv: -kv[1])[:12]]
     liked = ["%s - %s" % (t["artist"], t["name"])
              for t in engine.taste.tracks[:8]]
-
-    ask = (
+    return (
         "You are building a music radio station.\n\n"
         "Request: %s\n\n"
         "The listener's usual taste, for context only - the request above wins "
@@ -514,41 +516,204 @@ def ai_radio(engine, prompt, limit=20, model=None):
         "Respond with ONLY a JSON array of objects, each {\"artist\": ..., "
         "\"title\": ...}, and no other text."
         % (prompt, ", ".join(top_artists) or "unknown",
-           "; ".join(liked) or "unknown", min(limit * 2, 40)))
+           "; ".join(liked) or "unknown", count))
+
+
+def _sprint_ask(prompt, engine, auto):
+    """The opening call: just enough songs to press play on.
+
+    Deliberately does not ask the model to name the station. Inventing a theme
+    is the slowest thing this endpoint does - about ten seconds, measured, for
+    one line of text - and nobody is reading the name during the silence before
+    the first note. The slow wave names it, and the client picks that up.
+    """
+    if not auto:
+        return _radio_prompt(prompt, engine, SPRINT)
+
+    top_artists = [a for a, _ in sorted(engine.taste.artists.items(),
+                                        key=lambda kv: -kv[1])[:12]]
+    liked = ["%s - %s" % (t["artist"], t["name"])
+             for t in engine.taste.tracks[:12]]
+    # Worded flatly on purpose. Asking the model to *reason* about staying
+    # fresh - "reach for songs next to their taste" - doubled this call, from
+    # 6.2s to 13.2s measured. A plain list of what not to play buys the same
+    # freshness at half the wait, and the wait is all the listener sees.
+    return (
+        "A listener's favourite artists: %s.\n"
+        "They already play these a lot: %s.\n"
+        "Name %d real, existing songs they would enjoy right now. Do not name "
+        "any song in that second list. At most one song per artist.\n"
+        "Respond with ONLY a JSON array of objects, each {\"artist\": ..., "
+        "\"title\": ...}, and no other text."
+        % (", ".join(top_artists) or "unknown",
+           "; ".join(liked) or "unknown", SPRINT))
+
+
+def _resolve_together(engine, queries):
+    """Look every proposal up on YouTube Music at once, keeping the order.
+
+    The model's ordering is the station's ordering, so results are zipped back
+    onto the queries rather than collected as they happen to finish.
+    """
+    if not queries:
+        return []
+    visitor = engine.visitor()
+    futures = [_radio_search_pool.submit(rec.search_song, query, visitor,
+                                         engine.cookie)
+               for query in queries]
+    out = []
+    for future in futures:
+        try:
+            out.append(future.result(timeout=25))
+        except Exception:  # noqa: BLE001
+            out.append(None)
+    return out
+
+
+# Each wave is told "at most two songs by any one artist" and each obeys it,
+# but the two obey it separately, so their union did not. The cap has to be
+# held by the station.
+PER_ARTIST = 2
+
+
+def _admit(engine, state, found):
+    """Add resolved songs to a station, skipping repeats and past rejections."""
+    added = 0
+    with state["lock"]:
+        for track in found:
+            if not track or len(state["tracks"]) >= state["limit"]:
+                continue
+            key = rec.identity(track)
+            if track["videoId"] in state["seen_ids"] or key in state["seen_keys"]:
+                continue
+            if engine.learned.is_rejected(key):
+                continue
+            # "It keeps playing the songs I already like too much." The
+            # opening prompt says not to, and the model mostly listens, but
+            # mostly is not enough when the listener notices every time.
+            if key in state["avoid"]:
+                continue
+            artist = (track.get("artist") or "").strip().casefold()
+            if artist and state["artists"].get(artist, 0) >= PER_ARTIST:
+                continue
+            state["seen_ids"].add(track["videoId"])
+            state["seen_keys"].add(key)
+            state["artists"][artist] = state["artists"].get(artist, 0) + 1
+            track["source"] = "airadio"
+            state["tracks"].append(_track_row(track))
+            added += 1
+    return added
+
+
+def _fill_station(engine, state, cfg, model):
+    """The long tail, built behind the tracks that are already playing.
+
+    In auto mode this also names the station, since it is the wave that can
+    afford to think about it.
+    """
+    try:
+        if state["auto"]:
+            state["prompt"] = auto_theme(engine, cfg, model)
+        raw = _ask_model(cfg, _radio_prompt(state["prompt"], engine,
+                                            min(state["limit"] * 2, 40)),
+                         model or "gemini-3.8-flash-high")
+        queries = _parse_list(raw)
+        if not queries:
+            state["error"] = state["error"] or "model returned no usable songs"
+        else:
+            _admit(engine, state, _resolve_together(engine, queries))
+    except Exception as e:  # noqa: BLE001
+        state["error"] = state["error"] or ("model call failed: %s"
+                                            % str(e)[:200])
+    finally:
+        state["pending"] = False
+
+
+def _station_view(state, after=0):
+    with state["lock"]:
+        rows = list(state["tracks"])
+    return {"station": state["id"], "prompt": state["prompt"],
+            "auto": state["auto"], "total": len(rows),
+            "tracks": rows[max(0, after):],
+            "pending": bool(state["pending"]),
+            "error": state["error"], "resolved": len(rows)}
+
+
+def _expire_stations(now):
+    with _stations_guard:
+        for key in [k for k, v in _stations.items()
+                    if now - v["created"] > STATION_TTL]:
+            _stations.pop(key, None)
+
+
+def ai_radio(engine, prompt, limit=20, model=None, station=None, after=0):
+    """Build a station from a free-text description, first tracks first.
+
+    The model proposes songs; every proposal is then looked up on YouTube Music
+    and only real matches survive. That keeps the useful part of an LLM - taste
+    and theme - while making it impossible for an invented title to reach the
+    queue as an unplayable row.
+
+    Passing `station` returns what that station has found since, so the client
+    can start on the opening handful and append the rest as it arrives.
+    """
+    now = time.time()
+    _expire_stations(now)
+
+    if station:
+        with _stations_guard:
+            state = _stations.get(station)
+        if not state:
+            return {"error": "unknown station", "station": station,
+                    "tracks": [], "pending": False, "total": 0}
+        return _station_view(state, after)
+
+    cfg = _ai_config()
+    if not cfg:
+        return {"error": "no AI endpoint configured (ai.env missing)",
+                "prompt": prompt, "tracks": [], "pending": False, "total": 0}
+
+    engine.taste.refresh()
+
+    # No prompt means "just play something": the opening call invents the
+    # theme as well, and the long wave then builds around the same idea.
+    auto = not (prompt or "").strip()
+
+    # An automatic station is meant to widen the listener's taste, so their
+    # own heaviest rotation is held out of it. A station they asked for by
+    # name is not: "play me some MIMI" should play MIMI.
+    avoid = set()
+    if auto:
+        avoid = {rec.identity({"artist": row["artist"], "title": row["name"]})
+                 for row in engine.taste.tracks[:40]}
+
+    state = {"id": uuid.uuid4().hex[:12], "prompt": prompt, "auto": auto,
+             "limit": limit, "tracks": [], "seen_ids": set(), "seen_keys": set(),
+             "artists": {}, "avoid": avoid,
+             "pending": True, "error": None, "created": now,
+             "lock": threading.Lock()}
+    with _stations_guard:
+        _stations[state["id"]] = state
+
+    # Both waves start at once and do not slow each other down (measured: a
+    # six-song ask still answers in ~4s alongside a forty-song one).
+    tail = _radio_pool.submit(_fill_station, engine, state, cfg, model)
 
     try:
-        raw = _ask_model(cfg, ask, model or "gemini-3.8-flash-high")
+        raw = _ask_model(cfg, _sprint_ask(prompt, engine, auto),
+                         model or "gemini-3.8-flash-high",
+                         max_tokens=260, timeout=40)
+        _admit(engine, state, _resolve_together(engine, _parse_list(raw)))
     except Exception as e:  # noqa: BLE001
-        return {"error": "model call failed: %s" % str(e)[:200],
-                "prompt": prompt, "tracks": []}
+        # A failed opening is not a failed station: fall back to the long wave
+        # rather than handing back nothing.
+        state["error"] = "quick pass failed: %s" % str(e)[:120]
+        try:
+            tail.result(timeout=90)
+        except Exception:  # noqa: BLE001
+            pass
 
-    queries = _parse_list(raw)
-    if not queries:
-        return {"error": "model returned no usable songs", "prompt": prompt,
-                "tracks": []}
-
-    visitor = engine.visitor()
-    resolved, seen_ids, seen_identities = [], set(), set()
-    for query in queries:
-        if len(resolved) >= limit:
-            break
-        found = rec.search_song(query, visitor, engine.cookie)
-        if not found:
-            continue
-        key = rec.identity(found)
-        if found["videoId"] in seen_ids or key in seen_identities:
-            continue
-        if engine.learned.is_rejected(key):
-            continue
-        seen_ids.add(found["videoId"])
-        seen_identities.add(key)
-        found["source"] = "airadio"
-        resolved.append(found)
-
-    return {
-        "prompt": prompt,
-        "auto": auto,
-        "requested": len(queries),
-        "resolved": len(resolved),
-        "tracks": [_track_row(t) for t in resolved],
-    }
+    view = _station_view(state)
+    if not view["tracks"] and not view["pending"]:
+        view["error"] = view["error"] or "model returned no usable songs"
+    return view

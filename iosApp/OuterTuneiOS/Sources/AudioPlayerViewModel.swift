@@ -158,6 +158,11 @@ final class AudioPlayerViewModel: ObservableObject {
     private let autoQueueService = AutoQueueService.shared
     private let resolverService = StreamResolverService.shared
 
+    /// Bumped by every queue replacement. A station collector carries the
+    /// value it started with and gives up as soon as it no longer matches,
+    /// so tracks from an abandoned station never land in a new queue.
+    private var aiRadioGeneration = 0
+
     private let queueStorageKey = "ios.queue.v1"
     private let queueIndexStorageKey = "ios.queue.index.v1"
     private let queuePolicyVersionKey = "ios.queue.policyVersion.v1"
@@ -1016,6 +1021,61 @@ final class AudioPlayerViewModel: ObservableObject {
         }
     }
 
+    /// Start an AI station on its opening handful and keep collecting.
+    ///
+    /// Waiting for a full twenty-song list meant twenty seconds of silence
+    /// after the tap. The server now answers with the first few as soon as
+    /// they resolve, so playback starts on those and the queue grows
+    /// underneath the listener.
+    func startAIRadio(_ batch: AIRadioBatch) {
+        guard !batch.tracks.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.replaceQueueAndPlay(tracks: batch.tracks, startingAt: 0)
+            guard batch.pending, !batch.station.isEmpty else { return }
+            await self.collectAIRadio(station: batch.station,
+                                      have: batch.tracks.count,
+                                      generation: self.aiRadioGeneration)
+        }
+    }
+
+    private func collectAIRadio(station: String,
+                                have: Int,
+                                generation: Int) async {
+        var collected = have
+        var quiet = 0
+        // The rest of a station is one model call. Forty quiet polls is half
+        // a minute past the point where it has either landed or given up.
+        while quiet < 40, !Task.isCancelled, self.aiRadioGeneration == generation {
+            try? await Task.sleep(nanoseconds: 750_000_000)
+            guard !Task.isCancelled, self.aiRadioGeneration == generation
+            else { return }
+            guard let batch = await self.resolverService.continueAIRadio(
+                station: station, after: collected)
+            else { return }
+            guard self.aiRadioGeneration == generation else { return }
+
+            if batch.tracks.isEmpty {
+                quiet += 1
+            } else {
+                collected += batch.tracks.count
+                self.appendTracks(batch.tracks)
+                quiet = 0
+            }
+            if !batch.pending { return }
+        }
+    }
+
+    /// Add to the end of the queue without disturbing what is playing.
+    func appendTracks(_ tracks: [AppTrack]) {
+        guard !tracks.isEmpty else { return }
+        queue.append(contentsOf: tracks)
+        persistQueueState()
+        if let currentQueueIndex {
+            preloadNextTrack(after: currentQueueIndex)
+        }
+    }
+
     private func replaceQueueAndPlay(track: AppTrack) async {
         await replaceQueueAndPlay(tracks: [track], startingAt: 0)
     }
@@ -1027,6 +1087,7 @@ final class AudioPlayerViewModel: ObservableObject {
     ) async {
         guard tracks.indices.contains(index) else { return }
         cancelAutoQueueGeneration()
+        aiRadioGeneration &+= 1
         nextPreloadTask?.cancel()
         queue = tracks
         currentQueueIndex = index

@@ -12,7 +12,6 @@ struct AIRadioView: View {
 
     @State private var prompt: String = ""
     @State private var isBuilding = false
-    @State private var results: [AppTrack] = []
     @State private var errorMessage: String?
 
     private let examples = [
@@ -58,7 +57,7 @@ struct AIRadioView: View {
                     }
                 }
 
-                if results.isEmpty, !isBuilding {
+                if !isBuilding {
                     Section("試試看") {
                         ForEach(examples, id: \.self) { example in
                             Button(example) {
@@ -75,43 +74,6 @@ struct AIRadioView: View {
                         Text(errorMessage)
                             .font(.footnote)
                             .foregroundColor(.red)
-                    }
-                }
-
-                if !results.isEmpty {
-                    Section {
-                        Button {
-                            player.playTracks(results)
-                            dismiss()
-                        } label: {
-                            Label("播放全部（\(results.count) 首）", systemImage: "play.fill")
-                        }
-                    }
-
-                    Section("曲目") {
-                        ForEach(Array(results.enumerated()), id: \.offset) { index, track in
-                            Button {
-                                player.playTracks(results, startingAt: index)
-                                dismiss()
-                            } label: {
-                                HStack(spacing: 12) {
-                                    TrackArtworkView(
-                                        urlString: track.displayThumbnailURL,
-                                        dimension: 44,
-                                        cornerRadius: 6)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(track.title)
-                                            .font(.subheadline)
-                                            .lineLimit(1)
-                                        Text(track.artist)
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                }
-                            }
-                            .buttonStyle(.plain)
-                        }
                     }
                 }
             }
@@ -137,11 +99,16 @@ struct AIRadioView: View {
         errorMessage = nil
         defer { isBuilding = false }
 
-        if let tracks = await resolver.fetchAIRadio(prompt: request, limit: 25) {
-            results = tracks
-        } else {
-            results = []
+        // Play the opening handful straight away. The rest of the station
+        // lands in the queue behind it while song one is already playing,
+        // which is the whole point of asking the server for it in waves.
+        guard let batch = await resolver.openAIRadio(prompt: request, limit: 25),
+              !batch.tracks.isEmpty
+        else {
             errorMessage = resolver.lastErrorMessage ?? "無法建立電台，請稍後再試。"
+            return
         }
+        player.startAIRadio(batch)
+        dismiss()
     }
 }

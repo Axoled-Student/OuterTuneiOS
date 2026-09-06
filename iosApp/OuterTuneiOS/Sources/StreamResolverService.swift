@@ -48,6 +48,19 @@ enum StreamResolverError: LocalizedError {
 /// The resolver therefore runs on the user's own connection, uses yt-dlp (with
 /// a JS runtime) to resolve, verifies and losslessly remuxes the full source on
 /// the PC, then serves an AVPlayer-compatible fast-start M4A with byte ranges.
+/// One wave of an AI station.
+///
+/// The server answers the opening request with the first few playable songs
+/// and keeps filling the rest behind it, so `pending` says whether asking
+/// again - with `after: total` - is still worth doing.
+struct AIRadioBatch {
+    let station: String
+    let theme: String?
+    let tracks: [AppTrack]
+    let total: Int
+    let pending: Bool
+}
+
 @MainActor
 final class StreamResolverService: ObservableObject {
     static let shared = StreamResolverService()
@@ -267,14 +280,31 @@ final class StreamResolverService: ObservableObject {
         }
     }
 
-    /// A station described in words. The server resolves every suggestion
-    /// against YouTube Music, so nothing unplayable comes back.
-    func fetchAIRadio(prompt: String, limit: Int = 20) async -> [AppTrack]? {
-        guard isConfigured,
-              let endpoint = url(path: "/airadio", query: [
-                  URLQueryItem(name: "prompt", value: prompt),
-                  URLQueryItem(name: "limit", value: String(limit)),
-              ])
+    /// Open a station described in words, or an automatic one when the
+    /// prompt is empty.
+    ///
+    /// This comes back as soon as the first handful of songs are playable
+    /// rather than when the whole list is ready, so playback can start in a
+    /// few seconds. `continueAIRadio` collects the rest.
+    func openAIRadio(prompt: String, limit: Int = 20) async -> AIRadioBatch? {
+        await radioBatch([
+            URLQueryItem(name: "prompt", value: prompt),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ])
+    }
+
+    /// Whatever a station has found beyond the first `after` tracks.
+    func continueAIRadio(station: String, after: Int) async -> AIRadioBatch? {
+        await radioBatch([
+            URLQueryItem(name: "station", value: station),
+            URLQueryItem(name: "after", value: String(after)),
+        ])
+    }
+
+    /// The server resolves every suggestion against YouTube Music, so nothing
+    /// unplayable comes back.
+    private func radioBatch(_ query: [URLQueryItem]) async -> AIRadioBatch? {
+        guard isConfigured, let endpoint = url(path: "/airadio", query: query)
         else { return nil }
 
         do {
@@ -282,11 +312,19 @@ final class StreamResolverService: ObservableObject {
             guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return nil }
-            if let message = object["error"] as? String {
+
+            // A station can carry an error and still be playable - the quick
+            // pass failing while the long wave lands, say - so the message is
+            // recorded but the batch is still handed back.
+            if let message = object["error"] as? String, !message.isEmpty {
                 lastErrorMessage = message
-                return nil
             }
-            lastAIRadioTheme = object["prompt"] as? String
+            // An automatic station is only named once the long wave has run,
+            // so this fills in on a later poll rather than the first one.
+            if let theme = object["prompt"] as? String, !theme.isEmpty {
+                lastAIRadioTheme = theme
+            }
+
             let rows = (object["tracks"] as? [[String: Any]]) ?? []
             let tracks: [AppTrack] = rows.compactMap { row in
                 guard let videoId = row["videoId"] as? String, !videoId.isEmpty
@@ -300,7 +338,12 @@ final class StreamResolverService: ObservableObject {
                     durationText: nil,
                     source: .youtube(videoId: videoId))
             }
-            return tracks.isEmpty ? nil : tracks
+            return AIRadioBatch(
+                station: (object["station"] as? String) ?? "",
+                theme: object["prompt"] as? String,
+                tracks: tracks,
+                total: (object["total"] as? Int) ?? tracks.count,
+                pending: (object["pending"] as? Bool) ?? false)
         } catch {
             lastErrorMessage = error.localizedDescription
             return nil
