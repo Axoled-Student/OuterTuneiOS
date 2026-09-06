@@ -194,6 +194,44 @@ class WarmRouteTest(ResolverHarness):
         self.assertEqual(status, 400)
 
 
+class LyricsRouteTest(ResolverHarness):
+    """Route wiring only - the module itself is covered by test_lyrics.py."""
+
+    def setUp(self):
+        import lyrics
+        self.calls = []
+        self._get = lyrics.get
+        self.addCleanup(setattr, lyrics, "get", self._get)
+        lyrics.get = self.fake_get
+
+    def fake_get(self, title, artist, duration=None, target=None, **kwargs):
+        self.calls.append((title, artist, duration, target))
+        return {"ok": True, "synced": True, "translating": False,
+                "lines": [{"t": 1.0, "text": "hi", "tr": "嗨"}]}
+
+    def test_passes_the_query_through_and_returns_lines(self):
+        port = self.start_resolver(StubResolver())
+        status, _, body = self.request(
+            port, "/lyrics?title=Hello&artist=Someone&duration=201"
+                  "&target=zh-Hant-TW")
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls, [("Hello", "Someone", 201.0, "zh-Hant-TW")])
+        self.assertEqual(payload["lines"][0]["tr"], "嗨")
+
+    def test_translation_can_be_turned_off(self):
+        port = self.start_resolver(StubResolver())
+        self.request(port, "/lyrics?title=Hello&target=zh-Hant&translate=0")
+        self.assertEqual(self.calls[0][3], None)
+
+    def test_title_is_required(self):
+        port = self.start_resolver(StubResolver())
+        status, _, _ = self.request(port, "/lyrics?artist=Someone")
+        self.assertEqual(status, 400)
+        self.assertEqual(self.calls, [])
+
+
 class PreparedCacheTest(unittest.TestCase):
     def test_prune_evicts_least_recently_served_files_over_budget(self):
         directory = pathlib.Path(tempfile.mkdtemp())

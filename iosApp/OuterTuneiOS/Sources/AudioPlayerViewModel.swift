@@ -34,8 +34,20 @@ final class AudioPlayerViewModel: ObservableObject {
     @Published var sliderPosition: Double = 0
     @Published var isScrubbing: Bool = false
 
-    @Published var lyricsText: String = ""
+    @Published private(set) var lyrics = LyricsSnapshot()
     @Published var isLoadingLyrics: Bool = false
+    /// Show a translation under each line. Persisted: a listener who reads
+    /// the words in another language wants that on every track, not once.
+    @Published var lyricsTranslationEnabled: Bool = true {
+        didSet {
+            guard oldValue != lyricsTranslationEnabled else { return }
+            UserDefaults.standard.set(lyricsTranslationEnabled,
+                                      forKey: Self.lyricsTranslationKey)
+            loadLyricsForCurrentTrack()
+        }
+    }
+
+    static let lyricsTranslationKey = "ios.lyrics.translate.v1"
 
     @Published var downloadedTracks: [AppTrack] = []
     @Published var favoriteTracks: [AppTrack] = []
@@ -138,6 +150,7 @@ final class AudioPlayerViewModel: ObservableObject {
     private var hasConfiguredRemoteCommands: Bool = false
     private var nowPlayingArtworkSourceURL: String?
     private var nowPlayingArtworkTask: Task<Void, Never>?
+    private var lyricsTask: Task<Void, Never>?
 
     private let youtubeService = YouTubeMusicService.shared
     private let lyricsService = LyricsService.shared
@@ -775,6 +788,10 @@ final class AudioPlayerViewModel: ObservableObject {
         if UserDefaults.standard.object(forKey: autoQueueStorageKey) != nil {
             isAutoQueueEnabled = UserDefaults.standard.bool(forKey: autoQueueStorageKey)
         }
+        if UserDefaults.standard.object(forKey: Self.lyricsTranslationKey) != nil {
+            lyricsTranslationEnabled = UserDefaults.standard.bool(
+                forKey: Self.lyricsTranslationKey)
+        }
     }
 
     func setAudioQualityPreference(_ preference: AudioQualityPreference) {
@@ -845,31 +862,52 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     func loadLyricsForCurrentTrack() {
+        lyricsTask?.cancel()
         guard let track = nowPlayingTrack else {
-            lyricsText = ""
+            lyrics = LyricsSnapshot()
             return
         }
 
+        let target = lyricsTranslationEnabled
+            ? LyricsService.deviceLanguage : nil
         isLoadingLyrics = true
-        Task {
-            defer { isLoadingLyrics = false }
-            let seconds: Int?
-            if duration.isFinite && duration > 0 {
-                seconds = Int(duration)
-            } else {
-                seconds = nil
+
+        lyricsTask = Task { [weak self] in
+            defer { self?.isLoadingLyrics = false }
+            guard let self else { return }
+
+            let seconds: Int? = (self.duration.isFinite && self.duration > 0)
+                ? Int(self.duration) : nil
+            var snapshot = await self.lyricsService.fetch(
+                title: track.title, artist: track.artist,
+                duration: seconds, translateInto: target)
+
+            guard !Task.isCancelled, self.nowPlayingTrack == track else { return }
+            self.lyrics = snapshot ?? LyricsSnapshot()
+
+            // The server answers with the words straight away and translates
+            // behind them, so ask again until the column arrives. Backing off
+            // rather than polling flat keeps a song the model is slow on from
+            // costing a request a second.
+            var wait: UInt64 = 3
+            while !Task.isCancelled, snapshot?.translating == true,
+                  wait <= 24 {
+                try? await Task.sleep(nanoseconds: wait * 1_000_000_000)
+                guard !Task.isCancelled, self.nowPlayingTrack == track else { return }
+                snapshot = await self.lyricsService.fetch(
+                    title: track.title, artist: track.artist,
+                    duration: seconds, translateInto: target)
+                guard !Task.isCancelled, self.nowPlayingTrack == track,
+                      let fresh = snapshot, !fresh.isEmpty else { return }
+                self.lyrics = fresh
+                wait *= 2
             }
-            let lyrics = await lyricsService.fetchSyncedLyrics(
-                title: track.title,
-                artist: track.artist,
-                duration: seconds
-            )
-            lyricsText = lyrics ?? "找不到歌詞"
         }
     }
 
     func clearLyrics() {
-        lyricsText = ""
+        lyricsTask?.cancel()
+        lyrics = LyricsSnapshot()
     }
 
     func togglePlayback() {
@@ -1273,7 +1311,8 @@ final class AudioPlayerViewModel: ObservableObject {
         duration = nowPlayingStreamInfo?.duration
             ?? inferredFallbackDuration(for: track, streamURL: url)
             ?? 0
-        lyricsText = ""
+        lyricsTask?.cancel()
+        lyrics = LyricsSnapshot()
 
         observePlayerItemState(item: item, track: track)
         observePlaybackEnd(item: item)

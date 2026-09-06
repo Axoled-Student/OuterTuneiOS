@@ -399,10 +399,11 @@ def _ai_config():
     return None
 
 
-def _ask_model(cfg, prompt, model="gemini-3.8-flash-high", timeout=90):
+def _ask_model(cfg, prompt, model="gemini-3.8-flash-high", timeout=90,
+               max_tokens=2000, temperature=0.7):
     body = {"model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7, "max_tokens": 2000}
+            "temperature": temperature, "max_tokens": max_tokens}
     request = urllib.request.Request(cfg["endpoint"] + "/v1/chat/completions",
                                      data=json.dumps(body).encode(),
                                      method="POST")

@@ -1,10 +1,28 @@
 import SwiftUI
 
-/// One timed line of an LRC transcript.
+/// One timed line of an LRC transcript, with its translation when there is one.
 struct LyricLine: Identifiable, Equatable {
     let id: Int
     let time: Double
     let text: String
+    var translation: String?
+}
+
+/// Everything the player knows about the current track's words.
+struct LyricsSnapshot: Equatable {
+    var lines: [LyricLine] = []
+    /// Transcripts that arrived without timestamps, shown as a block.
+    var plain: String = ""
+    var plainTranslated: String?
+    /// What the words are written in, as the server detected it.
+    var language: String?
+    var source: String?
+    var translated: Bool = false
+    /// The server is running the translation now; ask again shortly.
+    var translating: Bool = false
+
+    var isEmpty: Bool { lines.isEmpty && plain.isEmpty }
+    var isSynced: Bool { !lines.isEmpty }
 }
 
 /// Parses the LRC that lrclib returns.
@@ -83,10 +101,33 @@ enum SyncedLyrics {
 }
 
 /// Scrolling, highlighted transcript.
+///
+/// Used at two sizes: the card inside the player, and the full-screen view.
+/// Only the metrics differ, so they share this rather than drifting apart.
 struct SyncedLyricsView: View {
     let lines: [LyricLine]
     let currentTime: Double
+    var metrics: Metrics = .card
+    var showsTranslation: Bool = true
     var onSeek: ((Double) -> Void)?
+
+    struct Metrics {
+        var size: CGFloat
+        var spacing: CGFloat
+        var translationSize: CGFloat
+        /// How dim a line that is not being sung right now looks.
+        var restingOpacity: Double
+        var alignment: HorizontalAlignment = .leading
+        var textAlignment: TextAlignment = .leading
+
+        static let card = Metrics(size: 17, spacing: 14, translationSize: 13,
+                                  restingOpacity: 0.55)
+        /// Full screen: large enough to read at arm's length, and the resting
+        /// lines fade further back so the current one carries the eye.
+        static let fullScreen = Metrics(size: 27, spacing: 22,
+                                        translationSize: 16,
+                                        restingOpacity: 0.32)
+    }
 
     private var activeIndex: Int? {
         SyncedLyrics.activeIndex(in: lines, at: currentTime)
@@ -95,17 +136,9 @@ struct SyncedLyricsView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: metrics.alignment, spacing: metrics.spacing) {
                     ForEach(Array(lines.enumerated()), id: \.element.id) { offset, line in
-                        Text(line.text)
-                            .font(.system(size: 17, weight: offset == activeIndex
-                                          ? .bold : .semibold))
-                            .foregroundColor(offset == activeIndex
-                                             ? AppTheme.textPrimary
-                                             : AppTheme.textSecondary.opacity(0.55))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .id(line.id)
-                            .onTapGesture { onSeek?(line.time) }
+                        row(at: offset, line: line)
                     }
                 }
                 .padding(.vertical, 8)
@@ -117,5 +150,34 @@ struct SyncedLyricsView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func row(at offset: Int, line: LyricLine) -> some View {
+        let isActive = offset == activeIndex
+        VStack(alignment: metrics.alignment, spacing: 4) {
+            Text(line.text)
+                .font(.system(size: metrics.size,
+                              weight: isActive ? .bold : .semibold))
+                .foregroundColor(isActive
+                                 ? AppTheme.textPrimary
+                                 : AppTheme.textSecondary.opacity(metrics.restingOpacity))
+
+            if showsTranslation, let translation = line.translation,
+               !translation.isEmpty {
+                Text(translation)
+                    .font(.system(size: metrics.translationSize,
+                                  weight: .medium))
+                    .foregroundColor(AppTheme.textPrimary
+                        .opacity(isActive ? 0.72 : metrics.restingOpacity * 0.8))
+            }
+        }
+        .multilineTextAlignment(metrics.textAlignment)
+        .frame(maxWidth: .infinity, alignment: metrics.alignment == .center
+               ? .center : .leading)
+        .id(line.id)
+        .contentShape(Rectangle())
+        .onTapGesture { onSeek?(line.time) }
+        .animation(.easeInOut(duration: 0.25), value: isActive)
     }
 }

@@ -19,6 +19,7 @@ struct NowPlayingView: View {
     @State private var showAdvancedSource: Bool = false
     @State private var isAudioInfoPresented: Bool = false
     @State private var isQueuePresented: Bool = false
+    @State private var isLyricsFullScreen: Bool = false
 
     var body: some View {
         ZStack {
@@ -102,6 +103,10 @@ struct NowPlayingView: View {
             PlaybackQueueView()
                 .environmentObject(player)
         }
+        .fullScreenCover(isPresented: $isLyricsFullScreen) {
+            LyricsFullScreenView()
+                .environmentObject(player)
+        }
     }
 
     // MARK: - Chrome
@@ -178,7 +183,7 @@ struct NowPlayingView: View {
                     .foregroundColor(AppTheme.textSecondary)
             }
             Spacer()
-            Button { player.loadLyricsForCurrentTrack() } label: {
+            Button { isLyricsFullScreen = true } label: {
                 Image(systemName: "quote.bubble")
                     .font(.system(size: 16))
                     .foregroundColor(AppTheme.textSecondary)
@@ -270,7 +275,7 @@ struct NowPlayingView: View {
     }
 
     private var lyricsCard: some View {
-        let lines = SyncedLyrics.parse(player.lyricsText)
+        let lyrics = player.lyrics
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("歌詞")
@@ -279,28 +284,34 @@ struct NowPlayingView: View {
                 Spacer()
                 if player.isLoadingLyrics {
                     ProgressView().tint(AppTheme.textSecondary)
-                } else if !lines.isEmpty {
+                } else if lyrics.isSynced {
                     Text("點一行可跳轉")
                         .font(.caption2)
                         .foregroundColor(AppTheme.textSecondary)
                 }
+                Button { isLyricsFullScreen = true } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(AppTheme.textSecondary)
+                }
+                .padding(.leading, 10)
             }
 
-            if player.isLoadingLyrics, player.lyricsText.isEmpty {
-                Text("載入中…")
-                    .font(.footnote)
-                    .foregroundColor(AppTheme.textSecondary)
-            } else if lines.isEmpty {
-                // Unsynced transcripts still arrive as plain text.
-                Text(player.lyricsText.isEmpty ? "找不到歌詞" : player.lyricsText)
-                    .font(.footnote)
-                    .foregroundColor(AppTheme.textSecondary)
-            } else {
-                SyncedLyricsView(lines: lines,
-                                 currentTime: player.currentTime) { time in
+            if lyrics.isSynced {
+                SyncedLyricsView(lines: lyrics.lines,
+                                 currentTime: player.currentTime,
+                                 showsTranslation: player.lyricsTranslationEnabled) { time in
                     player.seekTo(time)
                 }
                 .frame(height: 190)
+            } else if !lyrics.plain.isEmpty {
+                Text(lyrics.plain)
+                    .font(.footnote)
+                    .foregroundColor(AppTheme.textSecondary)
+            } else {
+                Text(player.isLoadingLyrics ? "載入中…" : "找不到歌詞")
+                    .font(.footnote)
+                    .foregroundColor(AppTheme.textSecondary)
             }
         }
         .padding(14)
@@ -309,6 +320,8 @@ struct NowPlayingView: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color.white.opacity(0.07))
         )
+        .contentShape(Rectangle())
+        .onTapGesture { if !lyrics.isSynced { isLyricsFullScreen = true } }
     }
 
     private var advancedSourceBlock: some View {

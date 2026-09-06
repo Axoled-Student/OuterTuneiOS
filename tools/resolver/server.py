@@ -507,6 +507,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True, "ready": ready,
                                          "queued": queued})
 
+        if route == "/lyrics":
+            title = (params.get("title") or [""])[0].strip()
+            artist = (params.get("artist") or [""])[0].strip()
+            if not title:
+                return self._send_json(400, {"error": "missing title"})
+            try:
+                seconds = float((params.get("duration") or ["0"])[0])
+            except ValueError:
+                seconds = 0.0
+            target = (params.get("target") or [""])[0].strip() or None
+            if (params.get("translate") or ["1"])[0] in ("0", "false", ""):
+                target = None
+            try:
+                import lyrics
+                payload = lyrics.get(title, artist, duration=seconds or None,
+                                     target=target)
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)[:300]})
+            return self._send_json(200, payload)
+
         if route == "/stream":
             if not video_id:
                 return self._send_json(400, {"error": "missing v"})

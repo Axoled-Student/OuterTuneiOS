@@ -307,6 +307,58 @@ final class StreamResolverService: ObservableObject {
         }
     }
 
+    /// Timed lyrics, and their translation when the server has one ready.
+    ///
+    /// Returns nil rather than an empty snapshot when the resolver cannot
+    /// answer, so the caller knows to fall back to lrclib directly.
+    func fetchLyrics(title: String,
+                     artist: String,
+                     duration: Int?,
+                     target: String?) async -> LyricsSnapshot? {
+        guard isConfigured, !title.isEmpty else { return nil }
+        var query = [
+            URLQueryItem(name: "title", value: title),
+            URLQueryItem(name: "artist", value: artist),
+        ]
+        if let duration, duration > 0 {
+            query.append(URLQueryItem(name: "duration", value: String(duration)))
+        }
+        if let target, !target.isEmpty {
+            query.append(URLQueryItem(name: "target", value: target))
+        } else {
+            query.append(URLQueryItem(name: "translate", value: "0"))
+        }
+        guard let endpoint = url(path: "/lyrics", query: query) else { return nil }
+
+        do {
+            let (data, response) = try await session.data(from: endpoint)
+            guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return nil }
+
+            var snapshot = LyricsSnapshot()
+            snapshot.source = object["source"] as? String
+            snapshot.language = object["language"] as? String
+            snapshot.translated = (object["translated"] as? Bool) ?? false
+            snapshot.translating = (object["translating"] as? Bool) ?? false
+            snapshot.plain = (object["plain"] as? String) ?? ""
+            snapshot.plainTranslated = object["plainTranslated"] as? String
+
+            let rows = (object["lines"] as? [[String: Any]]) ?? []
+            snapshot.lines = rows.enumerated().compactMap { index, row in
+                guard let text = row["text"] as? String else { return nil }
+                let time = (row["t"] as? Double) ?? 0
+                return LyricLine(id: index, time: time, text: text,
+                                 translation: row["tr"] as? String)
+            }
+            // An empty answer is still an answer: the server searched lrclib
+            // more thoroughly than the phone would, so do not search again.
+            return snapshot
+        } catch {
+            return nil
+        }
+    }
+
     /// Report how a track was actually received. Skips are the signal the
     /// ranker learns from, so this is fire-and-forget on every track change.
     func reportPlayback(track: AppTrack,
