@@ -621,7 +621,13 @@ def _fill_station(engine, state, cfg, model):
         if not queries:
             state["error"] = state["error"] or "model returned no usable songs"
         else:
-            _admit(engine, state, _resolve_together(engine, queries))
+            found = _resolve_together(engine, queries)
+            # The opening wave chose what plays first, so it gets the front of
+            # the station even on the rare occasion it answers second. Only
+            # the admission waits; the model call and the lookups above have
+            # already run alongside it.
+            state["opened"].wait(60)
+            _admit(engine, state, found)
     except Exception as e:  # noqa: BLE001
         state["error"] = state["error"] or ("model call failed: %s"
                                             % str(e)[:200])
@@ -691,7 +697,7 @@ def ai_radio(engine, prompt, limit=20, model=None, station=None, after=0):
              "limit": limit, "tracks": [], "seen_ids": set(), "seen_keys": set(),
              "artists": {}, "avoid": avoid,
              "pending": True, "error": None, "created": now,
-             "lock": threading.Lock()}
+             "lock": threading.Lock(), "opened": threading.Event()}
     with _stations_guard:
         _stations[state["id"]] = state
 
@@ -699,15 +705,23 @@ def ai_radio(engine, prompt, limit=20, model=None, station=None, after=0):
     # six-song ask still answers in ~4s alongside a forty-song one).
     tail = _radio_pool.submit(_fill_station, engine, state, cfg, model)
 
+    failed = None
     try:
         raw = _ask_model(cfg, _sprint_ask(prompt, engine, auto),
                          model or "gemini-3.8-flash-high",
                          max_tokens=260, timeout=40)
         _admit(engine, state, _resolve_together(engine, _parse_list(raw)))
     except Exception as e:  # noqa: BLE001
+        failed = e
+        state["error"] = "quick pass failed: %s" % str(e)[:120]
+
+    # Released whether the opening worked or not, and before anything waits on
+    # the long wave: the long wave is itself waiting on this.
+    state["opened"].set()
+
+    if failed is not None:
         # A failed opening is not a failed station: fall back to the long wave
         # rather than handing back nothing.
-        state["error"] = "quick pass failed: %s" % str(e)[:120]
         try:
             tail.result(timeout=90)
         except Exception:  # noqa: BLE001

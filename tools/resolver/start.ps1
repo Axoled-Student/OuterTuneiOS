@@ -6,6 +6,14 @@
 #
 # The hostname is a named tunnel (see ~/.cloudflared/config.yml), so unlike a
 # quick trycloudflare tunnel it stays the same across restarts.
+#
+# The only pip dependency is the DJ's voice, and it is optional:
+#
+#   pip install edge-tts
+#
+# Without it /djline still writes the line and the app reads it on screen; the
+# rest of the server does not touch it. yt-dlp is called as a subprocess, not
+# imported, so it only needs to be on PATH.
 
 param(
     [int]$Port = 9099,

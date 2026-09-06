@@ -535,6 +535,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(502, {"error": str(e)[:300]})
             return self._send_json(200, payload)
 
+        if route == "/djline":
+            # The voice between songs. The client asks for the handover into
+            # the *next* track while the current one is still playing, so the
+            # few seconds this takes are never waited on.
+            upcoming = {"artist": (params.get("artist") or [""])[0].strip(),
+                        "title": (params.get("title") or [""])[0].strip()}
+            prev = {"artist": (params.get("prevArtist") or [""])[0].strip(),
+                    "title": (params.get("prevTitle") or [""])[0].strip()}
+            if not (upcoming["title"] or upcoming["artist"]):
+                return self._send_json(400, {"error": "missing title"})
+            first = (params.get("first") or ["0"])[0] not in ("0", "", "false")
+            voice = (params.get("voice") or [""])[0].strip() or None
+            try:
+                import dj
+                payload = dj.line((params.get("theme") or [""])[0].strip(),
+                                  prev, upcoming,
+                                  language=(params.get("lang") or [""])[0],
+                                  first=first, voice=voice)
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)[:300]})
+            if payload.get("audio"):
+                payload["audioPath"] = "/djvoice?id=%s" % payload["audio"]
+            return self._send_json(200, payload)
+
+        if route == "/djvoice":
+            import dj
+            audio = dj.audio_bytes((params.get("id") or [""])[0].strip())
+            if audio is None:
+                return self._send_json(404, {"error": "no such line"})
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(audio)))
+            # A handover is keyed by the two songs either side of it, so the
+            # bytes behind one id never change.
+            self.send_header("Cache-Control", "public, max-age=604800")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(audio)
+            return
+
         if route == "/stream":
             if not video_id:
                 return self._send_json(400, {"error": "missing v"})

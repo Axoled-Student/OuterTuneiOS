@@ -61,6 +61,14 @@ struct AIRadioBatch {
     let pending: Bool
 }
 
+/// One spoken handover from the station's DJ.
+struct AIDJLine {
+    let text: String
+    /// Absent when the server could write the line but not speak it. The app
+    /// can still show it on screen, which is better than nothing.
+    let audio: URL?
+}
+
 @MainActor
 final class StreamResolverService: ObservableObject {
     static let shared = StreamResolverService()
@@ -346,6 +354,54 @@ final class StreamResolverService: ObservableObject {
                 pending: (object["pending"] as? Bool) ?? false)
         } catch {
             lastErrorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// The DJ's line introducing the track that is coming up next.
+    ///
+    /// Ask for this while the current track is still playing. Writing and
+    /// speaking a sentence takes the server the better part of ten seconds,
+    /// and the whole point is that none of them are waited on.
+    func fetchDJLine(theme: String?,
+                     previous: AppTrack?,
+                     upcoming: AppTrack,
+                     language: String,
+                     isFirst: Bool) async -> AIDJLine? {
+        var query = [
+            URLQueryItem(name: "artist", value: upcoming.artist),
+            URLQueryItem(name: "title", value: upcoming.title),
+            URLQueryItem(name: "lang", value: language),
+            URLQueryItem(name: "first", value: isFirst ? "1" : "0"),
+        ]
+        if let theme, !theme.isEmpty {
+            query.append(URLQueryItem(name: "theme", value: theme))
+        }
+        if let previous, !isFirst {
+            query.append(URLQueryItem(name: "prevArtist", value: previous.artist))
+            query.append(URLQueryItem(name: "prevTitle", value: previous.title))
+        }
+
+        guard isConfigured, let endpoint = url(path: "/djline", query: query)
+        else { return nil }
+
+        do {
+            let (data, response) = try await self.session.data(from: endpoint)
+            guard (200 ..< 300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let text = object["text"] as? String, !text.isEmpty
+            else { return nil }
+
+            // Built from the id rather than the server's `audioPath`, because
+            // that already carries a query string and `url(path:query:)` would
+            // overwrite it with the token.
+            var audio: URL?
+            if let identifier = object["audio"] as? String, !identifier.isEmpty {
+                audio = url(path: "/djvoice",
+                            query: [URLQueryItem(name: "id", value: identifier)])
+            }
+            return AIDJLine(text: text, audio: audio)
+        } catch {
             return nil
         }
     }

@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 /// 正在播放 sheet。iOS 風格大卡片 + 操作列 + 可展開歌詞。
 struct NowPlayingView: View {
     @EnvironmentObject private var player: AudioPlayerViewModel
+    @ObservedObject private var aiDJ = AIDJService.shared
     @Environment(\.dismiss) private var dismiss
 
     /// Set when the view is hosted as a side panel rather than presented, so
@@ -45,6 +46,9 @@ struct NowPlayingView: View {
                             Spacer(minLength: 26)
 
                             titleRow(track: track)
+                                .padding(.horizontal, 28)
+
+                            djLine
                                 .padding(.horizontal, 28)
 
                             progressSlider
@@ -142,6 +146,29 @@ struct NowPlayingView: View {
         }
         .padding(.horizontal, 22)
         .padding(.top, 14)
+    }
+
+    /// What the station DJ is saying over this intro.
+    ///
+    /// Also the whole of the DJ when the server could write a line but not
+    /// speak it, so this is not decoration - it is the fallback.
+    @ViewBuilder
+    private var djLine: some View {
+        if let line = aiDJ.spokenLine, !line.isEmpty {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 13))
+                    .foregroundColor(AppTheme.accent)
+                    .padding(.top, 1)
+                Text(line)
+                    .font(.system(size: 13))
+                    .foregroundColor(AppTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 10)
+            .transition(.opacity)
+        }
     }
 
     private func titleRow(track: AppTrack) -> some View {

@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var player: AudioPlayerViewModel
     @EnvironmentObject private var account: AccountStore
+    @ObservedObject private var aiDJ = AIDJService.shared
 
     @AppStorage("settings.autoPlayNext") private var autoPlayNext: Bool = true
     @AppStorage("settings.allowCellular") private var allowCellular: Bool = true
@@ -148,6 +149,11 @@ struct SettingsView: View {
             NavigationLink("串流伺服器") {
                 ResolverSettingsView()
             }
+            Toggle("AI 電台主持人", isOn: $aiDJ.isEnabled)
+            Text("在 AI 電台中，每隔幾首歌由 AI 主持人以語音介紹下一首，"
+                 + "說話時音樂會自動轉小聲。需要串流伺服器。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

@@ -157,11 +157,16 @@ final class AudioPlayerViewModel: ObservableObject {
     private let accountStore = AccountStore.shared
     private let autoQueueService = AutoQueueService.shared
     private let resolverService = StreamResolverService.shared
+    private let aiDJ = AIDJService.shared
 
     /// Bumped by every queue replacement. A station collector carries the
     /// value it started with and gives up as soon as it no longer matches,
     /// so tracks from an abandoned station never land in a new queue.
     private var aiRadioGeneration = 0
+
+    /// In-flight volume ramp for the DJ. Cancelled by the next one so two
+    /// ramps cannot fight over the same property.
+    private var volumeRamp: Task<Void, Never>?
 
     private let queueStorageKey = "ios.queue.v1"
     private let queueIndexStorageKey = "ios.queue.index.v1"
@@ -219,6 +224,9 @@ final class AudioPlayerViewModel: ObservableObject {
         }
         autocompleteSuggestions = Array(searchHistory.prefix(6))
         wireYouTubeAuthProvider()
+        aiDJ.duck = { [weak self] level in
+            self?.setMusicVolume(level)
+        }
     }
 
     private func wireYouTubeAuthProvider() {
@@ -942,7 +950,29 @@ final class AudioPlayerViewModel: ObservableObject {
         updateNowPlayingPlaybackState()
     }
 
+    /// Ride the music volume up or down, for the DJ talking over an intro.
+    ///
+    /// Ramped rather than stepped: an instant drop to a fifth of the volume is
+    /// audible as a click, and the whole illusion is that a person is speaking
+    /// over a record that never stopped.
+    func setMusicVolume(_ level: Float) {
+        volumeRamp?.cancel()
+        guard let player else { return }
+        let from = player.volume
+        guard abs(from - level) > 0.01 else { return }
+        volumeRamp = Task { [weak self] in
+            let steps = 8
+            for step in 1 ... steps {
+                try? await Task.sleep(nanoseconds: 25_000_000)
+                if Task.isCancelled { return }
+                let progress = Float(step) / Float(steps)
+                self?.player?.volume = from + (level - from) * progress
+            }
+        }
+    }
+
     func pause() {
+        aiDJ.stop()
         player?.pause()
         isPlaying = false
         statusMessage = "已暫停"
@@ -1032,6 +1062,8 @@ final class AudioPlayerViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.replaceQueueAndPlay(tracks: batch.tracks, startingAt: 0)
+            self.aiDJ.stationBegan(theme: batch.theme,
+                                   opening: batch.tracks.first)
             guard batch.pending, !batch.station.isEmpty else { return }
             await self.collectAIRadio(station: batch.station,
                                       have: batch.tracks.count,
@@ -1062,6 +1094,11 @@ final class AudioPlayerViewModel: ObservableObject {
                 self.appendTracks(batch.tracks)
                 quiet = 0
             }
+            // A promptless station only names itself once the long wave runs,
+            // and the DJ should be introducing songs by that name.
+            if let theme = batch.theme, !theme.isEmpty {
+                self.aiDJ.stationNamed(theme)
+            }
             if !batch.pending { return }
         }
     }
@@ -1088,6 +1125,9 @@ final class AudioPlayerViewModel: ObservableObject {
         guard tracks.indices.contains(index) else { return }
         cancelAutoQueueGeneration()
         aiRadioGeneration &+= 1
+        // Whatever this queue turns out to be, it is not the station the DJ
+        // was talking about. `startAIRadio` reopens it straight after.
+        aiDJ.stationEnded()
         nextPreloadTask?.cancel()
         queue = tracks
         currentQueueIndex = index
@@ -1113,6 +1153,8 @@ final class AudioPlayerViewModel: ObservableObject {
 
         let track = queue[index]
         finishListeningIfChanging(to: track)
+        // Whatever the DJ was saying was about the song that just ended.
+        aiDJ.stop()
         currentQueueIndex = index
         persistQueueState()
 
@@ -1141,6 +1183,12 @@ final class AudioPlayerViewModel: ObservableObject {
 
             startPlaybackAttempt(track: track)
             trackDidStartPlaying(track)
+            aiDJ.songStarted(track)
+            if index + 1 < queue.count {
+                // One track ahead: writing and speaking a sentence takes the
+                // server several seconds, all of which this hides.
+                aiDJ.prepare(upcoming: queue[index + 1], previous: track)
+            }
             // Fetch the transcript alongside the audio; waiting for the user to
             // ask meant it was almost never there when they looked.
             loadLyricsForCurrentTrack()
