@@ -535,6 +535,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(502, {"error": str(e)[:300]})
             return self._send_json(200, payload)
 
+        if route == "/djset":
+            # One turn of the DJ loop: a theme, the songs for it, and the
+            # sentence introducing them. The client sends back what was
+            # skipped and what was played through, which is what steers the
+            # next turn.
+            try:
+                import djset
+                payload = djset.next_set(
+                    self.__class__.queue_engine,
+                    session_id=(params.get("session") or [""])[0].strip(),
+                    language=(params.get("lang") or [""])[0],
+                    skipped=[v for v in params.get("skipped", []) if v.strip()],
+                    liked=[v for v in params.get("liked", []) if v.strip()],
+                    model=(params.get("model") or [""])[0].strip() or None)
+            except Exception as e:  # noqa: BLE001
+                return self._send_json(502, {"error": str(e)[:300]})
+            status = 200 if payload.get("tracks") else 502
+            return self._send_json(status, payload)
+
         if route == "/djline":
             # The voice between songs. The client asks for the handover into
             # the *next* track while the current one is still playing, so the

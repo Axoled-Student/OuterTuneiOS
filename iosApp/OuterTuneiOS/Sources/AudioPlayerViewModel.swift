@@ -158,6 +158,7 @@ final class AudioPlayerViewModel: ObservableObject {
     private let autoQueueService = AutoQueueService.shared
     private let resolverService = StreamResolverService.shared
     private let aiDJ = AIDJService.shared
+    private let djStation = DJStation.shared
 
     /// Bumped by every queue replacement. A station collector carries the
     /// value it started with and gives up as soon as it no longer matches,
@@ -1071,6 +1072,51 @@ final class AudioPlayerViewModel: ObservableObject {
         }
     }
 
+    /// Start a station that runs as a loop rather than one long list.
+    ///
+    /// The difference from `startAIRadio` is what happens after the first few
+    /// songs. A station is planned once; this is re-planned every set, with
+    /// what the listener did to the last one folded in - which is the point of
+    /// the whole exercise and the reason skipping actually changes anything.
+    ///
+    /// Returns whether a station actually opened, so the caller can say so.
+    /// The theme, which may take a set or two to be worth showing, is on
+    /// `DJStation.shared`.
+    @discardableResult
+    func startDJStation() async -> Bool {
+        guard let set = await djStation.openingSet(), !set.tracks.isEmpty
+        else { return false }
+
+        await replaceQueueAndPlay(tracks: set.tracks, startingAt: 0)
+        // Both reopened here rather than before: replacing the queue closes
+        // whatever station was running, including one opened a line earlier.
+        djStation.begin(set)
+        aiDJ.stationBegan(theme: set.theme, opening: set.tracks.first,
+                          setMode: true)
+        deliver(set)
+        return true
+    }
+
+    /// Hand a set's commentary to the DJ, to be spoken over its first song.
+    private func deliver(_ set: DJSet) {
+        guard !set.script.isEmpty, let opening = set.tracks.first else { return }
+        aiDJ.hold(text: set.script, audio: set.audio, for: opening.stableId)
+    }
+
+    /// The last song of the current set has started, so ask for the next one
+    /// and put it behind what is playing.
+    private func extendDJStation(after track: AppTrack) {
+        Task { [weak self] in
+            guard let self else { return }
+            guard let set = await self.djStation.songStarted(track),
+                  !set.tracks.isEmpty
+            else { return }
+            self.appendTracks(set.tracks)
+            self.aiDJ.stationNamed(set.theme)
+            self.deliver(set)
+        }
+    }
+
     private func collectAIRadio(station: String,
                                 have: Int,
                                 generation: Int) async {
@@ -1126,8 +1172,10 @@ final class AudioPlayerViewModel: ObservableObject {
         cancelAutoQueueGeneration()
         aiRadioGeneration &+= 1
         // Whatever this queue turns out to be, it is not the station the DJ
-        // was talking about. `startAIRadio` reopens it straight after.
+        // was talking about. `startAIRadio` and `startDJStation` reopen it
+        // straight after.
         aiDJ.stationEnded()
+        djStation.stop()
         nextPreloadTask?.cancel()
         queue = tracks
         currentQueueIndex = index
@@ -1184,6 +1232,11 @@ final class AudioPlayerViewModel: ObservableObject {
             startPlaybackAttempt(track: track)
             trackDidStartPlaying(track)
             aiDJ.songStarted(track)
+            // On a set station this is what keeps the loop turning: the last
+            // song of a set starting is the cue to go and plan the next.
+            if djStation.isRunning {
+                extendDJStation(after: track)
+            }
             if index + 1 < queue.count {
                 // One track ahead: writing and speaking a sentence takes the
                 // server several seconds, all of which this hides.
@@ -2110,26 +2163,62 @@ final class AudioPlayerViewModel: ObservableObject {
             return
         }
 
-        guard nowPlayingArtworkSourceURL != rawURL else {
+        // The lock screen draws this bigger than anything inside the app - most
+        // of an iPad's width - and this path used to hand it the URL exactly as
+        // the search result carried it. InnerTube tops most of those out at
+        // 120px, so the cover on the lock screen was a ten-fold upscale while
+        // every view inside the app was asking for a properly sized one.
+        //
+        // Going through `sized` rather than a fixed number keeps the cellular
+        // and Low Data ceilings that the rest of the artwork already respects.
+        let sourceURL = ArtworkURL.sized(rawURL, forPoints: 512) ?? rawURL
+
+        guard nowPlayingArtworkSourceURL != sourceURL else {
             return
         }
 
-        nowPlayingArtworkSourceURL = rawURL
+        nowPlayingArtworkSourceURL = sourceURL
         nowPlayingArtworkTask?.cancel()
 
-        nowPlayingArtworkTask = Task {
-            guard let url = URL(string: rawURL) else { return }
-            guard let (data, _) = try? await URLSession.shared.data(from: url) else { return }
-            guard !Task.isCancelled else { return }
-            guard let image = UIImage(data: data) else { return }
+        // Usually already on disk: the now-playing screen asks for a cover this
+        // size too, so the lock screen tends to cost nothing.
+        if let ready = ImageCache.shared.cached(sourceURL) {
+            applyNowPlayingArtwork(ready)
+            return
+        }
 
-            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-            var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-            info[MPMediaItemPropertyArtwork] = artwork
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        nowPlayingArtworkTask = Task { [weak self] in
+            guard let image = await Self.fetchArtwork(sourceURL) else { return }
+            guard !Task.isCancelled else { return }
+            self?.applyNowPlayingArtwork(image)
         }
 #endif
     }
+
+#if os(iOS)
+    private func applyNowPlayingArtwork(_ image: UIImage) {
+        let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPMediaItemPropertyArtwork] = artwork
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    /// Fetch a cover, dropping to the variant i.ytimg always publishes when the
+    /// larger one asked for turns out not to exist. Without the retry, raising
+    /// the requested size would have left some tracks with no lock-screen art
+    /// at all - worse than the soft one it replaced.
+    private nonisolated static func fetchArtwork(_ urlString: String) async -> UIImage? {
+        guard let url = URL(string: urlString) else { return nil }
+        var payload = try? await URLSession.shared.data(from: url)
+        if let status = (payload?.1 as? HTTPURLResponse)?.statusCode, status >= 400,
+           let alternative = ArtworkURL.fallback(for: urlString),
+           let retry = URL(string: alternative) {
+            payload = try? await URLSession.shared.data(from: retry)
+        }
+        guard let data = payload?.0, !data.isEmpty else { return nil }
+        return UIImage(data: data)
+    }
+#endif
 
     private func observeAudioSessionInterruptions() {
 #if os(iOS)
@@ -2472,6 +2561,10 @@ final class AudioPlayerViewModel: ObservableObject {
             await StreamResolverService.shared.reportPlayback(
                 track: previous, playedSeconds: listened, duration: total)
         }
+        // Step nine of the DJ loop. Held on the client and sent with the
+        // request for the next set, so the DJ plans against it.
+        djStation.finished(previous, listenedSeconds: listened,
+                           duration: total)
         feedbackTrack = nil
     }
 

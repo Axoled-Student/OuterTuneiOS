@@ -6,9 +6,9 @@ synthesised voice that reads it. The first is already here; this module adds
 the other two.
 
 Both halves live on this machine rather than the phone, for the same reason
-the lyrics do. The model key is here. The voice is here - `edge_tts` speaks
-through Microsoft's read-aloud service, which needs no key but does need a
-Python process, and putting it server side means the phone plays an ordinary
+the lyrics do. The model key is here. The voice is here - this speaks through
+Microsoft's read-aloud service, which needs no key but does need a Python
+process, and putting it server side means the phone plays an ordinary
 MP3 URL instead of shipping a synthesiser. And the result caches: two devices
 hearing the same handover pay for it once.
 
@@ -240,30 +240,124 @@ def write_line(theme, prev, upcoming, language, first=False, model=None):
 # --------------------------------------------------------------------- voice
 
 
-def speak(text, voice, path):
+# 24kHz mono, and 96kbps rather than the 48 that `edge_tts.Communicate`
+# hardcodes into its handshake. Measured against the live endpoint: 96 comes
+# back at exactly twice the bytes for the same sentence, 128 and 160 come back
+# empty, and every 48kHz variant is refused. So this is the ceiling the free
+# read-aloud service offers, and the old default was sitting an octave of
+# bitrate below it - which is audible, because the DJ is talking over music.
+AUDIO_FORMAT = "audio-24khz-96kbitrate-mono-mp3"
+
+# Radio hosts talk slightly faster than a screen reader. This is also why the
+# clips are a little shorter, which is worth something when one plays over the
+# opening bars of a song.
+SPEAKING_RATE = "+8%"
+
+
+async def _synthesise(text, voice, rate):
+    """One websocket round trip to the read-aloud service.
+
+    Written out rather than calling `edge_tts.Communicate` because the output
+    format is baked into a literal inside its handshake and there is no
+    parameter for it. Everything genuinely hard here - the Sec-MS-GEC token,
+    the SSML envelope - is still `edge_tts`, so this tracks its updates.
+    """
+    import aiohttp
+    import edge_tts.communicate as wire
+    from edge_tts.constants import SEC_MS_GEC_VERSION, WSS_HEADERS, WSS_URL
+    from edge_tts.drm import DRM
+
+    config = wire.TTSConfig(voice=voice, rate=rate, volume="+0%", pitch="+0Hz",
+                            boundary="SentenceBoundary")
+    url = ("%s&ConnectionId=%s&Sec-MS-GEC=%s&Sec-MS-GEC-Version=%s"
+           % (WSS_URL, wire.connect_id(), DRM.generate_sec_ms_gec(),
+              SEC_MS_GEC_VERSION))
+    config_frame = (
+        "X-Timestamp:%s\r\n"
+        "Content-Type:application/json; charset=utf-8\r\n"
+        "Path:speech.config\r\n\r\n"
+        '{"context":{"synthesis":{"audio":{"metadataoptions":{'
+        '"sentenceBoundaryEnabled":"true","wordBoundaryEnabled":"false"},'
+        '"outputFormat":"%s"}}}}\r\n'
+        % (wire.date_to_string(), AUDIO_FORMAT))
+
+    chunks = []
+    session = aiohttp.ClientSession(trust_env=True)
+    try:
+        async with session.ws_connect(
+                url, compress=15,
+                headers=DRM.headers_with_muid(WSS_HEADERS),
+                ssl=wire._SSL_CTX) as socket:
+            await socket.send_str(config_frame)
+            await socket.send_str(wire.ssml_headers_plus_data(
+                wire.connect_id(), wire.date_to_string(),
+                wire.mkssml(config, text)))
+
+            async for message in socket:
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    if "Path:turn.end" in message.data:
+                        break
+                elif message.type == aiohttp.WSMsgType.BINARY:
+                    if len(message.data) < 2:
+                        continue
+                    header = int.from_bytes(message.data[:2], "big")
+                    chunks.append(message.data[2 + header:])
+    finally:
+        await session.close()
+    return b"".join(chunks)
+
+
+def speak(text, voice, path, rate=None):
     """Synthesise `text` to `path` as MP3.
 
-    `edge_tts` is async and this server is threaded, so each call gets its own
-    event loop rather than borrowing one that belongs to another thread.
+    The synthesiser is async and this server is threaded, so each call gets its
+    own event loop rather than borrowing one that belongs to another thread.
     """
-    import edge_tts  # imported late: the resolver still runs without a DJ
-
-    temp = str(path) + ".tmp"
-
-    async def run():
-        await edge_tts.Communicate(text, voice).save(temp)
-
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(run())
+        audio = loop.run_until_complete(
+            _synthesise(text, voice, rate or SPEAKING_RATE))
     finally:
         loop.close()
-    if not os.path.exists(temp) or os.path.getsize(temp) == 0:
+    if not audio:
         raise RuntimeError("the voice service returned no audio")
+
+    temp = str(path) + ".tmp"
+    with open(temp, "wb") as handle:
+        handle.write(audio)
     os.replace(temp, path)
 
 
 # -------------------------------------------------------------------- public
+
+
+def voice_over(text, language=None, voice=None):
+    """Speak a script that has already been written, and return its audio id.
+
+    `line()` writes a sentence and speaks it. The DJ loop writes its own
+    script while it is choosing the set - one decision, one model call - so it
+    needs only this half. Cached on the words themselves, because the same
+    sentence read by the same voice is the same audio, whatever set it belongs
+    to.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("nothing to say")
+
+    language = normalise_language(language)
+    voice = voice or voice_for(language)
+    key = hashlib.sha1(("say|%s|%s" % (text, voice)).lower().encode("utf-8")
+                       ).hexdigest()[:20]
+
+    with _lock_for(key):
+        if _read_cache(key):
+            return key
+        _, audio_path = _paths(key)
+        speak(text, voice, audio_path)
+        _write_cache(key, {"v": CACHE_VERSION, "written": time.time(),
+                           "text": text, "voice": voice,
+                           "language": language})
+    return key
 
 
 def line(theme, prev, upcoming, language=None, first=False, model=None,

@@ -61,6 +61,24 @@ struct AIRadioBatch {
     let pending: Bool
 }
 
+/// One turn of the DJ loop: a theme, the songs chosen for it, and the line
+/// introducing them - already written and already spoken.
+///
+/// The server plans all three together because they are one decision, which is
+/// why this arrives as a single object rather than a station plus a handover.
+struct DJSet {
+    let session: String
+    /// How many sets have been handed over on this session, starting at one.
+    let index: Int
+    let theme: String
+    /// Empty when the DJ decided this set was not worth introducing.
+    let script: String
+    /// Absent when the script was written but the voice service was
+    /// unreachable, and when there is no script at all.
+    let audio: URL?
+    let tracks: [AppTrack]
+}
+
 /// One spoken handover from the station's DJ.
 struct AIDJLine {
     let text: String
@@ -333,19 +351,7 @@ final class StreamResolverService: ObservableObject {
                 lastAIRadioTheme = theme
             }
 
-            let rows = (object["tracks"] as? [[String: Any]]) ?? []
-            let tracks: [AppTrack] = rows.compactMap { row in
-                guard let videoId = row["videoId"] as? String, !videoId.isEmpty
-                else { return nil }
-                return AppTrack(
-                    id: UUID().uuidString,
-                    canonicalId: "yt:\(videoId)",
-                    title: (row["title"] as? String) ?? "Unknown",
-                    artist: (row["artist"] as? String) ?? "Unknown",
-                    thumbnailURL: row["thumbnail"] as? String,
-                    durationText: nil,
-                    source: .youtube(videoId: videoId))
-            }
+            let tracks = Self.tracks(from: object)
             return AIRadioBatch(
                 station: (object["station"] as? String) ?? "",
                 theme: object["prompt"] as? String,
@@ -402,6 +408,91 @@ final class StreamResolverService: ObservableObject {
             }
             return AIDJLine(text: text, audio: audio)
         } catch {
+            return nil
+        }
+    }
+
+    /// The rows a resolver reply carries under "tracks".
+    private static func tracks(from object: [String: Any]) -> [AppTrack] {
+        let rows = (object["tracks"] as? [[String: Any]]) ?? []
+        return rows.compactMap { row in
+            guard let videoId = row["videoId"] as? String, !videoId.isEmpty
+            else { return nil }
+            return AppTrack(
+                id: UUID().uuidString,
+                canonicalId: "yt:\(videoId)",
+                title: (row["title"] as? String) ?? "Unknown",
+                artist: (row["artist"] as? String) ?? "Unknown",
+                thumbnailURL: row["thumbnail"] as? String,
+                durationText: nil,
+                source: .youtube(videoId: videoId))
+        }
+    }
+
+    /// The next turn of the DJ loop.
+    ///
+    /// Pass `session` back on every call after the first, along with what was
+    /// skipped and what was listened through since the last set. Both change
+    /// what comes back: this is the whole reason the loop exists.
+    ///
+    /// Only the first set is slow. The server starts building the next one the
+    /// moment it hands this one over, so later calls usually return in under a
+    /// second - which is what lets the station keep playing without a gap.
+    func fetchDJSet(session: String?,
+                    language: String,
+                    skipped: [String] = [],
+                    liked: [String] = []) async -> DJSet? {
+        var query = [URLQueryItem(name: "lang", value: language)]
+        if let session, !session.isEmpty {
+            query.append(URLQueryItem(name: "session", value: session))
+        }
+        query += skipped.map { URLQueryItem(name: "skipped", value: $0) }
+        query += liked.map { URLQueryItem(name: "liked", value: $0) }
+
+        guard isConfigured, let endpoint = url(path: "/djset", query: query)
+        else { return nil }
+
+        do {
+            let (data, _) = try await self.session.data(from: endpoint)
+            guard let object = try JSONSerialization
+                    .jsonObject(with: data) as? [String: Any]
+            else { return nil }
+
+            // A set can carry an error and still be playable - the voice
+            // failing while the songs resolved - so the message is recorded
+            // and the set handed back anyway. Only an empty one is a failure,
+            // which is also why the status code is not checked: the server
+            // answers 502 with a perfectly readable explanation inside.
+            if let message = object["error"] as? String, !message.isEmpty {
+                lastErrorMessage = message
+            }
+            let tracks = Self.tracks(from: object)
+            guard !tracks.isEmpty,
+                  let identifier = object["session"] as? String
+            else { return nil }
+
+            let theme = (object["theme"] as? String) ?? ""
+            if !theme.isEmpty {
+                lastAIRadioTheme = theme
+            }
+
+            // Built from the id rather than the server's `audioPath`: that
+            // already carries a query string, which `url(path:query:)` would
+            // overwrite with the token.
+            var audio: URL?
+            if let clip = object["audio"] as? String, !clip.isEmpty {
+                audio = url(path: "/djvoice",
+                            query: [URLQueryItem(name: "id", value: clip)])
+            }
+
+            return DJSet(session: identifier,
+                         index: (object["set"] as? Int) ?? 0,
+                         theme: theme,
+                         script: (object["script"] as? String) ?? "",
+                         audio: audio,
+                         tracks: tracks)
+        } catch {
+            lastErrorMessage = error.localizedDescription
             return nil
         }
     }

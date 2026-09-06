@@ -34,6 +34,12 @@ final class AIDJService: ObservableObject {
     /// when the line finishes.
     @Published private(set) var spokenLine: String?
 
+    /// The DJ is off choosing what comes next. Only the now-playing screen
+    /// reads this, to show that something is happening rather than nothing:
+    /// the first set of a session takes the better part of ten seconds, and
+    /// an unexplained pause after a tap reads as a broken button.
+    @Published private(set) var isPreparing = false
+
     /// Set by the player so the DJ can lower the music while it talks.
     var duck: ((Float) -> Void)?
 
@@ -57,6 +63,12 @@ final class AIDJService: ObservableObject {
     private var stationTheme: String?
     private var isOnStation = false
     private var currentTrackId: String?
+
+    /// On a set station the server writes the commentary as part of choosing
+    /// the set, and hands it over with the songs. This service must then not
+    /// go and ask for handover lines of its own - it would be a second voice
+    /// talking over the first.
+    private var isSetMode = false
 
     private struct PreparedLine {
         let text: String
@@ -83,18 +95,54 @@ final class AIDJService: ObservableObject {
     /// is no track ahead of the first. It is asked for while song one is
     /// already playing and spoken a few seconds in, which is what a station
     /// signing on sounds like anyway.
-    func stationBegan(theme: String?, opening: AppTrack?) {
+    func stationBegan(theme: String?, opening: AppTrack?, setMode: Bool = false) {
         generation &+= 1
         songsSinceLine = 0
         hasSpokenThisStation = false
         stationTheme = theme
         isOnStation = true
+        isSetMode = setMode
         currentTrackId = opening?.stableId
         discardPrepared()
         stop()
-        if let opening {
+        // A set station arrives with its line already written; there is
+        // nothing to go and fetch.
+        if let opening, !setMode {
             prepare(upcoming: opening, previous: nil)
         }
+    }
+
+    /// A line the set loop already has, to be spoken when `key` starts playing.
+    ///
+    /// The set loop fetches a whole turn at once, so its commentary is in hand
+    /// well before the song it introduces. Handing it over here rather than
+    /// playing it directly means it goes out through the same path as every
+    /// other line - ducked, timed, and dropped if the listener has moved on.
+    func hold(text: String, audio: URL?, for key: String) {
+        guard isEnabled, isOnStation, !text.isEmpty else {
+            Self.discard(audio)
+            return
+        }
+        let mine = generation
+        Task { [weak self] in
+            guard let self else { return }
+            var file: URL?
+            if let audio {
+                file = await Self.download(audio)
+            }
+            guard self.generation == mine else {
+                Self.discard(file)
+                return
+            }
+            self.prepared[key] = PreparedLine(text: text, file: file,
+                                              generation: mine)
+            self.deliver(for: key)
+        }
+    }
+
+    /// The loop is off building the next set, or has finished doing so.
+    func preparing(_ busy: Bool) {
+        isPreparing = busy
     }
 
     /// The station named itself after playback began, which is the normal case
@@ -108,6 +156,8 @@ final class AIDJService: ObservableObject {
     func stationEnded() {
         generation &+= 1
         isOnStation = false
+        isSetMode = false
+        isPreparing = false
         stationTheme = nil
         currentTrackId = nil
         discardPrepared()
@@ -122,7 +172,8 @@ final class AIDJService: ObservableObject {
     /// part of ten seconds, and a line that arrives late is a line that never
     /// gets used.
     func prepare(upcoming: AppTrack, previous: AppTrack?) {
-        guard isEnabled, isOnStation, resolver.isConfigured, isDue else { return }
+        guard isEnabled, isOnStation, !isSetMode, resolver.isConfigured, isDue
+        else { return }
 
         let key = upcoming.stableId
         // One at a time. A line that misses its own song still gets spoken a
@@ -249,7 +300,7 @@ final class AIDJService: ObservableObject {
         prepared.removeAll()
     }
 
-    private nonisolated static func download(_ remote: URL) async -> URL? {
+    nonisolated static func download(_ remote: URL) async -> URL? {
         do {
             let (data, response) = try await URLSession.shared.data(from: remote)
             guard (200 ..< 300).contains(

@@ -230,6 +230,20 @@ struct HomeView: View {
         djMessage = nil
         defer { isDJBuilding = false }
 
+        // With the DJ switched on this is a loop, not a playlist: a few songs
+        // on one theme, introduced out loud, then a new theme chosen from what
+        // the listener did with the last one. Without it, the old station -
+        // one long list, planned once.
+        if AIDJService.shared.isEnabled {
+            guard await player.startDJStation() else {
+                djMessage = resolver.lastErrorMessage ?? "無法建立電台，請稍後再試"
+                return
+            }
+            djMessage = DJStation.shared.theme
+            openNowPlaying()
+            return
+        }
+
         // The station starts on the first few songs the server resolves; the
         // rest arrive in the queue while these are playing. An automatic
         // station is not named until the long wave runs, so the theme shown

@@ -148,27 +148,44 @@ struct NowPlayingView: View {
         .padding(.top, 14)
     }
 
-    /// What the station DJ is saying over this intro.
+    /// What the station DJ is saying over this intro - or, before there is
+    /// anything to say, that it is off deciding.
     ///
-    /// Also the whole of the DJ when the server could write a line but not
-    /// speak it, so this is not decoration - it is the fallback.
+    /// The line is also the whole of the DJ when the server could write one
+    /// but not speak it, so this is not decoration: it is the fallback.
     @ViewBuilder
     private var djLine: some View {
         if let line = aiDJ.spokenLine, !line.isEmpty {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "waveform")
-                    .font(.system(size: 13))
-                    .foregroundColor(AppTheme.accent)
-                    .padding(.top, 1)
+            djRow(animating: true) {
                 Text(line)
                     .font(.system(size: 13))
                     .foregroundColor(AppTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
             }
-            .padding(.top, 10)
-            .transition(.opacity)
+        } else if aiDJ.isPreparing {
+            // Planning a set runs to several seconds on the first one. Without
+            // this the screen looks like the tap missed.
+            djRow(animating: true) {
+                Text("DJ 正在挑選下一段…")
+                    .font(.system(size: 13))
+                    .foregroundColor(AppTheme.textSecondary)
+            }
         }
+    }
+
+    private func djRow<Content: View>(
+        animating: Bool,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            DJIndicator(isAnimating: animating)
+                .padding(.top, 2)
+            content()
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 10)
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.25), value: aiDJ.isPreparing)
     }
 
     private func titleRow(track: AppTrack) -> some View {
