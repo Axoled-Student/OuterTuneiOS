@@ -2,6 +2,10 @@
 #
 #   powershell -ExecutionPolicy Bypass -File tools\resolver\start.ps1
 #
+# This is the one you run in a window and watch, and it stops when the window
+# does. To have the machine bring the server back by itself after a reboot, and
+# keep it up without anyone watching, use `install-autostart.ps1` instead.
+#
 # The app should point at https://music.598787.xyz with no token.
 #
 # The hostname is a named tunnel (see ~/.cloudflared/config.yml), so unlike a
