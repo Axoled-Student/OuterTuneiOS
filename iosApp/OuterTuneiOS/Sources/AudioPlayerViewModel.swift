@@ -182,11 +182,15 @@ final class AudioPlayerViewModel: ObservableObject {
     private let shuffleStorageKey = "ios.shuffle.v1"
     private let autoQueueStorageKey = "ios.autoQueue.v1"
     private let resumePositionStorageKey = "ios.playback.resumePosition.v1"
-    private let resumeWasPlayingStorageKey = "ios.playback.wasPlaying.v1"
+    private let resumeDurationStorageKey = "ios.playback.resumeDuration.v1"
 
     private var searchHistory: [String] = []
+    /// Where the song the app was closed on had got to, and which song that
+    /// was. Spent on the first play of that track and thrown away on the first
+    /// play of any other, so a position from last night cannot land in the
+    /// middle of something chosen this morning.
     private var pendingLaunchResumePosition: Double?
-    private var hasHandledLaunchResume = false
+    private var pendingLaunchResumeTrackId: String?
     private var nextPreloadTask: Task<Void, Never>?
     private var serverWarmTask: Task<Void, Never>?
     /// Queue position whose successor is waiting on the listener to settle in
@@ -217,12 +221,7 @@ final class AudioPlayerViewModel: ObservableObject {
         restorePlaybackModeState()
         restoreSearchHistoryState()
         autoQueueService.bootstrapHistory(playbackHistory)
-        if UserDefaults.standard.bool(forKey: resumeWasPlayingStorageKey),
-           currentQueueIndex != nil {
-            pendingLaunchResumePosition = UserDefaults.standard.double(
-                forKey: resumePositionStorageKey
-            )
-        }
+        restoreLaunchPlaybackPosition()
         autocompleteSuggestions = Array(searchHistory.prefix(6))
         wireYouTubeAuthProvider()
         aiDJ.duck = { [weak self] level in
@@ -790,7 +789,33 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func persistPlaybackResumeState() {
         UserDefaults.standard.set(max(currentTime, 0), forKey: resumePositionStorageKey)
-        UserDefaults.standard.set(isPlaying, forKey: resumeWasPlayingStorageKey)
+        UserDefaults.standard.set(max(duration, 0), forKey: resumeDurationStorageKey)
+    }
+
+    /// Bring back where the last song had got to, without bringing back the
+    /// playing.
+    ///
+    /// Opening the app is not usually a request to hear something - it is a
+    /// request to look at something - and an app that starts singing the moment
+    /// it is opened is a nuisance on a train. So the track comes back sitting
+    /// paused at the point it was left, and the seek is spent later, on the tap
+    /// that asks for it.
+    private func restoreLaunchPlaybackPosition() {
+        guard let track = nowPlayingTrack else { return }
+        let saved = UserDefaults.standard.double(forKey: resumePositionStorageKey)
+        // A second in is not a position worth keeping, and it is also what an
+        // install that never saved one reads back as.
+        guard saved > 1 else { return }
+        pendingLaunchResumePosition = saved
+        pendingLaunchResumeTrackId = track.id
+
+        // Show the position too, but only when the length is known - a scrubber
+        // reading 2:14 of 0:00 is worse than one that has not started yet.
+        let length = UserDefaults.standard.double(forKey: resumeDurationStorageKey)
+        guard length > saved else { return }
+        duration = length
+        currentTime = saved
+        sliderPosition = saved
     }
 
     private func restorePlaybackModeState() {
@@ -982,24 +1007,16 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     /// Keep the playback session alive across ordinary Home-screen/background
-    /// transitions, and restore an item automatically after a process relaunch.
-    /// iOS still terminates audio when the user explicitly force-quits the app;
-    /// the saved item resumes as soon as the app is opened again.
+    /// transitions. Music that was playing when the app went to the background
+    /// keeps playing and is picked up again on the way back; music that was not
+    /// stays quiet. A relaunch restores the queue and the position but never the
+    /// playing - see `restoreLaunchPlaybackPosition`.
     func handleScenePhase(_ phase: ScenePhase) {
         let configured = AudioSessionConfigurator.configureForPlayback()
         appendDebugLog("場景狀態：\(String(describing: phase)) audioSession=\(configured)")
 
         switch phase {
         case .active:
-            if !hasHandledLaunchResume {
-                hasHandledLaunchResume = true
-                if pendingLaunchResumePosition != nil,
-                   let index = currentQueueIndex,
-                   queue.indices.contains(index) {
-                    Task { await self.playTrack(at: index) }
-                    return
-                }
-            }
             if isPlaying {
                 player?.play()
                 updateNowPlayingPlaybackState()
@@ -1481,8 +1498,12 @@ final class AudioPlayerViewModel: ObservableObject {
         player?.isMuted = false
         player?.volume = 1.0
 
-        if let resumePosition = pendingLaunchResumePosition {
-            pendingLaunchResumePosition = nil
+        let resumePosition: Double? =
+            pendingLaunchResumeTrackId == track.id ? pendingLaunchResumePosition : nil
+        pendingLaunchResumePosition = nil
+        pendingLaunchResumeTrackId = nil
+
+        if let resumePosition {
             let bounded = duration > 0 ? min(resumePosition, duration) : resumePosition
             let target = max(bounded, 0)
             player?.seek(to: CMTime(seconds: target, preferredTimescale: 600))
