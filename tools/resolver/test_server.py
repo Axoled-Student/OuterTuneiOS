@@ -4,8 +4,11 @@ import http.client
 import http.server
 import json
 import os
+import pathlib
+import shutil
 import tempfile
 import threading
+import time
 import unittest
 
 import server as resolver_server
@@ -20,6 +23,8 @@ class StubResolver:
     def __init__(self, upstream_url="http://127.0.0.1:1/audio"):
         self.upstream_url = upstream_url
         self.invalidations = 0
+        self.prepared = []
+        self.ready = set()
         handle = tempfile.NamedTemporaryFile(delete=False, suffix=".m4a")
         handle.write(b"abcdefgh")
         handle.close()
@@ -43,7 +48,11 @@ class StubResolver:
     def invalidate(self, _video_id):
         self.invalidations += 1
 
+    def is_prepared(self, video_id):
+        return video_id in self.ready
+
     def prepare(self, video_id):
+        self.prepared.append(video_id)
         payload = self.resolve(video_id)
         payload.update({
             "preparedPath": self.prepared_path,
@@ -53,7 +62,9 @@ class StubResolver:
         return payload
 
 
-class ResolverServerTest(unittest.TestCase):
+class ResolverHarness(unittest.TestCase):
+    """Starts a resolver on a free port and talks to it over real HTTP."""
+
     def start_resolver(self, resolver, token=None):
         handler = type("ConfiguredQuietHandler", (QuietHandler,), {})
         handler.resolver = resolver
@@ -77,6 +88,8 @@ class ResolverServerTest(unittest.TestCase):
         connection.close()
         return result
 
+
+class ResolverServerTest(ResolverHarness):
     def test_url_only_health_accepts_stale_client_token(self):
         port = self.start_resolver(StubResolver(), token=None)
         status, _, body = self.request(port, "/health?token=old-phone-token")
@@ -150,6 +163,69 @@ class ResolverServerTest(unittest.TestCase):
         self.assertEqual(status, 416)
         self.assertEqual(headers["Content-Range"], "bytes */8")
         self.assertEqual(body, b"")
+
+
+class WarmRouteTest(ResolverHarness):
+    def test_warm_queues_a_batch_without_waiting_for_it(self):
+        """The phone should pay one small request, not a download."""
+        stub = StubResolver()
+        stub.ready.add("already")
+        port = self.start_resolver(stub)
+
+        started = time.time()
+        status, _, body = self.request(port, "/warm?v=one,two,already,one")
+        elapsed = time.time() - started
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(payload["ready"], ["already"])
+        # Deduplicated, and the one already on disk is not fetched again.
+        self.assertEqual(payload["queued"], ["one", "two"])
+
+        deadline = time.time() + 5
+        while time.time() < deadline and len(stub.prepared) < 2:
+            time.sleep(0.05)
+        self.assertEqual(sorted(stub.prepared), ["one", "two"])
+
+    def test_warm_without_ids_is_a_client_error(self):
+        port = self.start_resolver(StubResolver())
+        status, _, _ = self.request(port, "/warm")
+        self.assertEqual(status, 400)
+
+
+class PreparedCacheTest(unittest.TestCase):
+    def test_prune_evicts_least_recently_served_files_over_budget(self):
+        directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+
+        resolver = resolver_server.Resolver(cache_dir=directory)
+        now = time.time()
+        for index in range(4):
+            path = directory / ("track%d.m4a" % index)
+            path.write_bytes(b"x" * 1024)
+            # Oldest first, so track0 is the one that should go.
+            os.utime(path, (now - (10 - index) * 60,) * 2)
+
+        original = resolver_server.PREPARED_BUDGET
+        resolver_server.PREPARED_BUDGET = 3 * 1024
+        self.addCleanup(setattr, resolver_server, "PREPARED_BUDGET", original)
+
+        resolver.prune_prepared()
+
+        remaining = sorted(p.name for p in directory.glob("*.m4a"))
+        # Down to three quarters of the budget: two files, the newest two.
+        self.assertEqual(remaining, ["track2.m4a", "track3.m4a"])
+
+    def test_prune_leaves_a_cache_inside_its_budget_alone(self):
+        directory = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+
+        resolver = resolver_server.Resolver(cache_dir=directory)
+        (directory / "keep.m4a").write_bytes(b"x" * 1024)
+        resolver.prune_prepared()
+
+        self.assertTrue((directory / "keep.m4a").exists())
 
 
 if __name__ == "__main__":

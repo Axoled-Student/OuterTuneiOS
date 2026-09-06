@@ -382,6 +382,44 @@ final class StreamResolverService: ObservableObject {
         isReachable = true
     }
 
+    /// Ask the PC to prepare several upcoming tracks at once.
+    ///
+    /// Returns as soon as the work is queued. Resolving a track costs the
+    /// server about a second of YouTube lookup; doing that ahead of time means
+    /// the phone spends one small request here instead of waiting for it at
+    /// the moment the listener presses play.
+    func warm(videoIds: [String]) async {
+        let ids = videoIds.filter { !$0.isEmpty }
+        guard isConfigured, !ids.isEmpty,
+              let endpoint = url(
+                path: "/warm",
+                query: [URLQueryItem(name: "v", value: ids.joined(separator: ","))]
+              ) else {
+            return
+        }
+        _ = try? await session.data(from: endpoint)
+    }
+
+    /// Pull a prepared track onto the device in one pass, straight to disk.
+    ///
+    /// The caller owns the returned file and must move or delete it.
+    func downloadPrepared(videoId: String) async throws -> URL {
+        guard isConfigured, let endpoint = streamURL(videoId: videoId) else {
+            throw StreamResolverError.notConfigured
+        }
+        var request = URLRequest(url: endpoint)
+        request.timeoutInterval = 180
+
+        let (location, response) = try await session.download(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200 ..< 300).contains(status) else {
+            try? FileManager.default.removeItem(at: location)
+            throw StreamResolverError.badResponse(status)
+        }
+        isReachable = true
+        return location
+    }
+
     /// A playback candidate for the resolver. Errors remain visible to the
     /// caller so it cannot silently fall back to a known-truncated direct URL.
     func playbackOption(for videoId: String) async throws -> AudioStreamOption {

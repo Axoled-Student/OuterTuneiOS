@@ -164,6 +164,12 @@ final class AudioPlayerViewModel: ObservableObject {
     private var pendingLaunchResumePosition: Double?
     private var hasHandledLaunchResume = false
     private var nextPreloadTask: Task<Void, Never>?
+    private var serverWarmTask: Task<Void, Never>?
+    /// Queue position whose successor is waiting on the listener to settle in
+    /// before it is fetched. Only used on expensive connections.
+    private var deferredPrefetchIndex: Int?
+    /// Tracks whose cached copy already failed once, so the retry cannot loop.
+    private var retriedWithoutCache: Set<String> = []
     private var autoQueueTask: Task<Void, Never>?
     private var activeRecommendationGeneration: UUID?
     private var feedbackTrack: AppTrack?
@@ -326,6 +332,7 @@ final class AudioPlayerViewModel: ObservableObject {
         autocompleteTask?.cancel()
         nowPlayingArtworkTask?.cancel()
         nextPreloadTask?.cancel()
+        serverWarmTask?.cancel()
         autoQueueTask?.cancel()
     }
 
@@ -1110,6 +1117,10 @@ final class AudioPlayerViewModel: ObservableObject {
                     )
                 )
                 appendDebugLog("使用本機快取：\(track.title)")
+                // Nothing further is needed: asking the resolver for metadata
+                // we are not going to use would put a network round trip in
+                // front of a track that is already sitting on the disk.
+                return options
             }
 
             // A configured resolver is the only full-track source. Do not hide
@@ -1188,9 +1199,6 @@ final class AudioPlayerViewModel: ObservableObject {
             // few KB instead of waiting for a whole download and remux.
             || selectedStream.sourceClientName == "RESOLVER" {
             playItemDirectly(url: selectedStream.url, track: track)
-            if selectedStream.sourceClientName == "RESOLVER" {
-                cacheResolverStreamInBackground(stream: selectedStream, track: track)
-            }
             return
         }
 
@@ -1237,25 +1245,6 @@ final class AudioPlayerViewModel: ObservableObject {
         }
     }
 
-    /// Copy a streamed track to disk while it plays, so the next play needs no
-    /// network at all. Playback does not wait on this.
-    private func cacheResolverStreamInBackground(stream: AudioStreamOption,
-                                                 track: AppTrack) {
-        let key = AudioCache.key(for: track)
-        Task.detached(priority: .utility) {
-            if await AudioCache.shared.existing(for: key) != nil { return }
-            var request = URLRequest(url: stream.url)
-            request.timeoutInterval = 120
-            guard let (data, response) = try? await URLSession.shared.data(for: request),
-                  let http = response as? HTTPURLResponse,
-                  (200 ... 206).contains(http.statusCode),
-                  data.count > 1024 else {
-                return
-            }
-            await AudioCache.shared.store(data, for: key)
-        }
-    }
-
     private func playItemDirectly(url: URL, track: AppTrack) {
         let item = AVPlayerItem(url: url)
         // For a file already on disk there is nothing to buffer, so waiting to
@@ -1263,6 +1252,13 @@ final class AudioPlayerViewModel: ObservableObject {
         // and progressive M4A retain AVPlayer's normal buffering behaviour.
         if url.isFileURL {
             item.preferredForwardBufferDuration = 0
+        } else {
+            // Left unbounded, AVPlayer will happily fetch a whole track that
+            // the listener abandons ten seconds in. On Wi-Fi that does not
+            // matter; on cellular it is the difference between paying for what
+            // was heard and paying for what was not.
+            item.preferredForwardBufferDuration =
+                NetworkConditions.shared.forwardBufferSeconds
         }
         if player == nil {
             player = AVPlayer(playerItem: item)
@@ -1445,6 +1441,25 @@ final class AudioPlayerViewModel: ObservableObject {
 
         let nextIndex = playbackCandidateIndex + 1
         guard playbackCandidates.indices.contains(nextIndex) else {
+            // When a cached copy exists it is offered as the only candidate,
+            // so a corrupt file would otherwise be a permanent failure for
+            // that track. Drop it and resolve again from the server, once.
+            // Only for streamed tracks: a track the listener imported has no
+            // cache entry to drop, and replaying it would just fail twice.
+            if case .youtube = track.source,
+               playbackCandidates.indices.contains(playbackCandidateIndex),
+               playbackCandidates[playbackCandidateIndex].sourceClientName == "LOCAL",
+               !retriedWithoutCache.contains(track.stableId) {
+                retriedWithoutCache.insert(track.stableId)
+                appendDebugLog("本機快取無法播放，改為重新下載：\(track.title)")
+                let key = AudioCache.key(for: track)
+                Task { [weak self] in
+                    await AudioCache.shared.evict(key)
+                    guard let self, let index = self.currentQueueIndex else { return }
+                    await self.playTrack(at: index)
+                }
+                return true
+            }
             print("[Player] tryFallback: no more candidates (was \(playbackCandidateIndex)/\(playbackCandidates.count))")
             appendDebugLog("所有 \(playbackCandidates.count) 個候選皆失敗，無法播放")
             return false
@@ -1457,11 +1472,28 @@ final class AudioPlayerViewModel: ObservableObject {
         return true
     }
 
-    /// Warm the PC-side fast-start M4A cache for the next YouTube item. The
-    /// task is deliberately best-effort and never changes visible playback
-    /// state; /stream prepares on demand if this did not finish in time.
+    /// Warm what is coming next, in two separate steps.
+    ///
+    /// The server prepares several tracks ahead. That costs the phone one small
+    /// request and takes the YouTube lookup - about a second per track - off
+    /// the critical path entirely.
+    ///
+    /// The device then pulls the very next track onto disk, so starting it
+    /// needs no network at all. Those are the same bytes playback would have
+    /// fetched anyway, moved earlier rather than added, which is why this is
+    /// worth doing even when data is being counted.
     private func preloadNextTrack(after index: Int) {
-        preloadTrack(at: index + 1)
+        guard resolverService.isConfigured else { return }
+        warmOnServer(from: index + 1, count: 3)
+
+        deferredPrefetchIndex = nil
+        if NetworkConditions.shared.prefetchAfterSeconds <= 0 {
+            prefetchUpcomingAudio(after: index)
+        } else {
+            // Wait for the listener to settle in. Skipping is the one way a
+            // prefetch becomes wasted data, and skips happen early.
+            deferredPrefetchIndex = index
+        }
     }
 
     private func scheduleAutoQueueExtension(startPlaying: Bool) {
@@ -1479,24 +1511,88 @@ final class AudioPlayerViewModel: ObservableObject {
     }
 
     private func preloadTrack(at index: Int) {
-        guard resolverService.isConfigured, queue.indices.contains(index) else { return }
-        guard case .youtube(let videoId) = queue[index].source else { return }
+        warmOnServer(from: index, count: 2)
+    }
 
-        let title = queue[index].title
+    /// Hand the resolver a short list of what is coming. One request, no wait.
+    private func warmOnServer(from start: Int, count: Int) {
+        guard resolverService.isConfigured else { return }
+
+        var ids: [String] = []
+        for offset in 0 ..< count {
+            let position = start + offset
+            guard queue.indices.contains(position) else { break }
+            if case .youtube(let videoId) = queue[position].source {
+                ids.append(videoId)
+            }
+        }
+        guard !ids.isEmpty else { return }
+
+        serverWarmTask?.cancel()
+        serverWarmTask = Task { [weak self] in
+            guard let self else { return }
+            await self.resolverService.warm(videoIds: ids)
+        }
+    }
+
+    private func prefetchUpcomingAudio(after index: Int) {
+        let depth = NetworkConditions.shared.prefetchDepth
+        guard depth > 0, resolverService.isConfigured else { return }
+
+        var targets: [AppTrack] = []
+        for offset in 1 ... depth {
+            let position = index + offset
+            guard queue.indices.contains(position) else { break }
+            if case .youtube = queue[position].source {
+                targets.append(queue[position])
+            }
+        }
+        guard !targets.isEmpty else { return }
+
         nextPreloadTask?.cancel()
         nextPreloadTask = Task { [weak self] in
             guard let self else { return }
-            do {
-                try await self.resolverService.prepare(videoId: videoId)
-                guard !Task.isCancelled else { return }
-                self.appendDebugLog("預載完成：\(title)")
-            } catch is CancellationError {
-                return
-            } catch {
-                guard !Task.isCancelled else { return }
-                self.appendDebugLog("預載失敗[\(title)]：\(error.localizedDescription)")
+            for track in targets {
+                if Task.isCancelled { return }
+                await self.prefetchAudio(for: track)
             }
         }
+    }
+
+    /// Fetch one track to disk, once. Best effort throughout: /stream still
+    /// serves it normally if this did not finish in time.
+    private func prefetchAudio(for track: AppTrack) async {
+        guard case .youtube(let videoId) = track.source else { return }
+        let key = AudioCache.key(for: track)
+        if await AudioCache.shared.existing(for: key) != nil { return }
+
+        do {
+            let temporary = try await resolverService.downloadPrepared(videoId: videoId)
+            guard !Task.isCancelled else {
+                try? FileManager.default.removeItem(at: temporary)
+                return
+            }
+            if await AudioCache.shared.store(fileAt: temporary, for: key) != nil {
+                appendDebugLog("預先下載完成：\(track.title)")
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            appendDebugLog("預先下載失敗[\(track.title)]：\(error.localizedDescription)")
+        }
+    }
+
+    /// On an expensive connection the next track is only fetched once the
+    /// current one has been listened to for a while.
+    private func startDeferredPrefetchIfDue() {
+        guard let index = deferredPrefetchIndex,
+              index == currentQueueIndex,
+              currentTime >= NetworkConditions.shared.prefetchAfterSeconds else {
+            return
+        }
+        deferredPrefetchIndex = nil
+        prefetchUpcomingAudio(after: index)
     }
 
     private func seek(to seconds: Double) {
@@ -1541,6 +1637,7 @@ final class AudioPlayerViewModel: ObservableObject {
                 }
 
                 self.updateNowPlayingPlaybackState()
+                self.startDeferredPrefetchIfDue()
             }
         }
     }

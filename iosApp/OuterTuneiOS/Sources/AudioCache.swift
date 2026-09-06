@@ -64,6 +64,33 @@ actor AudioCache {
         return url
     }
 
+    /// Take ownership of an already-downloaded file.
+    ///
+    /// A ten-minute track is tens of megabytes; reading it into a `Data` only
+    /// to write it straight back out doubles the peak memory for no reason.
+    @discardableResult
+    func store(fileAt source: URL, for key: String) -> URL? {
+        let destination = fileURL(for: key)
+        let manager = FileManager.default
+        do {
+            if manager.fileExists(atPath: destination.path) {
+                try manager.removeItem(at: destination)
+            }
+            try manager.moveItem(at: source, to: destination)
+        } catch {
+            try? manager.removeItem(at: source)
+            return nil
+        }
+        prune()
+        return destination
+    }
+
+    /// Forget a cached file, so the next play fetches it again. Used when a
+    /// cached copy turns out not to be playable.
+    func evict(_ key: String) {
+        try? FileManager.default.removeItem(at: fileURL(for: key))
+    }
+
     /// Least-recently-used eviction once the directory exceeds its budget.
     private func prune() {
         let manager = FileManager.default
