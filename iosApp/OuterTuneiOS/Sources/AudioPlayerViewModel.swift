@@ -1266,8 +1266,16 @@ final class AudioPlayerViewModel: ObservableObject {
             // Build the tail while this track is still rendering. Waiting for
             // DidPlayToEnd leaves a silent network gap where iOS may suspend a
             // backgrounded app before recommendations finish loading.
+            //
+            // Not on a station: the last song of a set is also the last song
+            // of the queue, so this fired at the same moment as the line above
+            // and twenty loose recommendations landed on top of the four the
+            // DJ had just planned. The station owns its own tail. If it ever
+            // fails to deliver one, `playNext` still falls back to these -
+            // which is the only moment they are the right answer.
             if isAutoQueueEnabled,
                !autoQueueAlreadyScheduled,
+               !djStation.isRunning,
                index == queue.count - 1 {
                 scheduleAutoQueueExtension(startPlaying: false)
             } else {
