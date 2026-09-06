@@ -169,7 +169,11 @@ class DJTest(unittest.TestCase):
         out = dj.line("pop", PREV, NEXT, language="en")
         meta, _ = dj._paths(out["audio"])
         text = meta.read_text(encoding="utf-8")
-        meta.write_text(text.replace('"v": 1', '"v": 0'), encoding="utf-8")
+        # Against the constant, not the number it happens to hold: this test
+        # is about a version that no longer matches, not about version one.
+        meta.write_text(
+            text.replace('"v": %d' % dj.CACHE_VERSION, '"v": 0'),
+            encoding="utf-8")
         again = dj.line("pop", PREV, NEXT, language="en")
         self.assertFalse(again["cached"])
         self.assertEqual(len(self.prompts), 2)

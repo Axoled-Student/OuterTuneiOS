@@ -27,6 +27,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import threading
 import time
 
@@ -36,7 +38,9 @@ CACHE_DIR = pathlib.Path(__file__).resolve().parents[2] / "build" / "dj_cache"
 # A handover between two particular songs says the same thing every time, so
 # this is long. It exists only so the cache cannot grow without bound.
 CACHE_TTL = 60 * 60 * 24 * 14
-CACHE_VERSION = 1
+# 2: clips are levelled and EQ'd on the way out, so everything spoken before
+# this is quieter than everything spoken after it.
+CACHE_VERSION = 2
 
 MODEL = "gemini-3.8-flash-high"
 # One sentence. Enough tokens for the model to reach a full stop in Japanese,
@@ -253,6 +257,45 @@ AUDIO_FORMAT = "audio-24khz-96kbitrate-mono-mp3"
 # opening bars of a song.
 SPEAKING_RATE = "+8%"
 
+# The service's own volume knob, which stops mattering once ffmpeg is in the
+# chain but is the only lift available on a host without it. Measured: +20%
+# buys 1.6dB and peaks at -2.1dBFS, +50% buys 3.5dB and peaks at -0.4, and
+# +100% is silently treated as +50%. So this is the last setting that still
+# leaves headroom to work in.
+SPEAKING_VOLUME = "+20%"
+
+# What a broadcast desk does to a voice before it goes over music, in the one
+# pass we get.
+#
+# The read-aloud service hands back speech at about -19 LUFS. Pop masters sit
+# near -9, and the player ducks them to 0.18 - so the music arrives at roughly
+# -24 and the voice is only five decibels clear of the thing it is talking
+# over. That is the whole complaint: not that the DJ is faint, but that it is
+# barely above the record.
+#
+#   highpass    rumble below 90Hz that a phone speaker cannot reproduce anyway
+#               and that only eats headroom
+#   -2 @ 250Hz  the boxiness of a 24kHz voice model
+#   +3.5 @ 3.6k presence, which is where consonants live and where a voice
+#               stops competing with the bass and starts sitting on top of it
+#   compressor  evens out the loud and quiet halves of a sentence, which is
+#               what makes a voice audible over music rather than merely loud
+#   loudnorm    to -12 LUFS with a true-peak ceiling, so every clip arrives at
+#               the same level whatever the voice or the language
+#
+# Measured on the same sentence: -18.8 LUFS in, -12.7 LUFS out, peaking at
+# -1.8dBFS. Six decibels is about twice as loud to the ear.
+VOICE_FILTER = (
+    "highpass=f=90,"
+    "equalizer=f=250:t=q:w=1.2:g=-2,"
+    "equalizer=f=3600:t=q:w=1.0:g=3.5,"
+    "acompressor=threshold=-20dB:ratio=3:attack=8:release=180:makeup=2,"
+    "loudnorm=I=-12:TP=-1.5:LRA=7"
+)
+# Re-encoding is a second lossy generation, so it gets more bits than the
+# 96kbps it came in at. At 24kHz that costs about 25KB a clip.
+VOICE_BITRATE = "128k"
+
 
 async def _synthesise(text, voice, rate):
     """One websocket round trip to the read-aloud service.
@@ -267,8 +310,8 @@ async def _synthesise(text, voice, rate):
     from edge_tts.constants import SEC_MS_GEC_VERSION, WSS_HEADERS, WSS_URL
     from edge_tts.drm import DRM
 
-    config = wire.TTSConfig(voice=voice, rate=rate, volume="+0%", pitch="+0Hz",
-                            boundary="SentenceBoundary")
+    config = wire.TTSConfig(voice=voice, rate=rate, volume=SPEAKING_VOLUME,
+                            pitch="+0Hz", boundary="SentenceBoundary")
     url = ("%s&ConnectionId=%s&Sec-MS-GEC=%s&Sec-MS-GEC-Version=%s"
            % (WSS_URL, wire.connect_id(), DRM.generate_sec_ms_gec(),
               SEC_MS_GEC_VERSION))
@@ -307,8 +350,40 @@ async def _synthesise(text, voice, rate):
     return b"".join(chunks)
 
 
+def _polish(source, destination):
+    """Level and shape a clip on its way to `destination`.
+
+    Best effort by design. A host with no ffmpeg still gets a DJ, just a
+    quieter one, and a filter chain that fails for any reason must not cost
+    the listener the line - so every failure here ends with the unprocessed
+    audio in place rather than an exception.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    out = str(destination) + ".mix.mp3"
+    try:
+        done = subprocess.run(
+            [ffmpeg, "-v", "error", "-y", "-i", str(source),
+             "-af", VOICE_FILTER, "-ar", "24000", "-b:a", VOICE_BITRATE, out],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        if done.returncode != 0 or not os.path.exists(out) \
+                or os.path.getsize(out) == 0:
+            return False
+        os.replace(out, destination)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if os.path.exists(out):
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+
+
 def speak(text, voice, path, rate=None):
-    """Synthesise `text` to `path` as MP3.
+    """Synthesise `text` to `path` as MP3, levelled for talking over music.
 
     The synthesiser is async and this server is threaded, so each call gets its
     own event loop rather than borrowing one that belongs to another thread.
@@ -325,7 +400,10 @@ def speak(text, voice, path, rate=None):
     temp = str(path) + ".tmp"
     with open(temp, "wb") as handle:
         handle.write(audio)
-    os.replace(temp, path)
+    if not _polish(temp, path):
+        os.replace(temp, path)
+    elif os.path.exists(temp):
+        os.remove(temp)
 
 
 # -------------------------------------------------------------------- public
