@@ -150,6 +150,22 @@ final class AudioPlayerViewModel: ObservableObject {
     private var hasConfiguredRemoteCommands: Bool = false
     private var nowPlayingArtworkSourceURL: String?
     private var nowPlayingArtworkTask: Task<Void, Never>?
+    /// Our own copy of what the lock screen, Control Center and the Dynamic
+    /// Island should be showing.
+    ///
+    /// `MPNowPlayingInfoCenter.nowPlayingInfo` is not a safe place to read
+    /// from. Its getter can hand back a snapshot taken before the last write,
+    /// so the half-second progress tick would read the *previous* song's
+    /// dictionary, edit the new song's elapsed time into it and put it back -
+    /// which is exactly the stuck lock screen: the right progress bar under
+    /// the wrong title, artist and cover. Starting every write from what this
+    /// object knows removes the round trip and the race with it.
+    private var nowPlayingInfo: [String: Any] = [:]
+    /// Which track `nowPlayingInfo` describes. The progress tick belongs to
+    /// whatever is actually rendering, not to whatever the queue has already
+    /// moved on to, and a cover that finishes downloading after the listener
+    /// has skipped must not be painted over the song that replaced it.
+    private var nowPlayingInfoTrackId: String?
     private var lyricsTask: Task<Void, Never>?
 
     private let youtubeService = YouTubeMusicService.shared
@@ -2147,16 +2163,20 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func updateNowPlayingInfo(for track: AppTrack) {
 #if os(iOS)
-        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-        info[MPMediaItemPropertyTitle] = track.title
-        info[MPMediaItemPropertyArtist] = track.artist
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(currentTime, 0)
-        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-        if duration > 0 {
-            info[MPMediaItemPropertyPlaybackDuration] = duration
+        if nowPlayingInfoTrackId != track.stableId {
+            // A new dictionary rather than an edit of the last one. Keys the
+            // next song does not set - the artwork above all - would otherwise
+            // survive the change and describe the song before it.
+            nowPlayingInfo = [:]
+            nowPlayingInfoTrackId = track.stableId
+            nowPlayingArtworkTask?.cancel()
+            nowPlayingArtworkTask = nil
+            nowPlayingArtworkSourceURL = nil
         }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+        nowPlayingInfo[MPMediaItemPropertyTitle] = track.title
+        nowPlayingInfo[MPMediaItemPropertyArtist] = track.artist
+        applyNowPlayingTiming()
+        publishNowPlayingInfo()
 
         updateNowPlayingArtworkIfNeeded(for: track)
 #endif
@@ -2164,27 +2184,49 @@ final class AudioPlayerViewModel: ObservableObject {
 
     private func updateNowPlayingPlaybackState() {
 #if os(iOS)
-        guard nowPlayingTrack != nil else {
+        // Nothing has been published yet, so there is no song for these
+        // numbers to belong to. Deliberately not keyed on `nowPlayingTrack`:
+        // that becomes the next song the moment its stream starts resolving,
+        // while the seconds being reported here are still the current one's.
+        guard nowPlayingInfoTrackId != nil else {
             return
         }
 
-        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(currentTime, 0)
-        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-        if duration > 0 {
-            info[MPMediaItemPropertyPlaybackDuration] = duration
-        }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+        applyNowPlayingTiming()
+        publishNowPlayingInfo()
 #endif
     }
 
     private func clearNowPlayingInfo() {
 #if os(iOS)
+        nowPlayingArtworkTask?.cancel()
+        nowPlayingArtworkTask = nil
+        nowPlayingArtworkSourceURL = nil
+        nowPlayingInfo = [:]
+        nowPlayingInfoTrackId = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         MPNowPlayingInfoCenter.default().playbackState = .stopped
 #endif
     }
+
+#if os(iOS)
+    private func applyNowPlayingTiming() {
+        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(currentTime, 0)
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        if duration > 0 {
+            nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration
+        } else {
+            // A duration carried over from the previous song draws a scrubber
+            // of the wrong length under the new one.
+            nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyPlaybackDuration)
+        }
+    }
+
+    private func publishNowPlayingInfo() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+    }
+#endif
 
     private func updateNowPlayingArtworkIfNeeded(for track: AppTrack) {
 #if os(iOS)
@@ -2209,27 +2251,31 @@ final class AudioPlayerViewModel: ObservableObject {
         nowPlayingArtworkSourceURL = sourceURL
         nowPlayingArtworkTask?.cancel()
 
+        // Whose cover this is. A download that lands after the listener has
+        // skipped belongs to a song that is no longer on.
+        let owner = track.stableId
+
         // Usually already on disk: the now-playing screen asks for a cover this
         // size too, so the lock screen tends to cost nothing.
         if let ready = ImageCache.shared.cached(sourceURL) {
-            applyNowPlayingArtwork(ready)
+            applyNowPlayingArtwork(ready, for: owner)
             return
         }
 
         nowPlayingArtworkTask = Task { [weak self] in
             guard let image = await Self.fetchArtwork(sourceURL) else { return }
             guard !Task.isCancelled else { return }
-            self?.applyNowPlayingArtwork(image)
+            self?.applyNowPlayingArtwork(image, for: owner)
         }
 #endif
     }
 
 #if os(iOS)
-    private func applyNowPlayingArtwork(_ image: UIImage) {
-        let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-        info[MPMediaItemPropertyArtwork] = artwork
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    private func applyNowPlayingArtwork(_ image: UIImage, for trackId: String) {
+        guard nowPlayingInfoTrackId == trackId else { return }
+        nowPlayingInfo[MPMediaItemPropertyArtwork] =
+            MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        publishNowPlayingInfo()
     }
 
     /// Fetch a cover, dropping to the variant i.ytimg always publishes when the
